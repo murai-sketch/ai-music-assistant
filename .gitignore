@@ -1,3 +1,15 @@
+# --- 制作物（楽曲・アイデア・リファレンス・過去案）はGit管理外 ---
+# このVaultの「枠組み」（04_Templates/, scripts/, ドキュメント類）のみMITでバージョン管理する。
+# 歌詞・作品本体はアーティスト個人の情報に準じるため、Gitにコミットしない。
+/01_Songs/*
+/02_Seeds/*
+/03_References/*
+/05_Archives/*
+!/01_Songs/.gitkeep
+!/02_Seeds/.gitkeep
+!/03_References/.gitkeep
+!/05_Archives/.gitkeep
+
 # --- 大容量音声ファイル ---
 *.wav
 *.mp3
