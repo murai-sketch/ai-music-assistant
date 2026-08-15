@@ -1,0 +1,28 @@
+# --- 大容量音声ファイル ---
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# --- DAWプロジェクトのバックアップファイル ---
+*.als.bak
+*.logicx.bak
+*.flp.bak
+*.ptxb
+Backup/
+Bounced Files/
+*.asd
+
+# --- Obsidian個人設定 ---
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
