@@ -2,21 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 align.py
-既知の歌詞行を、実際の歌唱音声に対して「大まかに」時刻合わせする。
+既知の歌詞行を、実際の歌唱音声に対して時刻合わせする。
 
 /Users/armada/YAMADA/MoneyPrinterTurbo/app/services/subtitle.py の
 correct() 関数（whisperの生セグメントを既知の台本テキストに再アライメント
-するロジック）から着想を得た、プロポーショナル分割のみの簡易版。
+するロジック）を参考にした、内容一致度ベースのアライメント。
 
-歌唱音声はナレーションと違い、whisperの認識テキスト自体はあまり信用できない
-（メリスマ・音楽の被り等）前提に立ち、whisperの文字起こし結果は
-「セグメントの開始/終了時刻」だけ使い、テキスト内容の一致度は見ない。
-これにより、内容一致検索(Levenshteinウィンドウ探索)を持ち込まずに済み、
-実装・デバッグの複雑さを抑えている。
+--- 経緯（重要）---
+当初は「whisperの認識テキストは歌唱音声では信用できない」という想定で、
+セグメントの開始/終了時刻だけを使い、歌詞行をセグメント数に機械的に
+按分するだけの簡易版にしていた。
 
-将来、実曲でのレビューにより「サビの繰り返しでズレが目立つ」等の具体的な
-劣化が見えた場合は、correct()の類似度探索ロジックを追加移植する前提で
-設計してある（本ファイルの分割ロジックだけを差し替えれば足りる）。
+しかし実曲（「空気で有罪 - カワイ民謡デスコアMIX」）でテストしたところ、
+2つの問題が判明した:
+  1. vad_filter=True だとVADが歪んだ/デスコア的なボーカルを「音声」と
+     認識できず、セグメントが0件になるケースがあった
+     （vad_filter=Falseに切り替えると94セグメント検出でき、言語判定も
+     日本語0.99の確度、認識テキストも歌詞にかなり近かった）。
+  2. whisperの1セグメントが印刷上の歌詞複数行にまたがる
+     （例: 1つのセグメントが歌詞の1-2行目に相当する）ため、
+     「セグメント数を行数に機械的に按分する」やり方は、セグメントの
+     実際の区切りと歌詞の行境界がズレるたびに、そこから後ろの行が
+     まとめて時刻ズレを起こす構造的な欠陥があった。
+
+そのため、認識テキストを実際に使う内容一致度ベースの探索
+（correct()と同じ発想）に作り直した。whisperの認識精度が完全でなくても、
+「セグメントの開始/終了時刻はおおむね合っている」という前提のもと、
+歌詞行ごとに一番近い位置を探して割り当てる。
 
 キャッシュ: 音声ファイルのSHA256先頭8桁をキーに、_work/<hash>/alignment.json
 に結果を保存する。既に存在すればwhisper文字起こしをスキップする。
@@ -59,21 +71,38 @@ def _get_model(model_size="large-v3", device="cpu", compute_type="int8"):
 
 
 def _transcribe_segments(audio_path):
-    """whisperで文字起こしし、[(start, end), ...] のセグメント時刻リストを返す。
-    テキスト内容は使わず、VADによる区間検出の結果としてのみ利用する。"""
+    """whisperで文字起こしし、[(start, end, text), ...] のリストを返す。
+
+    まずVAD(vad_filter=True)で試す。歪んだ/デスコア的な発声・ミックスに
+    埋もれたボーカルなど、通常の音声と大きく異なる音源ではVADが
+    「音声区間なし」と誤判定し、セグメントが0件になることがある
+    （実測: 「空気で有罪 - カワイ民謡デスコアMIX」でvad_filter=Trueだと
+    0件、vad_filter=Falseだと94件検出）。0件だった場合はvad_filter=False
+    で再試行し、それでも0件なら呼び出し元が明示的に警告を出す。"""
     model = _get_model()
+
     segments, _info = model.transcribe(
         str(audio_path),
         beam_size=5,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=200),
     )
-    return [(seg.start, seg.end) for seg in segments]
+    result = [(seg.start, seg.end, seg.text) for seg in segments]
+    if result:
+        return result
+
+    print("[WARN] VAD(音声区間検出)がセグメントを1つも検出できませんでした。"
+          "vad_filter=Falseで再試行します。")
+    segments, _info = model.transcribe(str(audio_path), beam_size=5, vad_filter=False)
+    result = [(seg.start, seg.end, seg.text) for seg in segments]
+    if not result:
+        print("[WARN] vad_filter=Falseでもセグメントを検出できませんでした。"
+              "曲全体への機械的な文字数比分配にフォールバックします"
+              "（タイミング精度は大きく低下します）。")
+    return result
 
 
 def _get_audio_duration(audio_path):
-    # ffprobeに依存せず、whisperのデコード結果から取れる最終セグメント終了時刻を
-    # フォールバックに使う。より正確な長さが欲しい場合は呼び出し側でffprobe等を使う。
     import subprocess
 
     try:
@@ -91,91 +120,125 @@ def _get_audio_duration(audio_path):
         return None
 
 
-def _proportional_align(lyric_lines, whisper_segments, audio_duration):
-    """whisperセグメントの区間だけを使い、歌詞行を文字数比例で配置する。
+def _levenshtein(a, b):
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * lb
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[lb]
 
-    考え方:
-      - whisperセグメントを「発話（歌唱）が起きている区間」の目安として使う。
-      - 各区間内で、対応する歌詞行を文字数の比率で分配する。
-      - セグメント数が歌詞行数よりずっと少ない場合は、区間をまとめて割り当てる。
-      - セグメントが1つも取れない場合は、曲全体を文字数比例で単純分配する
-        （whisperが完全に無音判定した曲などのフォールバック）。
+
+def _similarity(a, b):
+    """0.0-1.0の正規化類似度（1.0が完全一致）。"""
+    if not a and not b:
+        return 1.0
+    max_len = max(len(a), len(b), 1)
+    return 1.0 - (_levenshtein(a, b) / max_len)
+
+
+def _flatten_timeline(segments):
+    """whisperの生セグメント[(start, end, text), ...] を、
+    1本の連結テキスト + 文字オフセット→時刻 のブレークポイント列に変換する。
+    (MoneyPrinterTurbo/app/services/subtitle.py の _flatten_timeline と
+    同じ考え方。セグメント間は空白1文字で連結する。)"""
+    parts = []
+    breakpoints = []  # (start_offset, end_offset, seg_start, seg_end)
+    offset = 0
+    for start, end, text in segments:
+        text = text.strip()
+        if not text:
+            continue
+        start_off = offset
+        parts.append(text)
+        offset += len(text)
+        breakpoints.append((start_off, offset, start, end))
+        parts.append(" ")
+        offset += 1
+    return "".join(parts), breakpoints
+
+
+def _time_at_offset(breakpoints, char_offset):
+    if not breakpoints:
+        return 0.0
+    if char_offset <= breakpoints[0][0]:
+        return breakpoints[0][2]
+    for start_off, end_off, seg_start, seg_end in breakpoints:
+        if start_off <= char_offset <= end_off:
+            seg_len = max(end_off - start_off, 1)
+            frac = (char_offset - start_off) / seg_len
+            return seg_start + frac * (seg_end - seg_start)
+    return breakpoints[-1][3]
+
+
+def _content_aware_align(lyric_lines, whisper_segments, audio_duration):
+    """whisperの認識テキストを使い、歌詞行ごとに一番近い位置を探して
+    時刻を割り当てる（correct()と同じ発想）。
+
+    whisperの認識精度が悪くても、「セグメントの開始/終了時刻はおおむね
+    合っている」という前提のもと、類似度が低い行はウィンドウ内の
+    文字数比例分割にフォールバックする（内容が全く見つからない場合でも、
+    「その行の長さぶんだけ進める」ことで、後続の行への連鎖的なズレを防ぐ）。
     """
-    total_chars = sum(max(len(line), 1) for line in lyric_lines) or 1
+    flat_text, breakpoints = _flatten_timeline(whisper_segments)
+    total_len = len(flat_text)
 
-    if not whisper_segments:
-        if not audio_duration:
-            raise ValueError(
-                "whisperセグメントが1つも取れず、audio_durationも不明なため、"
-                "タイミングを推定できません。"
-            )
-        cursor = 0.0
-        result = []
-        for line in lyric_lines:
-            share = audio_duration * (max(len(line), 1) / total_chars)
+    result = []
+    pos = 0
+    for line in lyric_lines:
+        if pos >= total_len:
+            break
+
+        target_len = len(line)
+        window = max(6, int(target_len * 0.35))
+        lo = max(pos + 1, pos + target_len - window)
+        hi = min(total_len, pos + target_len + window)
+
+        best_end = min(pos + target_len, total_len)
+        best_score = _similarity(line, flat_text[pos:best_end])
+        for candidate_end in range(lo, hi + 1):
+            score = _similarity(line, flat_text[pos:candidate_end])
+            if score > best_score:
+                best_score = score
+                best_end = candidate_end
+
+        if best_score < 0.35:
+            # 一致するものが見つからない: それでも行の長さぶんだけ進める。
+            # 「一致しなかったのでその場に留まる」方が、後続行すべてが
+            # 巻き添えでズレる最悪のケースになるため。
+            best_end = min(pos + target_len, total_len)
+
+        start_time = _time_at_offset(breakpoints, pos)
+        end_time = _time_at_offset(breakpoints, best_end)
+        if end_time <= start_time:
+            end_time = start_time + 0.3
+
+        result.append({"line": line, "start": start_time, "end": end_time})
+        pos = best_end
+        if pos < total_len and flat_text[pos] == " ":
+            pos += 1
+
+    # flat_textを使い切って残った歌詞行は、残り音声時間に文字数比例で配分する
+    consumed = len(result)
+    remaining_lines = lyric_lines[consumed:]
+    if remaining_lines and audio_duration:
+        cursor = result[-1]["end"] if result else 0.0
+        available = max(audio_duration - cursor, 0.1)
+        rem_chars = sum(max(len(l), 1) for l in remaining_lines) or 1
+        for line in remaining_lines:
+            share = available * (max(len(line), 1) / rem_chars)
             end = min(cursor + share, audio_duration)
             result.append({"line": line, "start": cursor, "end": end})
             cursor = end
-        return result
-
-    # whisperセグメントを歌詞行数に合わせてグループ化する。
-    # セグメント数 >= 行数ならグループは1セグメントずつ、
-    # セグメント数 < 行数なら、複数行を同じセグメントの時間内で文字数比例分配する。
-    n_lines = len(lyric_lines)
-    n_segs = len(whisper_segments)
-
-    result = []
-    if n_segs >= n_lines:
-        # 各行に1つ以上のセグメントを対応させる（余ったセグメントは最後の行に吸収）
-        seg_idx = 0
-        segs_per_line = n_segs // n_lines
-        extra = n_segs % n_lines
-        for i, line in enumerate(lyric_lines):
-            take = segs_per_line + (1 if i < extra else 0)
-            take = max(take, 1)
-            group = whisper_segments[seg_idx: seg_idx + take]
-            seg_idx += take
-            if not group:
-                # 起こらないはずだが、念のためのフォールバック
-                start = result[-1]["end"] if result else 0.0
-                end = start + 0.3
-            else:
-                start = group[0][0]
-                end = group[-1][1]
-            result.append({"line": line, "start": start, "end": end})
-    else:
-        # 行数の方が多い: セグメントを歌詞行にまとめて割り当て、
-        # 各セグメント区間内を文字数比例でさらに分割する。
-        lines_per_seg = n_lines / n_segs
-        line_idx = 0
-        for seg_i, (seg_start, seg_end) in enumerate(whisper_segments):
-            remaining_lines = n_lines - line_idx
-            remaining_segs = n_segs - seg_i
-            take = round(remaining_lines / remaining_segs) if remaining_segs else remaining_lines
-            take = max(take, 1)
-            group_lines = lyric_lines[line_idx: line_idx + take]
-            line_idx += take
-            if not group_lines:
-                continue
-            seg_total_chars = sum(max(len(l), 1) for l in group_lines) or 1
-            cursor = seg_start
-            for line in group_lines:
-                share = (seg_end - seg_start) * (max(len(line), 1) / seg_total_chars)
-                end = min(cursor + share, seg_end)
-                result.append({"line": line, "start": cursor, "end": end})
-                cursor = end
-
-        # 万一取りこぼした行があれば、末尾に残り時間で追加する
-        if line_idx < n_lines and audio_duration:
-            remaining = lyric_lines[line_idx:]
-            cursor = result[-1]["end"] if result else 0.0
-            available = max(audio_duration - cursor, 0.1)
-            rem_chars = sum(max(len(l), 1) for l in remaining) or 1
-            for line in remaining:
-                share = available * (max(len(line), 1) / rem_chars)
-                end = min(cursor + share, audio_duration)
-                result.append({"line": line, "start": cursor, "end": end})
-                cursor = end
 
     # 単調増加・重複なしを保証する後処理
     for i in range(1, len(result)):
@@ -184,6 +247,25 @@ def _proportional_align(lyric_lines, whisper_segments, audio_duration):
         if result[i]["end"] <= result[i]["start"]:
             result[i]["end"] = result[i]["start"] + 0.3
 
+    return result
+
+
+def _uniform_fallback_align(lyric_lines, audio_duration):
+    """whisperセグメントが1つも取れなかった場合の最終フォールバック。
+    曲全体を文字数比例で単純分配する（タイミング精度は大きく低下する）。"""
+    if not audio_duration:
+        raise ValueError(
+            "whisperセグメントが1つも取れず、audio_durationも不明なため、"
+            "タイミングを推定できません。"
+        )
+    total_chars = sum(max(len(line), 1) for line in lyric_lines) or 1
+    cursor = 0.0
+    result = []
+    for line in lyric_lines:
+        share = audio_duration * (max(len(line), 1) / total_chars)
+        end = min(cursor + share, audio_duration)
+        result.append({"line": line, "start": cursor, "end": end})
+        cursor = end
     return result
 
 
@@ -202,7 +284,11 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
 
     audio_duration = _get_audio_duration(audio_path)
     whisper_segments = _transcribe_segments(audio_path)
-    alignment = _proportional_align(lyric_lines, whisper_segments, audio_duration)
+
+    if whisper_segments:
+        alignment = _content_aware_align(lyric_lines, whisper_segments, audio_duration)
+    else:
+        alignment = _uniform_fallback_align(lyric_lines, audio_duration)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(
