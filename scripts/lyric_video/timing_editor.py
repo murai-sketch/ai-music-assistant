@@ -199,12 +199,11 @@ def cmd_anchor(args):
         print("[ERROR] --anchors で最低1つは指定してください（例: 30=89.5）")
         sys.exit(1)
 
-    # 先頭行・末尾行が明示されていなければ、現在の値をそのまま境界として使う
-    if 1 not in anchors:
-        anchors[1] = alignment[0]["start"]
-    if n not in anchors:
-        anchors[n] = alignment[n - 1]["start"]
-
+    # ユーザーが実際に指定した行番号だけを境界として扱う。
+    # ここで anchors[1]/anchors[n] を「現在値のまま」補完してしまうと、
+    # 後段の「最初/最後のアンカーより外側はシフトする」処理が
+    # （常に1行目・n行目が“アンカー済み”になるため）一切発動しなくなる
+    # バグになるので、絶対に行わないこと。
     anchor_lines = sorted(anchors.keys())
     new_starts = [None] * n
 
@@ -221,6 +220,11 @@ def cmd_anchor(args):
             new_starts[i - 1] = cursor
             cursor += share
         new_starts[b - 1] = t1
+
+    # アンカーが1つしか指定されない場合など、上のループが1度も回らず
+    # アンカー行自体の値が未設定のままになるケースをここで必ず埋める
+    for a in anchor_lines:
+        new_starts[a - 1] = anchors[a]
 
     first_anchor, last_anchor = anchor_lines[0], anchor_lines[-1]
     if first_anchor > 1:
