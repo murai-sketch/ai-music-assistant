@@ -10,11 +10,15 @@
 !/03_References/.gitkeep
 !/05_Archives/.gitkeep
 
-# --- 大容量音声ファイル ---
+# --- 大容量音声・動画ファイル（歌詞動画・マスタリング出力含む） ---
 *.wav
 *.mp3
 *.m4a
 *.flac
+*.mp4
+
+# --- scripts/lyric_video, scripts/mastering のビルド成果物・中間ファイル ---
+_work/
 
 # --- DAWプロジェクトのバックアップファイル ---
 *.als.bak

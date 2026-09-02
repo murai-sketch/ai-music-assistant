@@ -1,0 +1,2 @@
+# master_audio.py は追加のPython依存を必要としません。
+# 実行時に ffmpeg (システムPATH上) が必要です。

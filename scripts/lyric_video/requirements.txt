@@ -1,0 +1,5 @@
+moviepy>=2.1
+faster-whisper
+librosa
+numpy
+pillow
