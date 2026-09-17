@@ -81,7 +81,12 @@ def _jitter_at(t, amplitude_px):
 
 
 def _build_caption_clip(line, start, end, style, font_path, video_size):
-    duration = max(end - start, 0.05)
+    raw_duration = max(end - start, 0.05)
+    # align.py/timing_editor.pyのendは「次の行が始まる時刻」であることが多く、
+    # そのまま使うと次の歌詞までインスト等で間隔が空いたときに、キャプションが
+    # 消えずに画面に残り続けてしまう。max_hold_secを超える分は打ち切り、
+    # 次の行が来るまでいったん非表示にする。
+    duration = min(raw_duration, style["max_hold_sec"])
     # 文字ごとの個別クリップ(真の1文字ずつの登場アニメーション)は生成コストが
     # 高すぎるため採用しない。代わりに、行の長さに比例してentrance全体の所要
     # 時間を伸ばすことで「長い行ほどゆっくり登場する」カスケード感を近似する。

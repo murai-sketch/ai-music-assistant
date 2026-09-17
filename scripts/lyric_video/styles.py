@@ -18,6 +18,13 @@ styles.py
     stagger_per_char_sec    : 1文字ごとの表示ずらし時間（0で行単位に一括表示）
     caption_color           : 歌詞テキストの色
     caption_stroke_color    : 歌詞テキストの縁取り色
+    max_hold_sec            : キャプションが画面に留まる最大秒数。
+                               次の行までの間隔がこれより長い場合（インスト
+                               部分・長い無音など）は、この秒数で一旦消えて
+                               非表示になり、次の行の開始時刻に改めて登場する。
+                               align.py/timing_editor.pyが返すend（多くの場合
+                               「次の行のstart」）をそのまま表示し続けない
+                               ようにするための上限。
 """
 
 STYLES = {
@@ -32,6 +39,7 @@ STYLES = {
         "stagger_per_char_sec": 0.02,
         "caption_color": "#FF6FB5",
         "caption_stroke_color": "#FFFFFF",
+        "max_hold_sec": 3.0,
     },
     "deathcore": {
         "beat_min_gap_sec": 0.22,
@@ -44,6 +52,7 @@ STYLES = {
         "stagger_per_char_sec": 0.0,
         "caption_color": "#E63946",
         "caption_stroke_color": "#0A0A0A",
+        "max_hold_sec": 2.5,
     },
     "kawaii-deathcore-wametal": {
         # kawaiiの弾む登場 + deathcoreのジッター/パルスの鋭さを合成したデフォルト
@@ -57,6 +66,7 @@ STYLES = {
         "stagger_per_char_sec": 0.012,
         "caption_color": "#FF3B70",
         "caption_stroke_color": "#1A0010",
+        "max_hold_sec": 2.8,
     },
 }
 

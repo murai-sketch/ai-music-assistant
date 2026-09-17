@@ -31,7 +31,7 @@ align.py の自動アライメント結果（_work/<hash>/alignment.json）を�
     4) 「進行するほどズレが大きくなる」ドリフトがある場合（1行ずつ直すのは
        非現実的）は、耳で確認できた正しい時刻を数行分だけ指定するアンカー
        補正が使える。歌唱が歪んでいて聞き取れない箇所は諦めて、聞き取れた
-       数点だけ与えれば、その間を文字数比例で再配分し直してくれる:
+       数点だけ与えれば、その間はwhisperが元々検出していた相対的なペース配分を保ったまま再スケーリングしてくれる:
         python3 scripts/lyric_video/timing_editor.py anchor \\
           --audio /path/to/song.mp3 \\
           --anchors "10=25.0,30=89.5,50=140.2"
@@ -50,6 +50,27 @@ align.py の自動アライメント結果（_work/<hash>/alignment.json）を�
        （1.0より大きいと後半ほど後ろに伸びる＝間延びを補正、
         1.0より小さいと後半ほど前に詰まる）。
        どちらも適用後に自動で単調増加・重複なしを再チェックする。
+
+    6) 「〇〇行目あたりだけ全体的に半秒くらい遅れてる」のような、範囲を絞った
+       ピンポイント補正には shift-range が使える（他の行には影響しない）:
+        python3 scripts/lyric_video/timing_editor.py shift-range \\
+          --audio /path/to/song.mp3 --from-line 11 --to-line 14 --seconds -0.5
+
+    7) whisperベースの自動アライメントは、歌唱の発音自体が不安定な音源では
+       限界がある。「大まかに合っているなら、音楽のビートに乗せてしまえば
+       違和感が減る」という考え方で、各行の開始時刻を最寄りのビート/
+       オンセット(beats.py・render.pyのパルス演出と同じ検出結果)に
+       スナップできる:
+        python3 scripts/lyric_video/timing_editor.py snap-beats \\
+          --audio /path/to/song.mp3 --tolerance 0.3
+
+       toleranceより離れたビートしかない行はスナップされない
+       （的外れな位置に飛ばされないための安全弁）。
+
+なお、render.py 側にも「次の行までの間隔が開きすぎている場合は、
+キャプションを一定時間で自動的に非表示にする」仕組み（styles.pyの
+max_hold_sec）が入っているため、shift-range等で意図的に隙間を作っても
+そこは自然に非表示になる。
 
 いずれのサブコマンドも、変更後の結果を align.py と同じ
 _work/<hash>/alignment.json に書き戻すため、その後は
@@ -170,7 +191,8 @@ def cmd_apply(args):
 def cmd_anchor(args):
     """自動アライメントが「進行するほどズレが大きくなる」ドリフトを起こしている
     場合の補正。1行ずつ手直しするのは非現実的なので、耳で確認できた正しい
-    時刻を数行分（アンカー）だけ指定し、アンカーとアンカーの間を文字数比例で
+    時刻を数行分（アンカー）だけ指定し、アンカーとアンカーの間はwhisperが元々検出
+    していた相対的なペース配分（ポーズ・フレーズの疎密など）を保ったまま
     再配分し直す。アンカーの外側（先頭行より前・末尾行より後）は、一番近い
     アンカーで生じたズレ量(delta)でそのままシフトする。
 
@@ -208,17 +230,23 @@ def cmd_anchor(args):
     new_starts = [None] * n
 
     for a, b in zip(anchor_lines, anchor_lines[1:]):
-        segment_lines = alignment[a - 1:b]  # a行目〜b行目（1-indexed, 両端含む）
-        # b行目自体の時刻はanchors[b]で確定するので、文字数の按分対象は a行目〜b-1行目
-        weight_lines = segment_lines[:-1] or segment_lines
-        total_chars = sum(max(len(x["line"]), 1) for x in weight_lines) or 1
         t0, t1 = anchors[a], anchors[b]
-        cursor = t0
+        # whisperの内容一致アライメント(align.py)が元々計算していた
+        # a行目〜b行目の相対的な間隔（ポーズの長さ・フレーズの疎密など、
+        # 文字数だけでは分からない実際の歌唱ペース情報）を捨てずに、
+        # [t0, t1] の区間へそのまま比例縮尺する。
+        # （旧実装は文字数だけで機械的に均等配分しており、whisperが実際に
+        #  検出していた情報を丸ごと無視してしまっていた。これが「アンカーの
+        #  間はどんどんズレる」の実質的な原因だった。）
+        orig_a, orig_b = alignment[a - 1]["start"], alignment[b - 1]["start"]
+        orig_span = orig_b - orig_a
         for i in range(a, b):
             item = alignment[i - 1]
-            share = (t1 - t0) * (max(len(item["line"]), 1) / total_chars)
-            new_starts[i - 1] = cursor
-            cursor += share
+            if orig_span > 0:
+                frac = (item["start"] - orig_a) / orig_span
+            else:
+                frac = (i - a) / max(b - a, 1)
+            new_starts[i - 1] = t0 + frac * (t1 - t0)
         new_starts[b - 1] = t1
 
     # アンカーが1つしか指定されない場合など、上のループが1度も回らず
@@ -254,6 +282,54 @@ def cmd_anchor(args):
           f"を使って全{n}行を再配分しました。")
 
 
+def cmd_snap_beats(args):
+    """各行のstart時刻を、検出済みのビート/オンセット(beats.json、
+    beats.detect_beats()の結果)の中から一番近いものにスナップする。
+
+    whisperベースの自動アライメントには限界があるが、「多少ズレていても、
+    音楽のビートに乗っていれば違和感が少ない」という考え方に基づく補正。
+    toleranceを超えて離れたビートには吸着しない（全く違う位置に
+    誤って飛ばされることへの安全弁）。"""
+    import bisect
+
+    cache_dir, alignment_path, _ = _cache_paths(args.audio)
+    cache = _load_cache(alignment_path)
+    alignment = cache["alignment"]
+
+    beats_path = cache_dir / "beats.json"
+    if not beats_path.exists():
+        print(f"[ERROR] {beats_path} が見つかりません。"
+              f"先に make_lyric_video.py または beats.py を実行してください。")
+        sys.exit(1)
+    beats_data = json.loads(beats_path.read_text(encoding="utf-8"))
+    beats = beats_data.get("beats", [])
+    if not beats:
+        print("[ERROR] ビートが1つも検出されていません。")
+        sys.exit(1)
+
+    snapped = 0
+    for item in alignment:
+        idx = bisect.bisect_left(beats, item["start"])
+        candidates = []
+        if idx > 0:
+            candidates.append(beats[idx - 1])
+        if idx < len(beats):
+            candidates.append(beats[idx])
+        if not candidates:
+            continue
+        nearest = min(candidates, key=lambda b: abs(b - item["start"]))
+        if abs(nearest - item["start"]) <= args.tolerance:
+            shift = nearest - item["start"]
+            item["start"] = nearest
+            item["end"] = max(item["end"] + shift, item["start"] + 0.05)
+            snapped += 1
+
+    cache["alignment"] = _enforce_monotonic(alignment)
+    _save_cache(alignment_path, cache)
+    print(f"[DONE] {snapped}/{len(alignment)}行を最寄りのビートにスナップしました"
+          f"（許容誤差: ±{args.tolerance:.2f}秒。それより遠いビートしかない行はスナップしていません）。")
+
+
 def cmd_shift(args):
     cache_dir, alignment_path, _ = _cache_paths(args.audio)
     cache = _load_cache(alignment_path)
@@ -263,6 +339,60 @@ def cmd_shift(args):
     cache["alignment"] = _enforce_monotonic(cache["alignment"])
     _save_cache(alignment_path, cache)
     print(f"[DONE] 全{len(cache['alignment'])}行を{args.seconds:+.2f}秒シフトしました。")
+
+
+def cmd_shift_range(args):
+    """指定した行番号の範囲（両端含む、1-indexed）だけを一括シフトする。
+    「〇〇行目あたりが全体的に半秒くらい遅れてる」のような、範囲を絞った
+    耳での指摘を反映するための、shift/anchorより手軽なピンポイント補正。"""
+    cache_dir, alignment_path, _ = _cache_paths(args.audio)
+    cache = _load_cache(alignment_path)
+    alignment = cache["alignment"]
+    n = len(alignment)
+
+    if not (1 <= args.from_line <= args.to_line <= n):
+        print(f"[ERROR] 範囲が不正です: {args.from_line}-{args.to_line} (1-{n})")
+        sys.exit(1)
+
+    # 注意: ここでは全体に対する_enforce_monotonic()は使わない。
+    # 範囲の直前の行(from_line-1)を基準に「start >= 直前行のend」を"強制的に
+    # 引き上げる"と、現状は歌詞行が隙間なく連続配置されていることが多いため、
+    # マイナス方向のシフトが直前行との衝突で丸ごと打ち消され、範囲内の行だけが
+    # 歪んでズレるカスケード的な破綻が起きる。
+    # render.py側で「長い間隔は自動で非表示になる」ようにした（max_hold_sec）
+    # ため、範囲の前後にちょっとした隙間ができても問題ない。
+    # ただし逆に「直前/直後の行とキャプションが同時表示されて文字が重なる」
+    # のは見た目上の破綻なので、範囲外の行の方を短く切り詰めて避ける
+    # （範囲外の行の"開始"時刻は変更しない。表示が終わる時刻だけ詰める）。
+    for item in alignment[args.from_line - 1: args.to_line]:
+        item["start"] = max(item["start"] + args.seconds, 0.0)
+        item["end"] = max(item["end"] + args.seconds, item["start"] + 0.05)
+
+    for i in range(args.from_line, args.to_line):
+        prev, cur = alignment[i - 1], alignment[i]
+        if cur["start"] < prev["end"]:
+            cur["start"] = prev["end"]
+        if cur["end"] <= cur["start"]:
+            cur["end"] = cur["start"] + 0.3
+
+    range_start_idx = args.from_line - 1
+    if range_start_idx > 0:
+        prev_item = alignment[range_start_idx - 1]
+        first_item = alignment[range_start_idx]
+        if prev_item["end"] > first_item["start"]:
+            prev_item["end"] = max(first_item["start"], prev_item["start"] + 0.1)
+
+    range_end_idx = args.to_line - 1
+    if range_end_idx < n - 1:
+        last_item = alignment[range_end_idx]
+        next_item = alignment[range_end_idx + 1]
+        if last_item["end"] > next_item["start"]:
+            last_item["end"] = max(next_item["start"], last_item["start"] + 0.1)
+
+    _save_cache(alignment_path, cache)
+    print(f"[DONE] {args.from_line}〜{args.to_line}行目を{args.seconds:+.2f}秒シフトしました"
+          "（範囲外の行との間に小さな隙間/重なりができても、"
+          "render.py側で自動的に扱われます）。")
 
 
 def cmd_scale(args):
@@ -300,10 +430,26 @@ def main():
     p_shift.add_argument("--seconds", type=float, required=True,
                           help="加算する秒数（マイナスで前倒し）")
 
+    p_shift_range = sub.add_parser(
+        "shift-range", help="指定した行番号の範囲だけを一括で時間シフトする"
+    )
+    p_shift_range.add_argument("--audio", required=True)
+    p_shift_range.add_argument("--from-line", type=int, required=True, dest="from_line")
+    p_shift_range.add_argument("--to-line", type=int, required=True, dest="to_line")
+    p_shift_range.add_argument("--seconds", type=float, required=True,
+                                help="加算する秒数（マイナスで前倒し）")
+
     p_scale = sub.add_parser("scale", help="全行を一括でスケールする（0秒基準）")
     p_scale.add_argument("--audio", required=True)
     p_scale.add_argument("--factor", type=float, required=True,
                           help="倍率（1.0より大きいと後半が後ろに伸びる）")
+
+    p_snap = sub.add_parser(
+        "snap-beats", help="各行の開始時刻を最寄りのビート/オンセットにスナップする"
+    )
+    p_snap.add_argument("--audio", required=True)
+    p_snap.add_argument("--tolerance", type=float, default=0.3,
+                         help="スナップを許容する最大誤差（秒）。デフォルト0.3")
 
     args = parser.parse_args()
     {
@@ -311,7 +457,9 @@ def main():
         "apply": cmd_apply,
         "anchor": cmd_anchor,
         "shift": cmd_shift,
+        "shift-range": cmd_shift_range,
         "scale": cmd_scale,
+        "snap-beats": cmd_snap_beats,
     }[args.command](args)
 
 
