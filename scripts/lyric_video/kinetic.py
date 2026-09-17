@@ -39,6 +39,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
+import kinetic_bg
 import kinetic_fx
 
 VIDEO_SIZE = (1080, 1920)
@@ -87,7 +88,7 @@ MIN_FLASH_GAP = 2.0
 MIN_BG_SWITCH_GAP = 0.5
 GAP_FOR_REST = 1.2  # これ以上の無歌詞区間は「間」として背景を画像に戻す
 
-INTERLUDE_EFFECTS = ["rgb_split", "glitch", "duotone", "scan"]
+INTERLUDE_EFFECTS = ["rgb_split", "glitch", "duotone", "scan", "kaleido"]
 INTERLUDE_FADE = 0.35  # 間奏の出入りでエフェクトを強める/弱める秒数
 INTERLUDE_MIN = 2.5    # これより短い歌詞の切れ目は間奏として扱わない
 
@@ -253,6 +254,7 @@ def build_plan(alignment, sections, beats, style, meta=None):
 
     profile = kinetic_fx.song_profile(alignment, sections, beats, meta)
     kinetic_fx.assign_techniques(plan, profile)
+    kinetic_bg.assign_backgrounds(plan, profile)
     for cut in plan:
         cut["profile_wa"] = profile["wa"]
 
@@ -267,14 +269,15 @@ def build_plan(alignment, sections, beats, style, meta=None):
 
 
 def plan_to_markdown(plan):
-    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 退場 | フラッシュ |",
-           "|---|---|---|---|---|---|---|---|---|---|---|"]
+    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for c in plan:
         bg = c["bg"] if c["bg"] == "image" else f"色{c['bg']}"
         out.append(
             f"| {c['index']} | {c['start']:.2f}–{c['end']:.2f} | {c['level']} | {c['layout']} | "
             f"{c['motion']} | {bg} | {c.get('camera', '')} | {c.get('decor') or ''} | "
-            f"{c.get('texture') or ''} | {c.get('exit') or ''} | {'●' if c['flash'] else ''} |"
+            f"{c.get('texture') or ''} | {c.get('exit') or ''} | {'●' if c['flash'] else ''} | "
+            f"{c.get('bgfx') or ''} | {c.get('under') or ''} | {c.get('wipe') or ''} |"
         )
     return "\n".join(out) + "\n"
 
@@ -550,6 +553,23 @@ class _Cut:
         self.n_rows = len(rows)
         if cut.get("entrance") == "stamp":
             self.overlay = self._stamp_overlay(accent)
+        self.under = None
+        if cut.get("under") and self.glyphs:
+            x0, y0, x1, y1 = self._bounds()
+            if cut["under"] == "brush":
+                wa = cut.get("profile_wa")
+                light_text = sum(_hex(text_color)) > 380
+                color = ("#111111" if not light_text else "#C1121F") if wa else accent
+                if _hex(color) == _hex(text_color):
+                    color = "#111111" if light_text else "#FFFFFF"
+                self.under = kinetic_bg.brush_stroke(x1 - x0 + 180, (y1 - y0) * 1.35 + 40, color, cut["index"])
+            else:
+                pad = 48
+                card_color = _hex(palette_bg) if palette_bg else (12, 12, 15)
+                card = Image.new("RGBA", (int(x1 - x0 + pad * 2), int(y1 - y0 + pad * 2)), card_color + (238,))
+                ImageDraw.Draw(card).rectangle([0, 0, card.width - 1, card.height - 1],
+                                               outline=_hex(accent) + (255,), width=8)
+                self.under = card
 
         if cut["layout"] == "left":
             self.anchor = (VIDEO_SIZE[0] * 0.47, VIDEO_SIZE[1] * 0.45)
@@ -803,6 +823,8 @@ class _Cut:
             frame.paste(self.echo, (ex, ey), self.echo)
 
         ax, ay = self.anchor
+        if self.under is not None:
+            self._draw_under(frame, tl, dur)
         base_angle = self.base_angle
         rad = math.radians(base_angle)
         cos_a, sin_a = math.cos(rad), math.sin(rad)
@@ -881,6 +903,38 @@ class _Cut:
             if 5 < remain < 8:
                 d = ImageDraw.Draw(frame)
                 d.line([(-50, ay + 60), (VIDEO_SIZE[0] + 50, ay - 60)], fill=(255, 255, 255), width=8)
+
+    def _draw_under(self, frame, tl, dur):
+        cut = self.cut
+        f = tl * FPS
+        remain = (dur - tl) * FPS
+        if f < 0:
+            return
+        im = self.under
+        if cut["under"] == "brush":
+            reveal = min(f / 7, 1.0)
+            if reveal <= 0:
+                return
+            im = im.crop((0, 0, max(int(im.width * _ease_out(reveal)), 1), im.height))
+            angle = -2
+        else:
+            angle = self.base_angle
+        a = 1.0
+        if remain < EXIT_FRAMES:
+            a = max(remain, 0) / EXIT_FRAMES
+        if cut.get("exit") == "fly" and remain < 7:
+            a *= (max(remain, 0) / 7)
+        key = ("under", cut["index"], im.size)
+        im = self._shared.transformed(key, im, 1.0, angle, a, 0.0, 0.0)
+        if im is None:
+            return
+        ax, ay = self.anchor
+        x0, y0, x1, y1 = self._bounds()
+        full_w = self.under.width
+        cx = ax + (x0 + x1) / 2
+        cy = ay + (y0 + y1) / 2
+        left = cx - full_w / 2
+        frame.paste(im, (int(left), int(cy - im.height / 2)), im)
 
     def _draw_overlay(self, frame, tl, dur):
         cut = self.cut
@@ -969,6 +1023,7 @@ class _Background:
         self.pulse_scale = style.get("pulse_scale", 1.08)
         self.pulse_decay = style.get("pulse_decay_sec", 0.14)
         self._solid = {}
+        self.wa = False
 
     def pulse(self, t):
         if not self.beats:
@@ -1003,14 +1058,31 @@ class _Background:
     def solid(self, color):
         im = self._solid.get(color)
         if im is None:
-            im = Image.new("RGB", VIDEO_SIZE, _hex(color))
+            im = kinetic_bg.apply_paper(Image.new("RGB", VIDEO_SIZE, _hex(color)), self.wa)
             self._solid[color] = im
         return im
 
-    def frame(self, mode, t, cam):
+    def frame(self, mode, t, cam, cut=None):
+        """cut（その時点のカット設計）の bgfx があれば背景に反映する。"""
+        bgfx = cut.get("bgfx") if cut else None
         if mode == "image":
-            return self.image_at(t, cam)
-        return self.solid(DEFAULT_PALETTE[mode][0]).copy()
+            im = self.image_at(t, cam)
+            if bgfx == "duotone":
+                accent = DEFAULT_PALETTE[cut["index"] % len(DEFAULT_PALETTE)][0]
+                im = kinetic_bg.apply_bgfx(im, bgfx, t, "#0C0C0F", accent, self.beat_amt(t), cut["index"])
+            return im
+        color = DEFAULT_PALETTE[mode][0]
+        if bgfx and bgfx.startswith("pattern:"):
+            im = kinetic_bg.apply_bgfx(Image.new("RGB", VIDEO_SIZE, _hex(color)), bgfx, t, color,
+                                       DEFAULT_PALETTE[mode][3], self.beat_amt(t), cut.get("shot", 0))
+            return kinetic_bg.apply_paper(im, self.wa)
+        return self.solid(color).copy()
+
+    def beat_amt(self, t):
+        idx = bisect.bisect_right(self.beats, t) - 1
+        if idx < 0:
+            return 0.0
+        return math.exp(-(t - self.beats[idx]) / 0.12)
 
 
 def find_interludes(plan, duration=None):
@@ -1036,6 +1108,10 @@ def apply_interlude_effect(frame, name, strength, t, beat_idx, beat_amt, palette
     """frame(PIL RGB) に間奏エフェクトをかける。strength 0..1、beat_amt はビート直後ほど1。"""
     if strength <= 0.01:
         return frame
+    if name == "kaleido":
+        frame = kinetic_bg.kaleidoscope(frame, t, strength)
+        name = "rgb_split"
+        strength *= 0.5
     arr = np.asarray(frame).astype(np.int16)
     H, W, _ = arr.shape
     out = arr
@@ -1131,6 +1207,7 @@ class KineticRenderer:
             lo, hi = self.shot_span[shots[-1]]
             self.shot_span[shots[-1]] = (lo, hi + 4.0)
         self.bg = _Background(image_path, beats, style)
+        self.bg.wa = any(c.get("profile_wa") for c in plan)
         self.sprites = _shared_sprites()
         self.duration = duration
         self.interludes = find_interludes(plan, duration)
@@ -1210,7 +1287,9 @@ class KineticRenderer:
     def frame_at(self, t):
         bg_cam, g_zoom, sx, sy = self.camera_at(t)
         mode, prev, p = self._bg_mode_at(t)
-        frame = self.bg.frame(mode, t, bg_cam)
+        kc = bisect.bisect_right(self.starts, t) - 1
+        cur_cut = self.plan[kc] if 0 <= kc < len(self.plan) and mode == self.plan[kc]["bg"] else None
+        frame = self.bg.frame(mode, t, bg_cam, cur_cut)
         k = bisect.bisect_right(self.interlude_starts, t) - 1
         if k >= 0 and mode == "image" and prev is None:
             s0, e0, effect = self.interludes[k]
@@ -1224,14 +1303,11 @@ class KineticRenderer:
                                                (DEFAULT_PALETTE[0][0], DEFAULT_PALETTE[0][3]) if k % 2
                                                else (DEFAULT_PALETTE[1][0], DEFAULT_PALETTE[2][0]))
         if prev is not None:
-            old = self.bg.frame(prev, t, bg_cam)
-            cut_x = int(VIDEO_SIZE[0] * _ease_out(p))
-            k = bisect.bisect_right(self.starts, t) - 1
-            if k % 2:
-                frame.paste(old.crop((cut_x, 0, VIDEO_SIZE[0], VIDEO_SIZE[1])), (cut_x, 0))
-            else:
-                w = VIDEO_SIZE[0] - cut_x
-                frame.paste(old.crop((0, 0, w, VIDEO_SIZE[1])), (0, 0))
+            prev_cut = self.plan[kc - 1] if kc > 0 else None
+            old = self.bg.frame(prev, t, bg_cam, prev_cut if prev_cut and prev_cut["bg"] == prev else None)
+            kind = cur_cut.get("wipe", "straight") if cur_cut else "straight"
+            mask = kinetic_bg.wipe_mask(kind, _ease_out(p), kc)
+            frame = Image.composite(frame, old, mask)
         active = self._active(t)
         for j in active:
             text_color, _stroke, accent = self.cuts[j].colors
@@ -1320,7 +1396,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8):
     return sheets
 
 
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 
 
 def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None):
