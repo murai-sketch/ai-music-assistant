@@ -27,6 +27,7 @@ timing_gui.py
         怪しい = 字幕はあるが、その時間に歌が聞き取れていない／認識と一致しない行
         未使用 = 歌詞ノートにあるのに字幕に使われていない行
     - キネティック描画の実物プレビュー、静止画チェック、書き出し（進捗表示つき）
+    - 部分書き出し: 開始・終了（再生位置から／選択行の範囲から）を決めて、その区間だけを音声付きで書き出す
     - 保存のたびに直前の alignment.json を alignment.bak-<日時>.json に退避する
 
 キーボード:
@@ -188,7 +189,7 @@ def _preview_jpeg(alignment, t, style_name):
     return buf.getvalue()
 
 
-def _run_render(style_name, stills_only):
+def _run_render(style_name, stills_only, part=None):
     from kinetic import load_or_build_plan, render_kinetic, render_stills
 
     STATE["render_status"] = "running"
@@ -208,12 +209,18 @@ def _run_render(style_name, stills_only):
             out_dir = cache_dir / f"gui_stills_{stamp}"
             STATE["stills"] = [str(p) for p in render_stills(STATE["image_path"], plan, _beats(), style, out_dir)]
         else:
-            out = cache_dir / f"gui_kinetic_{stamp}.mp4"
+            if part:
+                t0, t1 = part
+                out = cache_dir / f"gui_part_{t0:07.2f}-{t1:07.2f}_{stamp}.mp4"
+            else:
+                t0 = t1 = None
+                out = cache_dir / f"gui_kinetic_{stamp}.mp4"
 
             def progress(p):
                 STATE["render_progress"] = p
 
-            render_kinetic(STATE["image_path"], STATE["audio_path"], plan, _beats(), style, out, progress=progress)
+            render_kinetic(STATE["image_path"], STATE["audio_path"], plan, _beats(), style, out,
+                           progress=progress, t_start=t0, t_end=t1)
             STATE["render_output"] = str(out)
         STATE["render_progress"] = 1.0
         STATE["render_status"] = "done"
@@ -437,7 +444,13 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["render_status"] == "running":
                 self._json({"error": "書き出し中です"}, 409); return
             params = json.loads(body.decode("utf-8")) if body else {}
-            args = (params.get("style", DEFAULT_STYLE), bool(params.get("stills")))
+            part = None
+            if params.get("part"):
+                t0, t1 = float(params["part"][0]), float(params["part"][1])
+                if t1 - t0 < 0.1:
+                    self._json({"error": "区間の終了を開始より後にしてください"}, 400); return
+                part = (t0, t1)
+            args = (params.get("style", DEFAULT_STYLE), bool(params.get("stills")), part)
             threading.Thread(target=_run_render, args=args, daemon=True).start()
             self._json({"ok": True})
         else:
@@ -492,6 +505,8 @@ tr.low td.match { color:var(--warn); }
 .hint { color:var(--dim); font-size:11px; }
 kbd { background:#2a2a30; border:1px solid #444; border-radius:3px; padding:0 4px; font-size:11px; }
 #stills img { width:100%; margin-top:6px; border-radius:4px; }
+fieldset.part { border:1px solid var(--line); border-radius:6px; margin:8px 0; padding:4px 8px 8px; }
+fieldset.part legend { color:var(--dim); font-size:12px; }
 .hidden { display:none !important; }
 </style>
 </head>
@@ -522,8 +537,23 @@ kbd { background:#2a2a30; border:1px solid #444; border-radius:3px; padding:0 4p
     </div>
     <div class="toolbar">
       <button id="stillsBtn">静止画チェック</button>
-      <button class="primary" id="renderBtn">書き出す</button>
+      <button class="primary" id="renderBtn">全体を書き出す</button>
     </div>
+    <fieldset class="part">
+      <legend>部分書き出し</legend>
+      <div class="toolbar">
+        <label>開始 <input class="t" type="number" step="0.01" id="partStart" value="0.00"></label>
+        <button class="small" id="partStartNow" title="再生位置を開始に">⇤今</button>
+        <label>終了 <input class="t" type="number" step="0.01" id="partEnd" value="10.00"></label>
+        <button class="small" id="partEndNow" title="再生位置を終了に">今⇥</button>
+      </div>
+      <div class="toolbar">
+        <button class="small" id="partFromSel" title="選択した行の頭から終わりまで（前後0.5秒の余白つき）">選択行の範囲</button>
+        <button class="small" id="partPlay">▶ 区間を再生</button>
+        <button class="primary" id="partRenderBtn">部分を書き出す</button>
+      </div>
+      <div class="hint" id="partInfo"></div>
+    </fieldset>
     <div class="status" id="renderStatus"></div>
     <div class="toolbar">
       <a id="downloadLink" class="hidden" href="/render/download" download>⬇ 書き出した動画</a>
@@ -829,6 +859,14 @@ function drawTimeline() {
     tctx.save(); tctx.beginPath(); tctx.rect(x0, ry, Math.max(xs - x0, 2), rh); tctx.clip();
     tctx.fillText(`${i + 1} ${r.line}`, x0 + 5, ry + (i % 2) * 8 + 20); tctx.restore();
   });
+  // 部分書き出しの区間
+  const ps = +$('partStart').value, pe = +$('partEnd').value;
+  if (pe > ps) {
+    tctx.fillStyle = 'rgba(62,207,142,0.10)';
+    tctx.fillRect(t2x(ps), 0, t2x(pe) - t2x(ps), H);
+    tctx.fillStyle = '#3ecf8e';
+    tctx.fillRect(t2x(ps), 0, 2, H); tctx.fillRect(t2x(pe) - 2, 0, 2, H);
+  }
   // playhead
   const px = t2x(audio.currentTime);
   tctx.fillStyle = '#fff'; tctx.fillRect(px - 1, 0, 2, H);
@@ -1203,17 +1241,18 @@ document.addEventListener('keydown', e => {
 $('undoBtn').onclick = undo; $('redoBtn').onclick = redo;
 
 // ---------- render ----------
-async function startRender(stills) {
+async function startRender(stills, part) {
   if (dirty && !(await save())) return;
   const st = $('renderStatus');
   $('downloadLink').classList.add('hidden');
   $('openFolderBtn').classList.add('hidden');
-  const r = await fetch('/render/run', {method: 'POST', body: JSON.stringify({style: $('styleSelect').value, stills})});
+  const r = await fetch('/render/run', {method: 'POST', body: JSON.stringify({style: $('styleSelect').value, stills, part})});
   if (!r.ok) { st.textContent = (await r.json()).error; return; }
-  st.textContent = stills ? '静止画を作成中…' : '書き出し中… 0%';
+  const what = part ? `部分（${fmt(part[0])}〜${fmt(part[1])}秒）` : '全体';
+  st.textContent = stills ? '静止画を作成中…' : `${what}を書き出し中… 0%`;
   const poll = setInterval(async () => {
     const s = await (await fetch('/render/status')).json();
-    if (s.status === 'running' && !stills) st.textContent = `書き出し中… ${Math.round(s.progress * 100)}%`;
+    if (s.status === 'running' && !stills) st.textContent = `${what}を書き出し中… ${Math.round(s.progress * 100)}%`;
     if (s.status === 'done') {
       clearInterval(poll);
       if (stills) {
@@ -1233,6 +1272,43 @@ let openWhat = 'video';
 $('openFolderBtn').onclick = () => fetch('/open-folder', {method: 'POST', body: JSON.stringify({what: openWhat})});
 $('stillsBtn').onclick = () => startRender(true);
 $('renderBtn').onclick = () => startRender(false);
+
+// ---------- 部分書き出し ----------
+function partRange() { return [+$('partStart').value, +$('partEnd').value]; }
+function updatePartInfo() {
+  const [a, b] = partRange();
+  const len = b - a;
+  // 全体の書き出し実績（約1.7倍の実時間）から目安を出す
+  $('partInfo').textContent = len > 0 ? `${fmt(len)}秒の区間（書き出しの目安 約${Math.max(Math.round(len * 1.7), 3)}秒）` : '終了を開始より後にしてください';
+  drawTimeline();
+}
+function setPart(a, b) {
+  $('partStart').value = fmt(clamp(a, 0, duration || a));
+  $('partEnd').value = fmt(clamp(b, 0, duration || b));
+  updatePartInfo();
+}
+$('partStart').onchange = updatePartInfo;
+$('partEnd').onchange = updatePartInfo;
+$('partStartNow').onclick = () => { const [, b] = partRange(); setPart(audio.currentTime, Math.max(b, audio.currentTime + 1)); };
+$('partEndNow').onclick = () => { const [a] = partRange(); setPart(Math.min(a, audio.currentTime - 1), audio.currentTime); };
+$('partFromSel').onclick = () => {
+  if (!sel.size) return alert('行を選択してください（⇧クリックで範囲選択）');
+  const idx = [...sel].sort((x, y) => x - y);
+  setPart(rows[idx[0]].start - 0.5, shownEnd(rows[idx[idx.length - 1]], idx[idx.length - 1]) + 0.5);
+};
+let partStop = null;
+$('partPlay').onclick = () => {
+  const [a, b] = partRange();
+  seek(a); audio.play();
+  clearInterval(partStop);
+  partStop = setInterval(() => { if (audio.currentTime >= b || audio.paused) { audio.pause(); clearInterval(partStop); } }, 50);
+};
+$('partRenderBtn').onclick = () => {
+  const [a, b] = partRange();
+  if (b - a < 0.1) return alert('終了を開始より後にしてください');
+  startRender(false, [a, b]);
+};
+updatePartInfo();
 
 // ---------- refresh ----------
 function refresh(rebuildTable = true) {

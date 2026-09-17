@@ -1260,19 +1260,27 @@ class KineticRenderer:
         return frame
 
 
-def render_kinetic(image_path, audio_path, plan, beats, style, output_path, progress=None):
+def render_kinetic(image_path, audio_path, plan, beats, style, output_path, progress=None,
+                   t_start=None, t_end=None):
+    """t_start / t_end を渡すと、その区間だけを書き出す（音声も同じ区間）。"""
     from moviepy import AudioFileClip, VideoClip
 
     audio = AudioFileClip(str(audio_path))
     renderer = KineticRenderer(image_path, plan, beats, style, duration=audio.duration)
-    total = max(audio.duration, 0.1)
+    t0 = max(float(t_start or 0.0), 0.0)
+    t1 = min(float(t_end), audio.duration) if t_end is not None else audio.duration
+    if t1 - t0 < 0.1:
+        raise ValueError(f"書き出す区間が短すぎます: {t0:.2f}〜{t1:.2f}秒")
+    if t0 > 0 or t1 < audio.duration:
+        audio = audio.subclipped(t0, t1)
+    total = t1 - t0
 
     def frame(t):
         if progress:
             progress(min(t / total, 0.99))
-        return np.asarray(renderer.frame_at(t))
+        return np.asarray(renderer.frame_at(t0 + t))
 
-    clip = VideoClip(frame_function=frame, duration=audio.duration).with_audio(audio)
+    clip = VideoClip(frame_function=frame, duration=total).with_audio(audio)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     clip.write_videofile(
