@@ -13,6 +13,11 @@ bgfx（ショットごとの背景処理）:
 under（文字の下に敷くもの）:
     brush           刷毛の帯（和なら墨色、それ以外は差し色）。行の頭から塗られていく
     card            文字の下の板（模様が強いときに読みやすくする）
+背景の素材（複数の画像・動画）:
+    _work/<音源ハッシュ>/backgrounds.json = {"items": [{"file": パス, "use": 用途}, ...]}
+    用途 = quiet（囁き）/ verse / hook（サビ）/ interlude（間奏）/ any
+    画像背景のショットに、強さに合う用途の素材を順番に割り当てる（bg_image）。
+    無い用途は any → 起動時の --image の順で代用する。
 wipe（背景の切り替え方）:
     straight / torn（破れた紙の縁）/ circle（円で広がる）
 """
@@ -294,3 +299,78 @@ def kaleidoscope(frame, t, strength):
     for yy in range(-((H // 2 - s) % (2 * s)) - 2 * s, H, 2 * s):
         out.paste(tile, (0, yy))
     return Image.blend(frame, out, strength)
+
+
+# ---------------------------------------------------------------------------
+# 複数の背景素材
+
+USES = ("quiet", "verse", "hook", "interlude", "any")
+
+
+def load_backgrounds(cache_dir):
+    import json
+    from pathlib import Path
+
+    path = Path(cache_dir) / "backgrounds.json"
+    if not path.exists():
+        return []
+    items = json.loads(path.read_text(encoding="utf-8")).get("items", [])
+    return [i for i in items if i.get("file") and Path(i["file"]).exists() and i.get("use", "any") in USES]
+
+
+def save_backgrounds(cache_dir, items):
+    import json
+    from pathlib import Path
+
+    path = Path(cache_dir) / "backgrounds.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _pool(backgrounds, use):
+    items = backgrounds or []
+    pool = [i["file"] for i in items if i.get("use") == use]
+    return pool or [i["file"] for i in items if i.get("use") == "any"]
+
+
+def assign_bg_images(plan, backgrounds):
+    """画像背景のショットごとに、強さに合う素材を順番に割り当てる。"""
+    counters = {}
+    shot_img = {}
+    # 囁き用・サビ用の素材があれば、単色のカットの一部を画像背景にして見せる
+    if _pool(backgrounds, "quiet") and any(i.get("use") == "quiet" for i in backgrounds or []):
+        for c in plan:
+            if c["level"] == 1:
+                c["bg"] = "image"
+                c["bgfx"] = None
+    if any(i.get("use") == "hook" for i in backgrounds or []):
+        k = 0
+        for c in plan:
+            if c["level"] == 3:
+                if k % 3 == 0:
+                    c["bg"] = "image"
+                    c["bgfx"] = None
+                    if c.get("under") == "card":
+                        c["under"] = None
+                k += 1
+    for c in plan:
+        c["bg_image"] = None
+        if c["bg"] != "image" or not backgrounds:
+            continue
+        sh = c.get("shot", c["index"])
+        if sh not in shot_img:
+            use = {1: "quiet", 3: "hook"}.get(c["level"], "verse")
+            pool = _pool(backgrounds, use)
+            if pool:
+                k = counters.get(use, 0)
+                shot_img[sh] = pool[k % len(pool)]
+                counters[use] = k + 1
+            else:
+                shot_img[sh] = None
+        c["bg_image"] = shot_img[sh]
+    return plan
+
+
+def interlude_images(backgrounds, n):
+    pool = _pool(backgrounds, "interlude")
+    return [pool[k % len(pool)] if pool else None for k in range(n)]

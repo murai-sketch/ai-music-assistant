@@ -72,6 +72,12 @@ def parse_args():
         help="kinetic: _work/<hash>/kinetic_plan.json を作り直す（手で直した設計は消える）",
     )
     parser.add_argument(
+        "--bg", action="append", metavar="FILE:USE",
+        help="kinetic: 背景素材（画像・動画）を用途つきで登録する。複数指定可。"
+             "USE = quiet / verse / hook / interlude / any。"
+             "指定すると _work/<hash>/backgrounds.json を置き換える（省略時はそのファイルを使う）",
+    )
+    parser.add_argument(
         "--stills", metavar="DIR",
         help="kinetic: 動画は書き出さず、各カットの静止画一覧をDIRに出す（書き出し前の確認用）",
     )
@@ -125,22 +131,34 @@ def main():
         )
     else:
         from kinetic import load_or_build_plan, render_kinetic, render_stills
+        from kinetic_bg import load_backgrounds, save_backgrounds
 
-        plan_path = WORK_DIR / _audio_hash(audio_path) / "kinetic_plan.json"
+        cache_dir = WORK_DIR / _audio_hash(audio_path)
+        plan_path = cache_dir / "kinetic_plan.json"
+        if args.bg:
+            items = []
+            for spec in args.bg:
+                file, _, use = spec.rpartition(":") if ":" in spec else (spec, "", "any")
+                items.append({"file": str(Path(file).resolve()), "use": use or "any"})
+            save_backgrounds(cache_dir, items)
+        backgrounds = load_backgrounds(cache_dir)
+        if backgrounds:
+            print(f"      背景素材: {len(backgrounds)}件（{cache_dir / 'backgrounds.json'}）")
         sections = sections_for_alignment(alignment, note.lyric_sections)
         plan = load_or_build_plan(plan_path, alignment, sections, beats, style,
-                                  replan=args.replan, meta=note.meta)
+                                  replan=args.replan, meta=note.meta, backgrounds=backgrounds)
         print(f"      カット設計: {plan_path}（一覧は {plan_path.with_suffix('.md').name}）")
         if args.stills:
             print(f"[4/4] 静止画一覧を書き出し中: {args.stills}")
-            sheets = render_stills(image_path, plan, beats, style, args.stills)
+            sheets = render_stills(image_path, plan, beats, style, args.stills, backgrounds=backgrounds)
             print(f"[DONE] {len(sheets)}枚: {args.stills}")
             return
         if not args.out:
             print("[ERROR] --out を指定してください")
             sys.exit(1)
         print(f"[4/4] 動画を書き出し中 (renderer=kinetic, style={args.style})...")
-        output_path = render_kinetic(image_path, audio_path, plan, beats, style, args.out)
+        output_path = render_kinetic(image_path, audio_path, plan, beats, style, args.out,
+                                     backgrounds=backgrounds)
 
     print(f"[DONE] 出力: {output_path}")
 

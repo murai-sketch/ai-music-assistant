@@ -133,7 +133,7 @@ def _split_rows(text):
     return [joined]
 
 
-def build_plan(alignment, sections, beats, style, meta=None):
+def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
     """alignment（[{line,start,end}]）と、行ごとの構成タグ名から、
     カットごとの設計を作る。meta（曲ノートの title/genre/tags/bpm）があれば、
     曲の性格に合わせて参考作品由来の技法（kinetic_fx）を割り当てる。"""
@@ -255,6 +255,7 @@ def build_plan(alignment, sections, beats, style, meta=None):
     profile = kinetic_fx.song_profile(alignment, sections, beats, meta)
     kinetic_fx.assign_techniques(plan, profile)
     kinetic_bg.assign_backgrounds(plan, profile)
+    kinetic_bg.assign_bg_images(plan, backgrounds)
     for cut in plan:
         cut["profile_wa"] = profile["wa"]
 
@@ -1002,28 +1003,83 @@ def _shared_decor():
     return _DECOR
 
 
-class _Background:
-    """背景画像は画面を覆う大きさ（縦長画面に横長画像なら横に余りが出る）で
-    保持し、カメラの窓（寄り・パン位置・傾き）で切り出す。"""
+VIDEO_EXTS = (".mp4", ".mov", ".webm", ".m4v")
 
-    def __init__(self, image_path, beats, style):
-        path = Path(image_path)
+
+def _make_cover(img):
+    W, H = VIDEO_SIZE
+    s = max(W / img.width, H / img.height)
+    img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1), Image.LANCZOS)
+    return ImageEnhance.Brightness(img).enhance(0.55)
+
+
+class _ImageSource:
+    def __init__(self, path):
+        path = Path(path)
         key = (str(path), path.stat().st_mtime)
         cover = _COVERS.get(key)
         if cover is None:
-            img = Image.open(path).convert("RGB")
-            W, H = VIDEO_SIZE
-            s = max(W / img.width, H / img.height)
-            img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1), Image.LANCZOS)
-            cover = ImageEnhance.Brightness(img).enhance(0.55)
-            _COVERS.clear()
+            cover = _make_cover(Image.open(path).convert("RGB"))
+            if len(_COVERS) > 16:
+                _COVERS.clear()
             _COVERS[key] = cover
         self.cover = cover
+
+    def cover_at(self, t):
+        return self.cover
+
+
+class _VideoSource:
+    """動画の背景。曲の時刻に合わせて繰り返し再生する。"""
+
+    def __init__(self, path):
+        from moviepy import VideoFileClip
+
+        self.clip = VideoFileClip(str(path), audio=False)
+        self.duration = max(self.clip.duration, 0.1)
+        self._last = (None, None)
+
+    def cover_at(self, t):
+        fi = int((t % self.duration) * FPS)
+        if self._last[0] == fi:
+            return self._last[1]
+        arr = self.clip.get_frame(min(fi / FPS, self.duration - 0.001))
+        img = Image.fromarray(arr)
+        W, H = VIDEO_SIZE
+        s = max(W / img.width, H / img.height) * 1.12
+        img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1), Image.BILINEAR)
+        cover = ImageEnhance.Brightness(img).enhance(0.6)
+        self._last = (fi, cover)
+        return cover
+
+
+class _Background:
+    """背景画像は画面を覆う大きさ（縦長画面に横長画像なら横に余りが出る）で
+    保持し、カメラの窓（寄り・パン位置・傾き）で切り出す。
+    複数の背景（画像・動画）を持ち、カットごとに bg_image で選ぶ。"""
+
+    def __init__(self, image_path, beats, style):
+        self.main = str(image_path)
+        self._sources = {}
+        self.cover = self._source(self.main).cover_at(0)
         self.beats = beats or []
         self.pulse_scale = style.get("pulse_scale", 1.08)
         self.pulse_decay = style.get("pulse_decay_sec", 0.14)
         self._solid = {}
         self.wa = False
+
+    def _source(self, path):
+        path = str(path or self.main)
+        src = self._sources.get(path)
+        if src is None:
+            if not Path(path).exists():
+                path = self.main
+                src = self._sources.get(path)
+                if src is not None:
+                    return src
+            src = _VideoSource(path) if Path(path).suffix.lower() in VIDEO_EXTS else _ImageSource(path)
+            self._sources[path] = src
+        return src
 
     def pulse(self, t):
         if not self.beats:
@@ -1036,14 +1092,15 @@ class _Background:
             return 1.0
         return 1.0 + (self.pulse_scale - 1.0) * math.exp(-dt / self.pulse_decay)
 
-    def image_at(self, t, cam):
+    def image_at(self, t, cam, path=None):
         W, H = VIDEO_SIZE
+        cover = self._source(path).cover_at(t)
         zoom, px, py, angle = cam
         zoom *= self.pulse(t)
         th = math.radians(angle)
         # 傾けても画面外（黒）が見えない最小の寄り
         zoom = max(zoom, math.cos(th) + (W / H) * abs(math.sin(th)) + 0.01, 1.0)
-        CW, CH = self.cover.size
+        CW, CH = cover.size
         room_x = max((CW - W / zoom) / 2, 0)
         room_y = max((CH - H / zoom) / 2, 0)
         cx = CW / 2 + px * room_x
@@ -1053,7 +1110,7 @@ class _Background:
         d, e = sin_t / zoom, cos_t / zoom
         c = cx - a * W / 2 - b * H / 2
         f = cy - d * W / 2 - e * H / 2
-        return self.cover.transform(VIDEO_SIZE, Image.AFFINE, (a, b, c, d, e, f), resample=Image.BILINEAR)
+        return cover.transform(VIDEO_SIZE, Image.AFFINE, (a, b, c, d, e, f), resample=Image.BILINEAR)
 
     def solid(self, color):
         im = self._solid.get(color)
@@ -1062,11 +1119,11 @@ class _Background:
             self._solid[color] = im
         return im
 
-    def frame(self, mode, t, cam, cut=None):
-        """cut（その時点のカット設計）の bgfx があれば背景に反映する。"""
+    def frame(self, mode, t, cam, cut=None, image=None):
+        """cut（その時点のカット設計）の bgfx / bg_image があれば背景に反映する。"""
         bgfx = cut.get("bgfx") if cut else None
         if mode == "image":
-            im = self.image_at(t, cam)
+            im = self.image_at(t, cam, image or (cut.get("bg_image") if cut else None))
             if bgfx == "duotone":
                 accent = DEFAULT_PALETTE[cut["index"] % len(DEFAULT_PALETTE)][0]
                 im = kinetic_bg.apply_bgfx(im, bgfx, t, "#0C0C0F", accent, self.beat_amt(t), cut["index"])
@@ -1191,7 +1248,7 @@ def camera_move(name, u, since_land, index):
 # ---------------------------------------------------------------------------
 
 class KineticRenderer:
-    def __init__(self, image_path, plan, beats, style, duration=None):
+    def __init__(self, image_path, plan, beats, style, duration=None, backgrounds=None):
         self.plan = plan
         self.starts = [c["start"] for c in plan]
         # ショットごとの開始・終了（次のショットの開始まで動き続ける）
@@ -1212,6 +1269,7 @@ class KineticRenderer:
         self.duration = duration
         self.interludes = find_interludes(plan, duration)
         self.interlude_starts = [s for s, _e, _n in self.interludes]
+        self.interlude_images = kinetic_bg.interlude_images(backgrounds, len(self.interludes))
         self.cuts = []
         for c in plan:
             if c["bg"] == "image":
@@ -1289,7 +1347,12 @@ class KineticRenderer:
         mode, prev, p = self._bg_mode_at(t)
         kc = bisect.bisect_right(self.starts, t) - 1
         cur_cut = self.plan[kc] if 0 <= kc < len(self.plan) and mode == self.plan[kc]["bg"] else None
-        frame = self.bg.frame(mode, t, bg_cam, cur_cut)
+        ki = bisect.bisect_right(self.interlude_starts, t) - 1
+        in_interlude = ki >= 0 and self.interludes[ki][0] <= t <= self.interludes[ki][1] and mode == "image" and prev is None
+        if in_interlude:
+            frame = self.bg.frame(mode, t, bg_cam, None, self.interlude_images[ki])
+        else:
+            frame = self.bg.frame(mode, t, bg_cam, cur_cut)
         k = bisect.bisect_right(self.interlude_starts, t) - 1
         if k >= 0 and mode == "image" and prev is None:
             s0, e0, effect = self.interludes[k]
@@ -1337,12 +1400,12 @@ class KineticRenderer:
 
 
 def render_kinetic(image_path, audio_path, plan, beats, style, output_path, progress=None,
-                   t_start=None, t_end=None):
+                   t_start=None, t_end=None, backgrounds=None):
     """t_start / t_end を渡すと、その区間だけを書き出す（音声も同じ区間）。"""
     from moviepy import AudioFileClip, VideoClip
 
     audio = AudioFileClip(str(audio_path))
-    renderer = KineticRenderer(image_path, plan, beats, style, duration=audio.duration)
+    renderer = KineticRenderer(image_path, plan, beats, style, duration=audio.duration, backgrounds=backgrounds)
     t0 = max(float(t_start or 0.0), 0.0)
     t1 = min(float(t_end), audio.duration) if t_end is not None else audio.duration
     if t1 - t0 < 0.1:
@@ -1366,10 +1429,10 @@ def render_kinetic(image_path, audio_path, plan, beats, style, output_path, prog
     return output_path
 
 
-def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8):
+def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, backgrounds=None):
     """各カットの 0/25/50/75/100% と入りの着地直後を静止画にし、
     一覧画像（コンタクトシート）にまとめる。書き出し前の目視確認用。"""
-    renderer = KineticRenderer(image_path, plan, beats, style)
+    renderer = KineticRenderer(image_path, plan, beats, style, backgrounds=backgrounds)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     thumb_w, thumb_h = 216, 384
@@ -1396,22 +1459,24 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8):
     return sheets
 
 
-PLAN_VERSION = 3
+PLAN_VERSION = 4
 
 
-def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None):
+def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None):
     plan_path = Path(plan_path)
     lines = [a["line"] for a in alignment]
     if plan_path.exists() and not replan:
         saved = json.loads(plan_path.read_text(encoding="utf-8"))
         if ([c["text"] for c in saved.get("plan", [])] == lines and saved.get("alignment") == alignment
-                and saved.get("version") == PLAN_VERSION and saved.get("meta") == meta):
+                and saved.get("version") == PLAN_VERSION and saved.get("meta") == meta
+                and saved.get("backgrounds") == (backgrounds or [])):
             return saved["plan"]
         print("      kinetic_plan.json は歌詞・タイミング・曲情報・設計の版のいずれかが変わったため作り直します")
-    plan = build_plan(alignment, sections, beats, style, meta)
+    plan = build_plan(alignment, sections, beats, style, meta, backgrounds)
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
-        json.dumps({"version": PLAN_VERSION, "meta": meta, "alignment": alignment, "plan": plan},
+        json.dumps({"version": PLAN_VERSION, "meta": meta, "backgrounds": backgrounds or [],
+                    "alignment": alignment, "plan": plan},
                    ensure_ascii=False, indent=1),
         encoding="utf-8",
     )

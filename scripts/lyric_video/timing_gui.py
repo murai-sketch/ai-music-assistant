@@ -27,6 +27,7 @@ timing_gui.py
         怪しい = 字幕はあるが、その時間に歌が聞き取れていない／認識と一致しない行
         未使用 = 歌詞ノートにあるのに字幕に使われていない行
     - キネティック描画の実物プレビュー、静止画チェック、書き出し（進捗表示つき）
+    - 背景素材: 複数の画像・動画を用途（Verse／サビ／囁き／間奏／どこでも）つきで追加
     - 部分書き出し: 開始・終了（再生位置から／選択行の範囲から）を決めて、その区間だけを音声付きで書き出す
     - 保存のたびに直前の alignment.json を alignment.bak-<日時>.json に退避する
 
@@ -69,7 +70,7 @@ MAX_BACKUPS = 30
 MIME_TYPES = {
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".flac": "audio/flac",
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
-    ".mp4": "video/mp4",
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".m4v": "video/mp4",
 }
 
 STATE = {
@@ -160,26 +161,32 @@ def _run_alignment(reset):
         STATE["align_error"] = traceback.format_exc()
 
 
+def _backgrounds():
+    from kinetic_bg import load_backgrounds
+
+    return load_backgrounds(_cache_dir())
+
+
 def _plan_for(alignment, style_name):
     from kinetic import build_plan
 
     note = _note()
     sections = sections_for_alignment(alignment, note.lyric_sections)
-    return build_plan(alignment, sections, _beats(), STYLES[style_name], note.meta)
+    return build_plan(alignment, sections, _beats(), STYLES[style_name], note.meta, _backgrounds())
 
 
 def _preview_jpeg(alignment, t, style_name):
     from kinetic import KineticRenderer
 
     key = hashlib.sha1(
-        json.dumps([alignment, style_name, STATE["image_path"]], ensure_ascii=False, sort_keys=True).encode()
+        json.dumps([alignment, style_name, STATE["image_path"], _backgrounds()], ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()
     with _LOCK:
         if _PREVIEW["key"] != key:
             plan = _plan_for(alignment, style_name)
             _PREVIEW["renderer"] = KineticRenderer(
                 STATE["image_path"], plan, _beats(), STYLES[style_name],
-                duration=_get_audio_duration(STATE["audio_path"]),
+                duration=_get_audio_duration(STATE["audio_path"]), backgrounds=_backgrounds(),
             )
             _PREVIEW["key"] = key
         frame = _PREVIEW["renderer"].frame_at(t)
@@ -202,12 +209,14 @@ def _run_render(style_name, stills_only, part=None):
         alignment = cache["alignment"]
         style = STYLES[style_name]
         sections = sections_for_alignment(alignment, note.lyric_sections)
+        backgrounds = _backgrounds()
         plan = load_or_build_plan(cache_dir / "kinetic_plan.json", alignment, sections, _beats(), style,
-                                  meta=note.meta)
+                                  meta=note.meta, backgrounds=backgrounds)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         if stills_only:
             out_dir = cache_dir / f"gui_stills_{stamp}"
-            STATE["stills"] = [str(p) for p in render_stills(STATE["image_path"], plan, _beats(), style, out_dir)]
+            STATE["stills"] = [str(p) for p in render_stills(STATE["image_path"], plan, _beats(), style, out_dir,
+                                                             backgrounds=backgrounds)]
         else:
             if part:
                 t0, t1 = part
@@ -220,7 +229,7 @@ def _run_render(style_name, stills_only, part=None):
                 STATE["render_progress"] = p
 
             render_kinetic(STATE["image_path"], STATE["audio_path"], plan, _beats(), style, out,
-                           progress=progress, t_start=t0, t_end=t1)
+                           progress=progress, t_start=t0, t_end=t1, backgrounds=backgrounds)
             STATE["render_output"] = str(out)
         STATE["render_progress"] = 1.0
         STATE["render_status"] = "done"
@@ -332,6 +341,22 @@ class Handler(BaseHTTPRequestHandler):
                 "ignored_gaps": cache.get("ignored_gaps", []),
                 "backups": sorted(p.name for p in _cache_dir().glob("alignment.bak-*.json"))[-8:],
             })
+        elif path == "/backgrounds":
+            if not self._need("audio_path"):
+                return
+            items = _backgrounds()
+            self._json({"items": [{"file": i["file"], "name": Path(i["file"]).name, "use": i.get("use", "any")} for i in items]})
+        elif path == "/background/thumb":
+            name = query.get("file", [""])[0]
+            if name and any(i["file"] == name for i in _backgrounds()) and Path(name).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                from PIL import Image as _Image
+                im = _Image.open(name).convert("RGB")
+                im.thumbnail((240, 240))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=80)
+                self._bytes(buf.getvalue(), "image/jpeg")
+            else:
+                self.send_response(404); self.end_headers()
         elif path == "/align/status":
             self._json({"status": STATE["align_status"], "error": STATE["align_error"]})
         elif path == "/render/status":
@@ -371,6 +396,31 @@ class Handler(BaseHTTPRequestHandler):
             dest = UPLOAD_DIR / f"{kind}_{uuid.uuid4().hex[:8]}{ext}"
             dest.write_bytes(body)
             STATE[f"{kind}_path"] = str(dest)
+            self._json({"ok": True})
+        elif path == "/upload/bg":
+            if not self._need("audio_path"):
+                return
+            from kinetic_bg import USES, save_backgrounds
+            ext = Path("x" + query.get("ext", [".bin"])[0]).suffix.lower()
+            use = query.get("use", ["any"])[0]
+            if ext not in MIME_TYPES or use not in USES:
+                self._json({"error": f"対応していない形式・用途: {ext} / {use}"}, 400); return
+            dest_dir = WORK_DIR / "backgrounds" / Path(STATE["song_path"] or "unknown").stem
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / f"{use}_{uuid.uuid4().hex[:6]}{ext}"
+            dest.write_bytes(body)
+            items = _backgrounds() + [{"file": str(dest), "use": use}]
+            save_backgrounds(_cache_dir(), items)
+            self._json({"ok": True})
+        elif path == "/backgrounds":
+            if not self._need("audio_path"):
+                return
+            from kinetic_bg import USES, save_backgrounds
+            data = json.loads(body.decode("utf-8"))
+            known = {i["file"] for i in _backgrounds()}
+            items = [{"file": i["file"], "use": i["use"]} for i in data.get("items", [])
+                     if i.get("file") in known and i.get("use") in USES]
+            save_backgrounds(_cache_dir(), items)
             self._json({"ok": True})
         elif path == "/song":
             name = Path(query.get("name", [""])[0]).name
@@ -479,7 +529,7 @@ button.small { padding:1px 6px; font-size:12px; }
 main { display:grid; grid-template-columns: 300px minmax(0, 1fr); gap:10px; padding:10px; }
 main > div { min-width:0; }
 aside, section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; }
-aside { align-self:start; position:sticky; top:54px; }
+aside { align-self:start; position:sticky; top:54px; max-height:calc(100vh - 64px); overflow:auto; }
 #previewBox { width:100%; aspect-ratio:9/16; background:#000; border-radius:6px; overflow:hidden; position:relative; }
 #previewImg { width:100%; height:100%; object-fit:cover; display:block; }
 #previewNote { position:absolute; bottom:4px; left:6px; font-size:11px; color:#aaa; text-shadow:0 0 3px #000; }
@@ -505,6 +555,9 @@ tr.low td.match { color:var(--warn); }
 .hint { color:var(--dim); font-size:11px; }
 kbd { background:#2a2a30; border:1px solid #444; border-radius:3px; padding:0 4px; font-size:11px; }
 #stills img { width:100%; margin-top:6px; border-radius:4px; }
+.bgitem { display:flex; gap:6px; align-items:center; margin:4px 0; }
+.bgitem img { width:64px; height:36px; object-fit:cover; border-radius:3px; background:#000; }
+.bgitem .name { flex:1; font-size:11px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 fieldset.part { border:1px solid var(--line); border-radius:6px; margin:8px 0; padding:4px 8px 8px; }
 fieldset.part legend { color:var(--dim); font-size:12px; }
 .hidden { display:none !important; }
@@ -553,6 +606,19 @@ fieldset.part legend { color:var(--dim); font-size:12px; }
         <button class="primary" id="partRenderBtn">部分を書き出す</button>
       </div>
       <div class="hint" id="partInfo"></div>
+    </fieldset>
+    <fieldset class="part">
+      <legend>背景素材（複数・用途ごと）</legend>
+      <div class="toolbar">
+        <select id="bgUse">
+          <option value="verse">Verse 用</option><option value="hook">サビ用</option>
+          <option value="quiet">囁き用</option><option value="interlude">間奏用</option><option value="any">どこでも</option>
+        </select>
+        <span class="drop" id="dropBg">＋ 画像・動画を追加</span>
+        <input type="file" id="fileBg" class="hidden" accept="image/*,video/*" multiple>
+      </div>
+      <div id="bgList"></div>
+      <div class="hint">画像背景のカットに、強さに合う用途の素材が順番に使われます。無い用途は「どこでも」→ 上の🖼背景で代用します。</div>
     </fieldset>
     <div class="status" id="renderStatus"></div>
     <div class="toolbar">
@@ -698,6 +764,7 @@ async function loadProject() {
   undoStack = []; redoStack = []; lastSnap = snapshot(); setDirty(false);
   if (!rows.length) $('alignStatus').textContent = 'タイミング未作成：「自動タイミング」を押してください';
   if (!peaks) await decodeWaveform();
+  await loadBackgrounds();
   refresh(); requestPreview();
 }
 
@@ -1272,6 +1339,41 @@ let openWhat = 'video';
 $('openFolderBtn').onclick = () => fetch('/open-folder', {method: 'POST', body: JSON.stringify({what: openWhat})});
 $('stillsBtn').onclick = () => startRender(true);
 $('renderBtn').onclick = () => startRender(false);
+
+// ---------- 背景素材 ----------
+const USE_LABEL = {verse: 'Verse', hook: 'サビ', quiet: '囁き', interlude: '間奏', any: 'どこでも'};
+let bgItems = [];
+async function loadBackgrounds() {
+  const r = await fetch('/backgrounds'); if (!r.ok) return;
+  bgItems = (await r.json()).items;
+  $('bgList').innerHTML = bgItems.map((b, i) => `
+    <div class="bgitem" data-i="${i}">
+      <img src="/background/thumb?file=${encodeURIComponent(b.file)}" onerror="this.style.visibility='hidden'">
+      <span class="name" title="${esc(b.file)}">${esc(b.name)}</span>
+      <select data-a="use">${Object.entries(USE_LABEL).map(([k, v]) => `<option value="${k}" ${k === b.use ? 'selected' : ''}>${v}</option>`).join('')}</select>
+      <button class="small" data-a="del" title="一覧から外す（ファイルは消さない）">✕</button>
+    </div>`).join('') || '<div class="hint">まだありません（🖼背景の1枚だけを使います）</div>';
+}
+async function saveBackgrounds() {
+  await fetch('/backgrounds', {method: 'POST', body: JSON.stringify({items: bgItems})});
+  await loadBackgrounds(); requestPreview(true);
+}
+$('bgList').addEventListener('change', e => { const row = e.target.closest('.bgitem'); if (!row) return; bgItems[+row.dataset.i].use = e.target.value; saveBackgrounds(); });
+$('bgList').addEventListener('click', e => { if (e.target.dataset.a !== 'del') return; bgItems.splice(+e.target.closest('.bgitem').dataset.i, 1); saveBackgrounds(); });
+$('dropBg').onclick = () => $('fileBg').click();
+$('dropBg').ondragover = e => e.preventDefault();
+$('dropBg').ondrop = e => { e.preventDefault(); uploadBgs(e.dataTransfer.files); };
+$('fileBg').onchange = () => uploadBgs($('fileBg').files);
+async function uploadBgs(files) {
+  for (const file of files) {
+    $('dropBg').textContent = `追加中… ${file.name}`;
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+    const r = await fetch(`/upload/bg?ext=${encodeURIComponent(ext)}&use=${$('bgUse').value}`, {method: 'POST', body: await file.arrayBuffer()});
+    if (!r.ok) alert((await r.json()).error);
+  }
+  $('dropBg').textContent = '＋ 画像・動画を追加';
+  await loadBackgrounds(); requestPreview(true);
+}
 
 // ---------- 部分書き出し ----------
 function partRange() { return [+$('partStart').value, +$('partEnd').value]; }
