@@ -260,6 +260,10 @@ def _global_align(lyric_lines, word_segments, audio_duration):
             starts[i] = cursor
             cursor += span * line_len[i] / total
 
+    matched_per_line = [0] * n_lines
+    for li_char in matched:
+        matched_per_line[l_line[li_char]] += 1
+
     result = []
     for i, line in enumerate(lyric_lines):
         if i + 1 < n_lines:
@@ -268,7 +272,11 @@ def _global_align(lyric_lines, word_segments, audio_duration):
             end = ends[i] + 0.5 if ends[i] is not None else tail_end
             if audio_duration:
                 end = min(end, audio_duration)
-        result.append({"line": line, "start": starts[i], "end": end})
+        result.append({
+            "line": line, "start": starts[i], "end": end,
+            # src: 歌詞ノートの何行目(0始まり)か / match: 認識テキストと一致した文字の割合
+            "src": i, "match": round(matched_per_line[i] / line_len[i], 2),
+        })
 
     for i in range(1, len(result)):
         if result[i]["start"] < result[i - 1]["start"]:
@@ -460,6 +468,12 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
         if cached.get("lyric_lines") == lyric_lines:
             return cached["alignment"]
+        if cached.get("edited"):
+            # 歌詞ノートが変わった。GUIでの手直しを失わないよう退避してから作り直す
+            backup = cache_path.with_name(f"alignment.bak-lyrics-changed-{audio_hash}.json")
+            backup.write_text(cache_path.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"[WARN] 歌詞ノートが変わったため自動タイミングを作り直します。"
+                  f"手直し済みの版は {backup.name} に退避しました（GUIの「バックアップから戻す」で戻せます）。")
 
     audio_duration = _get_audio_duration(audio_path)
     words_path = cache_dir / "whisper_words.json"

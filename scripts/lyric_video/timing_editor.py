@@ -177,8 +177,8 @@ def cmd_apply(args):
 
     new_alignment = _parse_sheet(sheet_path, len(cache["alignment"]))
     # 歌詞テキスト自体は元のalignmentのものを正とする（シート内テキストは表示用の参考情報）
-    for new_item, old_item in zip(new_alignment, cache["alignment"]):
-        new_item["line"] = old_item["line"]
+    for i, (new_item, old_item) in enumerate(zip(new_alignment, cache["alignment"])):
+        new_alignment[i] = {**old_item, "start": new_item["start"], "end": new_item["end"]}
 
     new_alignment = _enforce_monotonic(new_alignment)
     cache["alignment"] = new_alignment
@@ -273,7 +273,7 @@ def cmd_anchor(args):
             end = new_starts[i + 1]
         else:
             end = start + max(item["end"] - item["start"], 0.5)
-        new_alignment.append({"line": item["line"], "start": start, "end": end})
+        new_alignment.append({**item, "start": start, "end": end})
 
     new_alignment = _enforce_monotonic(new_alignment)
     cache["alignment"] = new_alignment

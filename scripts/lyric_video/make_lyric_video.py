@@ -41,7 +41,7 @@ from pathlib import Path
 from align import WORK_DIR, _audio_hash, align_lyrics
 from beats import detect_beats
 from render import render_video
-from song_note import SongNote
+from song_note import SongNote, sections_for_alignment
 from styles import DEFAULT_STYLE, STYLES, get_style
 
 
@@ -127,7 +127,7 @@ def main():
         from kinetic import load_or_build_plan, render_kinetic, render_stills
 
         plan_path = WORK_DIR / _audio_hash(audio_path) / "kinetic_plan.json"
-        sections = [section for _line, section in note.lyric_sections]
+        sections = sections_for_alignment(alignment, note.lyric_sections)
         plan = load_or_build_plan(plan_path, alignment, sections, beats, style, replan=args.replan)
         print(f"      カット設計: {plan_path}（一覧は {plan_path.with_suffix('.md').name}）")
         if args.stills:

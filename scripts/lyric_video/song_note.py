@@ -85,6 +85,29 @@ def extract_lyric_lines_with_sections(text):
     return lines
 
 
+def sections_for_alignment(alignment, lyric_sections):
+    """alignment の各行の構成タグ名を返す。GUIで行を追加・削除した後でも
+    対応が取れるよう、行の section → src（ノートの行番号）→ 同じ文言の
+    ノート行 → 位置 の順で決める。"""
+    by_text = {}
+    for line, section in lyric_sections:
+        by_text.setdefault(line, section)
+    same_length = len(alignment) == len(lyric_sections)
+    out = []
+    for i, row in enumerate(alignment):
+        if row.get("section") is not None:
+            out.append(row["section"])
+        elif isinstance(row.get("src"), int) and 0 <= row["src"] < len(lyric_sections):
+            out.append(lyric_sections[row["src"]][1])
+        elif row.get("line") in by_text:
+            out.append(by_text[row["line"]])
+        elif same_length:
+            out.append(lyric_sections[i][1])
+        else:
+            out.append(out[-1] if out else "")
+    return out
+
+
 class SongNote:
     def __init__(self, path):
         self.path = Path(path)

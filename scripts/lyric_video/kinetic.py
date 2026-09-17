@@ -16,6 +16,9 @@ render.py（字幕を中央下にポップインさせる方式）とは別に�
       囁き→静かな動き・明朝・暗い背景 / Hook・Chorus→叩きつけ・背景色の切り替え
   - 背景に同じ言葉を巨大・薄く（不透明度7%前後）敷く
   - 叩きつけ系の着地をビートに合わせる
+  - カメラ: 背景が変わらない一続きのカット（ショット）ごとに、背景画像を
+    パン/ティルト/寄り/引き/傾きで動かす。Hookの着地では画面全体を
+    パンチイン＋揺れ。背景の動きを文字より大きくして奥行きを出す
   - 点滅の安全: 白フラッシュは1〜2フレーム、0.5秒以内に連発しない。
     背景色の切り替えも0.5秒以上の間隔を空ける
 
@@ -66,6 +69,7 @@ VERSE_MOTIONS = ["slide_l", "stagger", "mask", "slide_r", "rotate", "stagger", "
 QUIET_MOTIONS = ["mask", "float"]
 HOOK_MOTIONS = ["slam", "grow", "slam", "converge"]
 LAYOUTS = ["center", "left", "right", "vertical", "diagonal"]
+CAMERA_MOVES = ["pan_l", "push_in", "tilt_up", "pan_r", "pull_out", "dutch", "tilt_down"]
 
 # 入り（フレーム数）。記事の目安: 叩きつけ4〜8f / スライド5〜10f / マスク6〜12f
 ENTRANCE_FRAMES = {
@@ -128,6 +132,9 @@ def build_plan(alignment, sections, beats, style):
         counts[item["line"]] = counts.get(item["line"], 0) + 1
 
     plan = []
+    shot = -1
+    prev_bg = object()
+    prev_end = -99.0
     prev_layout = None
     verse_i = 0
     hook_i = 0
@@ -203,8 +210,21 @@ def build_plan(alignment, sections, beats, style):
             if near:
                 land = min(near, key=lambda b: abs(b - land))
 
+        if bg_mode != prev_bg or level == 3 or start - prev_end > GAP_FOR_REST:
+            shot += 1
+            if level == 3:
+                camera = "punch"
+            elif level == 1:
+                camera = "drift"
+            else:
+                camera = CAMERA_MOVES[shot % len(CAMERA_MOVES)]
+        prev_bg = bg_mode
+        prev_end = show_end
+
         plan.append({
             "index": i + 1,
+            "shot": shot,
+            "camera": camera,
             "text": text,
             "section": section,
             "level": level,
@@ -232,12 +252,12 @@ def build_plan(alignment, sections, beats, style):
 
 
 def plan_to_markdown(plan):
-    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | フラッシュ |", "|---|---|---|---|---|---|---|"]
+    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | フラッシュ |", "|---|---|---|---|---|---|---|---|"]
     for c in plan:
         bg = c["bg"] if c["bg"] == "image" else f"色{c['bg']}"
         out.append(
             f"| {c['index']} | {c['start']:.2f}–{c['end']:.2f} | {c['level']} | {c['layout']} | "
-            f"{c['motion']} | {bg} | {'●' if c['flash'] else ''} |"
+            f"{c['motion']} | {bg} | {c.get('camera', '')} | {'●' if c['flash'] else ''} |"
         )
     return "\n".join(out) + "\n"
 
@@ -540,15 +560,17 @@ class _Cut:
             scale *= _lerp(0.9, 1.0, q)
         return dx, dy, scale, angle, alpha, crop_top, crop_right
 
-    def draw(self, frame, t, sprites):
+    def draw(self, frame, t, sprites, cam=(1.0, 0.0, 0.0, 0.0)):
         cut = self.cut
         tl = t - cut["start"]
         dur = cut["end"] - cut["start"]
         if tl < -0.2 or tl > dur:
             return
-        # 背景の巨大文字（ゆっくり流れる）
-        ex = int(VIDEO_SIZE[0] / 2 - self.echo.size[0] / 2 + (40 - 80 * tl / max(dur, 0.1)) * (1 if cut["index"] % 2 else -1))
-        ey = int(VIDEO_SIZE[1] * (0.22 if cut["index"] % 2 else 0.78) - self.echo.size[1] / 2)
+        # 背景の巨大文字: ゆっくり流れ、背景カメラと逆向きに大きく動く（単色背景でもカメラが感じられる）
+        _zoom, px, py, _angle = cam
+        ex = int(VIDEO_SIZE[0] / 2 - self.echo.size[0] / 2
+                 + (40 - 80 * tl / max(dur, 0.1)) * (1 if cut["index"] % 2 else -1) - px * 260)
+        ey = int(VIDEO_SIZE[1] * (0.22 if cut["index"] % 2 else 0.78) - self.echo.size[1] / 2 - py * 360)
         frame.paste(self.echo, (ex, ey), self.echo)
 
         ax, ay = self.anchor
@@ -623,22 +645,21 @@ class _Cut:
 # 背景
 
 class _Background:
+    """背景画像は画面を覆う大きさ（縦長画面に横長画像なら横に余りが出る）で
+    保持し、カメラの窓（寄り・パン位置・傾き）で切り出す。"""
+
     def __init__(self, image_path, beats, style):
         img = Image.open(image_path).convert("RGB")
         W, H = VIDEO_SIZE
         s = max(W / img.width, H / img.height)
         img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1), Image.LANCZOS)
-        left = (img.width - W) // 2
-        top = (img.height - H) // 2
-        img = img.crop((left, top, left + W, top + H))
-        self.image = ImageEnhance.Brightness(img).enhance(0.55)
+        self.cover = ImageEnhance.Brightness(img).enhance(0.55)
         self.beats = beats or []
         self.pulse_scale = style.get("pulse_scale", 1.08)
         self.pulse_decay = style.get("pulse_decay_sec", 0.14)
-        self._pulse_cache = {}
         self._solid = {}
 
-    def _pulse(self, t):
+    def pulse(self, t):
         if not self.beats:
             return 1.0
         idx = bisect.bisect_right(self.beats, t) - 1
@@ -649,20 +670,24 @@ class _Background:
             return 1.0
         return 1.0 + (self.pulse_scale - 1.0) * math.exp(-dt / self.pulse_decay)
 
-    def image_at(self, t):
-        s = round(self._pulse(t) / 0.005) * 0.005
-        im = self._pulse_cache.get(s)
-        if im is None:
-            if s <= 1.0:
-                im = self.image
-            else:
-                W, H = VIDEO_SIZE
-                big = self.image.resize((int(W * s), int(H * s)), Image.BILINEAR)
-                l = (big.width - W) // 2
-                tp = (big.height - H) // 2
-                im = big.crop((l, tp, l + W, tp + H))
-            self._pulse_cache[s] = im
-        return im
+    def image_at(self, t, cam):
+        W, H = VIDEO_SIZE
+        zoom, px, py, angle = cam
+        zoom *= self.pulse(t)
+        th = math.radians(angle)
+        # 傾けても画面外（黒）が見えない最小の寄り
+        zoom = max(zoom, math.cos(th) + (W / H) * abs(math.sin(th)) + 0.01, 1.0)
+        CW, CH = self.cover.size
+        room_x = max((CW - W / zoom) / 2, 0)
+        room_y = max((CH - H / zoom) / 2, 0)
+        cx = CW / 2 + px * room_x
+        cy = CH / 2 + py * room_y
+        cos_t, sin_t = math.cos(th), math.sin(th)
+        a, b = cos_t / zoom, -sin_t / zoom
+        d, e = sin_t / zoom, cos_t / zoom
+        c = cx - a * W / 2 - b * H / 2
+        f = cy - d * W / 2 - e * H / 2
+        return self.cover.transform(VIDEO_SIZE, Image.AFFINE, (a, b, c, d, e, f), resample=Image.BILINEAR)
 
     def solid(self, color):
         im = self._solid.get(color)
@@ -671,11 +696,45 @@ class _Background:
             self._solid[color] = im
         return im
 
-    def frame(self, mode, t):
+    def frame(self, mode, t, cam):
         if mode == "image":
-            return self.image_at(t).copy()
+            return self.image_at(t, cam)
         return self.solid(DEFAULT_PALETTE[mode][0]).copy()
 
+
+def _smooth(u):
+    u = min(max(u, 0.0), 1.0)
+    return u * u * (3 - 2 * u)
+
+
+def camera_move(name, u, since_land, index):
+    """背景カメラ: (寄り, 横位置-1..1, 縦位置-1..1, 傾き度)"""
+    s = _smooth(u)
+    side = 1 if index % 2 else -1
+    if name == "push_in":
+        return (_lerp(1.05, 1.3, s), 0.0, 0.0, 0.0)
+    if name == "pull_out":
+        return (_lerp(1.3, 1.05, s), 0.0, 0.0, 0.0)
+    if name == "pan_l":
+        return (1.12, _lerp(0.85, -0.85, s), 0.0, 0.0)
+    if name == "pan_r":
+        return (1.12, _lerp(-0.85, 0.85, s), 0.0, 0.0)
+    if name == "tilt_up":
+        return (1.22, 0.3 * side, _lerp(0.8, -0.8, s), 0.0)
+    if name == "tilt_down":
+        return (1.22, -0.3 * side, _lerp(-0.8, 0.8, s), 0.0)
+    if name == "dutch":
+        return (1.15, _lerp(0.4, -0.4, s) * side, 0.0, _lerp(-2.5, 2.5, s) * side)
+    if name == "punch":
+        base = _lerp(1.18, 1.26, s)
+        if since_land >= 0:
+            base += 0.25 * math.exp(-since_land / 0.12)
+        return (base, 0.55 * side, 0.0, 1.5 * side)
+    # drift
+    return (_lerp(1.05, 1.12, s), _lerp(-0.3, 0.3, s) * side, 0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 
@@ -683,6 +742,18 @@ class KineticRenderer:
     def __init__(self, image_path, plan, beats, style):
         self.plan = plan
         self.starts = [c["start"] for c in plan]
+        # ショットごとの開始・終了（次のショットの開始まで動き続ける）
+        self.shot_span = {}
+        for j, c in enumerate(plan):
+            sh = c.get("shot", j)
+            lo, _hi = self.shot_span.get(sh, (c["start"], c["end"]))
+            self.shot_span[sh] = (lo, c["end"])
+        shots = sorted(self.shot_span)
+        for a, b in zip(shots, shots[1:]):
+            self.shot_span[a] = (self.shot_span[a][0], self.shot_span[b][0])
+        if shots:
+            lo, hi = self.shot_span[shots[-1]]
+            self.shot_span[shots[-1]] = (lo, hi + 4.0)
         self.bg = _Background(image_path, beats, style)
         self.sprites = _Sprites(_Fonts())
         self.cuts = []
@@ -727,11 +798,40 @@ class KineticRenderer:
             return mode, prev, max(p, 0.0)
         return mode, None, 1.0
 
+    def camera_at(self, t):
+        """(背景カメラ, 画面全体の寄り, 画面全体の揺れx, 揺れy)"""
+        k = bisect.bisect_right(self.starts, t) - 1
+        if k < 0:
+            first = self.starts[0] if self.starts else 1.0
+            return camera_move("drift", t / max(first, 0.1), -1, 0), 1.0, 0.0, 0.0
+        c = self.plan[k]
+        sh = c.get("shot", k)
+        lo, hi = self.shot_span.get(sh, (c["start"], c["end"]))
+        u = (t - lo) / max(hi - lo, 0.1)
+        since_land = t - c["land"]
+        bg_cam = camera_move(c.get("camera", "drift"), u, since_land, sh)
+
+        span_c = max((self.plan[k + 1]["start"] if k + 1 < len(self.plan) else c["end"]) - c["start"], 0.1)
+        uc = min(max((t - c["start"]) / span_c, 0.0), 1.0)
+        # 単色背景では背景カメラが見えないので、画面全体の寄りを強める
+        g_zoom = 1.0 + (0.02 if c["bg"] == "image" else 0.06) * uc
+        sx = sy = 0.0
+        if c["level"] == 3 and since_land >= 0:
+            g_zoom += 0.07 * math.exp(-since_land / 0.12)
+            amp = 14 * math.exp(-since_land / 0.08)
+            sx = amp * math.sin(t * 90)
+            sy = amp * math.cos(t * 77)
+            g_zoom += 0.012 * (self.bg.pulse(t) - 1.0) / max(self.bg.pulse_scale - 1.0, 1e-3)
+        elif c["level"] == 1:
+            g_zoom = 1.0 + 0.015 * uc
+        return bg_cam, g_zoom, sx, sy
+
     def frame_at(self, t):
+        bg_cam, g_zoom, sx, sy = self.camera_at(t)
         mode, prev, p = self._bg_mode_at(t)
-        frame = self.bg.frame(mode, t)
+        frame = self.bg.frame(mode, t, bg_cam)
         if prev is not None:
-            old = self.bg.frame(prev, t)
+            old = self.bg.frame(prev, t, bg_cam)
             cut_x = int(VIDEO_SIZE[0] * _ease_out(p))
             k = bisect.bisect_right(self.starts, t) - 1
             if k % 2:
@@ -740,25 +840,36 @@ class KineticRenderer:
                 w = VIDEO_SIZE[0] - cut_x
                 frame.paste(old.crop((0, 0, w, VIDEO_SIZE[1])), (0, 0))
         for j in self._active(t):
-            self.cuts[j].draw(frame, t, self.sprites)
+            self.cuts[j].draw(frame, t, self.sprites, bg_cam)
             c = self.plan[j]
             if c["flash"]:
                 df = (t - c["land"]) * FPS
                 if 0 <= df < 2:
                     white = Image.new("RGB", VIDEO_SIZE, (255, 255, 255))
                     frame = Image.blend(frame, white, 0.7 if df < 1 else 0.3)
+        if g_zoom > 1.0005 or sx or sy:
+            W, H = VIDEO_SIZE
+            z = max(g_zoom, 1.0 + 2 * max(abs(sx), abs(sy)) / W)
+            a = 1 / z
+            c0 = W / 2 - a * W / 2 - sx / z
+            f0 = H / 2 - a * H / 2 - sy / z
+            frame = frame.transform(VIDEO_SIZE, Image.AFFINE, (a, 0, c0, 0, a, f0), resample=Image.BILINEAR)
         return frame
 
 
-def render_kinetic(image_path, audio_path, plan, beats, style, output_path):
+def render_kinetic(image_path, audio_path, plan, beats, style, output_path, progress=None):
     from moviepy import AudioFileClip, VideoClip
 
     renderer = KineticRenderer(image_path, plan, beats, style)
     audio = AudioFileClip(str(audio_path))
-    clip = VideoClip(
-        frame_function=lambda t: np.asarray(renderer.frame_at(t)),
-        duration=audio.duration,
-    ).with_audio(audio)
+    total = max(audio.duration, 0.1)
+
+    def frame(t):
+        if progress:
+            progress(min(t / total, 0.99))
+        return np.asarray(renderer.frame_at(t))
+
+    clip = VideoClip(frame_function=frame, duration=audio.duration).with_audio(audio)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     clip.write_videofile(
