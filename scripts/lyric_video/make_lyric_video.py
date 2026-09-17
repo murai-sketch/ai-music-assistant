@@ -128,7 +128,8 @@ def main():
 
         plan_path = WORK_DIR / _audio_hash(audio_path) / "kinetic_plan.json"
         sections = sections_for_alignment(alignment, note.lyric_sections)
-        plan = load_or_build_plan(plan_path, alignment, sections, beats, style, replan=args.replan)
+        plan = load_or_build_plan(plan_path, alignment, sections, beats, style,
+                                  replan=args.replan, meta=note.meta)
         print(f"      カット設計: {plan_path}（一覧は {plan_path.with_suffix('.md').name}）")
         if args.stills:
             print(f"[4/4] 静止画一覧を書き出し中: {args.stills}")

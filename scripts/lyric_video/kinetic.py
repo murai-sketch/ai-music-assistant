@@ -37,7 +37,9 @@ import math
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+
+import kinetic_fx
 
 VIDEO_SIZE = (1080, 1920)
 FPS = 30
@@ -78,6 +80,7 @@ ENTRANCE_FRAMES = {
     "slam": 6, "slash": 6, "shake": 6, "stagger": 4, "slide_l": 7, "slide_r": 7,
     "dash": 6, "mask": 9, "spread": 12, "converge": 10, "rotate": 8, "fall": 8,
     "grow": 10, "float": 14, "erase": 9,
+    "stamp": 6, "scatter": 5, "pop": 6, "neon": 6,
 }
 EXIT_FRAMES = 3
 MIN_FLASH_GAP = 2.0
@@ -129,9 +132,10 @@ def _split_rows(text):
     return [joined]
 
 
-def build_plan(alignment, sections, beats, style):
+def build_plan(alignment, sections, beats, style, meta=None):
     """alignment（[{line,start,end}]）と、行ごとの構成タグ名から、
-    カットごとの設計を作る。"""
+    カットごとの設計を作る。meta（曲ノートの title/genre/tags/bpm）があれば、
+    曲の性格に合わせて参考作品由来の技法（kinetic_fx）を割り当てる。"""
     max_hold = style.get("max_hold_sec", 2.8)
     counts = {}
     for item in alignment:
@@ -247,6 +251,11 @@ def build_plan(alignment, sections, beats, style):
                      and (i == 0 or plan[-1]["level"] != 3),
         })
 
+    profile = kinetic_fx.song_profile(alignment, sections, beats, meta)
+    kinetic_fx.assign_techniques(plan, profile)
+    for cut in plan:
+        cut["profile_wa"] = profile["wa"]
+
     last_flash = -99.0
     for cut in plan:
         if cut["flash"]:
@@ -258,12 +267,14 @@ def build_plan(alignment, sections, beats, style):
 
 
 def plan_to_markdown(plan):
-    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | フラッシュ |", "|---|---|---|---|---|---|---|---|"]
+    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 退場 | フラッシュ |",
+           "|---|---|---|---|---|---|---|---|---|---|---|"]
     for c in plan:
         bg = c["bg"] if c["bg"] == "image" else f"色{c['bg']}"
         out.append(
             f"| {c['index']} | {c['start']:.2f}–{c['end']:.2f} | {c['level']} | {c['layout']} | "
-            f"{c['motion']} | {bg} | {c.get('camera', '')} | {'●' if c['flash'] else ''} |"
+            f"{c['motion']} | {bg} | {c.get('camera', '')} | {c.get('decor') or ''} | "
+            f"{c.get('texture') or ''} | {c.get('exit') or ''} | {'●' if c['flash'] else ''} |"
         )
     return "\n".join(out) + "\n"
 
@@ -321,6 +332,32 @@ class _Sprites:
             self.base[key] = g
         return g
 
+    def neon(self, ch, font_path, size, color):
+        key = ("neon", ch, font_path, size, color)
+        g = self.base.get(key)
+        if g is None:
+            font = self.fonts.get(font_path, size)
+            sw = max(size // 28, 3)
+            pad = size // 6
+            l, t, r, b = font.getbbox(ch, stroke_width=sw)
+            w, h = r - l + pad * 2, b - t + pad * 2
+            outline = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            ImageDraw.Draw(outline).text(
+                (pad - l, pad - t), ch, font=font, fill=(0, 0, 0, 0),
+                stroke_width=sw, stroke_fill=_hex(color) + (255,),
+            )
+            glow = outline.filter(ImageFilter.GaussianBlur(max(size // 16, 4)))
+            glow.putalpha(glow.getchannel("A").point(lambda v: min(int(v * 2.2), 255)))
+            core = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            ImageDraw.Draw(core).text(
+                (pad - l, pad - t), ch, font=font, fill=(0, 0, 0, 0),
+                stroke_width=max(sw // 3, 1), stroke_fill=(255, 255, 255, 255),
+            )
+            img = Image.alpha_composite(Image.alpha_composite(glow, outline), core)
+            g = (img, l - pad, t - pad, font.getlength(ch))
+            self.base[key] = g
+        return g
+
     def echo(self, text, color):
         key = (text, color)
         im = self.echoes.get(key)
@@ -373,16 +410,27 @@ class _Sprites:
 class _Cut:
     """1カット分の文字配置（基準サイズ・回転なしの状態）を持つ。"""
 
-    def __init__(self, cut, sprites, colors, palette_bg):
+    def __init__(self, cut, sprites, colors, palette_bg, beats=None):
         self.cut = cut
+        self._shared = sprites
+        self.colors = colors
+        self.beats = beats or []
         text_color, stroke_color, accent = colors
         level = cut["level"]
         rows = cut["rows"]
         vertical = cut["layout"] == "vertical"
         font_path = FONT_QUIET if level == 1 else FONT_HEAVY
+        emphasis = bool(cut.get("emphasis"))
+        neon = cut.get("entrance") == "neon"
+        self.overlay = None
+
+        def weight(row):
+            if not emphasis:
+                return max(len(row), 1)
+            return max(sum(1.0 if kinetic_fx._is_kanji(ch) else 0.66 for ch in row), 1)
 
         def row_size(row):
-            n = max(len(row), 1)
+            n = weight(row)
             if vertical:
                 return max(min(int(1500 / n), 320 if cut["tier"] == 1 else 220), 60)
             budget = 980 if cut["layout"] in ("center", "diagonal") else 900
@@ -404,9 +452,30 @@ class _Cut:
         size = max(sizes)
         self.size = size
 
+        # 行の中で一番長い漢字の連なり（強調する語）
+        emph_idx = set()
+        if emphasis:
+            flat = "".join(rows)
+            best, cur = (0, 0), None
+            for k, ch in enumerate(flat + " "):
+                if kinetic_fx._is_kanji(ch):
+                    cur = k if cur is None else cur
+                elif cur is not None:
+                    if k - cur > best[1] - best[0]:
+                        best = (cur, k)
+                    cur = None
+            emph_idx = set(range(*best))
+        mis_colors = [accent, "#F2C200"] if cut.get("texture") == "misregister" else []
+
+        def make_glyph(draw_ch, fpath, gsize, fill, stroke, sw):
+            if neon:
+                return sprites.neon(draw_ch, fpath, gsize, accent if fill == accent else "#FF5FA2"), ("neon", draw_ch, fpath, gsize, fill)
+            return sprites.glyph(draw_ch, fpath, gsize, fill, stroke, sw), (draw_ch, fpath, gsize, fill, stroke, sw)
+
         # 段ごとに、最後の段（またはHookの末尾2文字）をアクセント色にする
         glyphs = []
         order = 0
+        flat_i = 0
         row_hs = [sz * 1.1 for sz in sizes]
         total_h = sum(row_hs)
         y_cursor = -total_h / 2
@@ -419,8 +488,11 @@ class _Cut:
                 x0 = -(len(rows) - 1) * row_h / 2 + (len(rows) - 1 - ri) * row_h - rsize / 2
                 y = -len(row) * rsize * 1.02 / 2
             else:
-                font = sprites.fonts.get(font_path, rsize)
-                row_w = sum(font.getlength(ch) for ch in row)
+                def csize(ch):
+                    if emphasis and not kinetic_fx._is_kanji(ch):
+                        return int(rsize * 0.66)
+                    return rsize
+                row_w = sum(sprites.fonts.get(font_path, csize(ch)).getlength(ch) for ch in row)
                 if cut["layout"] == "left":
                     x = -row_w / 2 - 60 + ri * 40
                 elif cut["layout"] == "right":
@@ -430,13 +502,19 @@ class _Cut:
                 y0 = y_cursor
                 y_cursor += row_hs[ri]
             for ci, ch in enumerate(row):
-                is_accent = accent_row or (level == 3 and len(rows) == 1 and len(row) >= 4 and ci >= len(row) - 2)
+                if emphasis:
+                    is_accent = flat_i in emph_idx
+                else:
+                    is_accent = accent_row or (level == 3 and len(rows) == 1 and len(row) >= 4 and ci >= len(row) - 2)
+                flat_i += 1
                 fill = accent if is_accent else text_color
                 stroke = stroke_color
                 if is_accent and palette_bg is not None and _hex(accent) == _hex(stroke_color):
                     stroke = text_color
                 draw_ch = VERTICAL_MAP.get(ch, ch) if vertical else ch
-                g = sprites.glyph(draw_ch, font_path, rsize, fill, stroke, stroke_w)
+                gsize = rsize if vertical else csize(ch)
+                gsw = max(gsize // 24, 3) if palette_bg is None else max(gsize // 40, 2)
+                g, key = make_glyph(draw_ch, font_path, gsize, fill, stroke, gsw)
                 img, l, t, adv = g
                 w, h = img.size
                 if vertical:
@@ -444,18 +522,34 @@ class _Cut:
                     cy = y + rsize * 1.02 * ci + rsize / 2
                     angle = 0
                 else:
+                    drop = (rsize - gsize) * 0.78
                     cx = x + l + w / 2
-                    cy = y0 + t + h / 2
+                    cy = y0 + t + h / 2 + drop
                     x += adv
                     angle = 0
+                mis = []
+                for mc in mis_colors:
+                    mg = sprites.glyph(draw_ch, font_path, gsize, mc, mc, gsw)
+                    mis.append(((draw_ch, font_path, gsize, mc, mc, gsw), mg[0]))
                 glyphs.append({
-                    "key": (draw_ch, font_path, rsize, fill, stroke, stroke_w),
-                    "img": img, "cx": cx, "cy": cy, "order": order, "row": ri, "angle": angle,
+                    "key": key, "img": img, "cx": cx, "cy": cy, "order": order, "row": ri,
+                    "angle": angle, "mis": mis,
                 })
                 order += 1
+        if cut["layout"] == "grid":
+            glyphs = self._grid_glyphs(sprites, "".join(rows), font_path, text_color, stroke_color, accent, palette_bg)
+        if cut.get("entrance") == "scatter":
+            for g in glyphs:
+                o = g["order"] + cut["index"] * 7
+                g["cx"] += (kinetic_fx._hash01(o) - 0.5) * self.size * 0.5
+                g["cy"] += (kinetic_fx._hash01(o + 11) - 0.5) * self.size * 0.8
+                g["angle"] += (kinetic_fx._hash01(o + 23) - 0.5) * 36
+                g["gscale"] = 0.75 + 0.5 * kinetic_fx._hash01(o + 31)
         self.glyphs = glyphs
         self.count = max(order, 1)
         self.n_rows = len(rows)
+        if cut.get("entrance") == "stamp":
+            self.overlay = self._stamp_overlay(accent)
 
         if cut["layout"] == "left":
             self.anchor = (VIDEO_SIZE[0] * 0.47, VIDEO_SIZE[1] * 0.45)
@@ -466,11 +560,85 @@ class _Cut:
         else:
             self.anchor = (VIDEO_SIZE[0] / 2, VIDEO_SIZE[1] * 0.5)
         self.base_angle = -8 if cut["layout"] == "diagonal" else 0
+        if cut.get("entrance") == "stamp":
+            self.base_angle = -4 if cut["index"] % 2 else 3
+        if cut["layout"] == "grid":
+            self.base_angle = -6 if cut["index"] % 2 else 5
 
         # 背景に敷く巨大な文字
         echo_text = max(rows, key=len)
         echo_color = _hex(text_color) if palette_bg is not None else (255, 255, 255)
         self.echo = sprites.echo(echo_text, echo_color)
+
+    def _bounds(self):
+        xs0 = [g["cx"] - g["img"].width / 2 for g in self.glyphs]
+        xs1 = [g["cx"] + g["img"].width / 2 for g in self.glyphs]
+        ys0 = [g["cy"] - g["img"].height / 2 for g in self.glyphs]
+        ys1 = [g["cy"] + g["img"].height / 2 for g in self.glyphs]
+        return min(xs0), min(ys0), max(xs1), max(ys1)
+
+    def _grid_glyphs(self, sprites, text, font_path, text_color, stroke_color, accent, palette_bg):
+        """4文字を2×2の格子に置く。格子の線は overlay として描く。"""
+        cell = 420
+        gsize = 300
+        sw = max(gsize // 24, 3) if palette_bg is None else max(gsize // 40, 2)
+        glyphs = []
+        for k, ch in enumerate(text[:4]):
+            fill = accent if k >= 2 else text_color
+            img, l, t, adv = sprites.glyph(ch, font_path, gsize, fill, stroke_color, sw)
+            cx = (k % 2 - 0.5) * cell
+            cy = (k // 2 - 0.5) * cell
+            glyphs.append({"key": (ch, font_path, gsize, fill, stroke_color, sw), "img": img,
+                           "cx": cx, "cy": cy, "order": k, "row": k // 2, "angle": 0, "mis": []})
+        size = cell * 2 + 40
+        ov = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(ov)
+        col = _hex(accent) + (255,)
+        d.rectangle([20, 20, size - 20, size - 20], outline=col, width=12)
+        d.line([(size / 2, 20), (size / 2, size - 20)], fill=col, width=12)
+        d.line([(20, size / 2), (size - 20, size / 2)], fill=col, width=12)
+        self.overlay = ov
+        self.size = gsize
+        return glyphs
+
+    def _stamp_overlay(self, accent):
+        """判子の枠と、墨の飛び散り。"""
+        x0, y0, x1, y1 = self._bounds()
+        pad = 50
+        w, h = int(x1 - x0 + pad * 2 + 160), int(y1 - y0 + pad * 2 + 160)
+        ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(ov)
+        col = _hex(accent) + (255,)
+        d.rectangle([80, 80, w - 80, h - 80], outline=col, width=max(int(self.size / 22), 8))
+        for k in range(26):
+            r1 = kinetic_fx._hash01(self.cut["index"] * 13 + k)
+            r2 = kinetic_fx._hash01(self.cut["index"] * 29 + k)
+            r3 = kinetic_fx._hash01(self.cut["index"] * 41 + k)
+            side = k % 4
+            if side == 0:
+                cx, cy = r1 * w, r2 * 90
+            elif side == 1:
+                cx, cy = r1 * w, h - r2 * 90
+            elif side == 2:
+                cx, cy = r2 * 90, r1 * h
+            else:
+                cx, cy = w - r2 * 90, r1 * h
+            rad = 4 + r3 * 22
+            d.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=col)
+        # 版の欠け（枠の一部をかすれさせる）
+        a = np.asarray(ov.getchannel("A"), dtype=np.int16)
+        rng = np.random.default_rng(self.cut["index"])
+        a = np.where(rng.random(a.shape) < 0.18, 0, a).astype(np.uint8)
+        ov.putalpha(Image.fromarray(a))
+        return ov
+
+    def _beat_pulse(self, t):
+        if not self.beats:
+            return 0.0
+        k = bisect.bisect_right(self.beats, t) - 1
+        if k < 0:
+            return 0.0
+        return math.exp(-(t - self.beats[k]) / 0.15)
 
     def glyph_state(self, g, tl, dur):
         """時刻tl（カット開始からの秒）での1文字の変形を返す:
@@ -562,10 +730,56 @@ class _Cut:
             q = _ease_out(f / E)
             dy = _lerp(70, 0, q) + 6 * math.sin(tl * 3 + o * 0.5)
             alpha = q
+        elif motion == "stamp":
+            lead = (cut["land"] - cut["start"]) * FPS - 3
+            p = f - lead
+            if p < 0:
+                alpha = 0.0
+            elif p < 3:
+                scale = _lerp(2.4, 0.9, p / 3)
+                alpha = min(p / 1.5, 1.0)
+            elif p < E:
+                scale = _lerp(0.9, 1.0, (p - 3) / (E - 3))
+            if 3 <= p < 6:
+                dy += 10 * (1 - (p - 3) / 3)
+        elif motion == "scatter":
+            p = f - o * 3
+            if p < 0:
+                alpha = 0.0
+            else:
+                q = _ease_out(p / E)
+                scale = _lerp(1.7, 1.0, q)
+                alpha = min(p / 2, 1.0)
+        elif motion == "pop":
+            p = f - 2 - o * 3
+            if p < 0:
+                alpha = 0.0
+            else:
+                q = min(p / E, 1.0)
+                scale = _lerp(0.2, 1.12, q / 0.7) if q < 0.7 else _lerp(1.12, 1.0, (q - 0.7) / 0.3)
+                alpha = min(p / 2, 1.0)
+        elif motion == "neon":
+            p = f - o * 2
+            if p < 0:
+                alpha = 0.0
+            else:
+                crop_right = 1 - _ease_out(p / E)
+                flicker = (0.35, 1.0, 0.5, 1.0)
+                alpha = flicker[int(p)] if p < len(flicker) else 1.0
+
+        if cut.get("hold") == "heartbeat" and f > E:
+            scale *= 1 + 0.08 * self._beat_pulse(cut["start"] + tl)
+        scale *= g.get("gscale", 1.0)
 
         # 退場
         remain = (dur - tl) * FPS
-        if cut["motion"] == "erase" and remain < 8:
+        if cut.get("exit") == "fly" and remain < 7:
+            q = 1 - max(remain, 0) / 7
+            scale *= 1 + 3.0 * q * q
+            alpha *= 1 - q * q
+        elif cut.get("exit") == "split" and remain < 8:
+            pass
+        elif cut["motion"] == "erase" and remain < 8:
             crop_right = 1 - max(remain, 0) / 8
         elif remain < EXIT_FRAMES:
             q = max(remain, 0) / EXIT_FRAMES
@@ -581,10 +795,12 @@ class _Cut:
             return
         # 背景の巨大文字: ゆっくり流れ、背景カメラと逆向きに大きく動く（単色背景でもカメラが感じられる）
         _zoom, px, py, _angle = cam
+        show_echo = cut.get("decor") not in ("wall", "tunnel", "kanji", "rings")
         ex = int(VIDEO_SIZE[0] / 2 - self.echo.size[0] / 2
                  + (40 - 80 * tl / max(dur, 0.1)) * (1 if cut["index"] % 2 else -1) - px * 260)
         ey = int(VIDEO_SIZE[1] * (0.22 if cut["index"] % 2 else 0.78) - self.echo.size[1] / 2 - py * 360)
-        frame.paste(self.echo, (ex, ey), self.echo)
+        if show_echo:
+            frame.paste(self.echo, (ex, ey), self.echo)
 
         ax, ay = self.anchor
         base_angle = self.base_angle
@@ -637,14 +853,69 @@ class _Cut:
                     py = top + (h * scale) - shown
                     frame.paste(im, (int(px), int(py)), im)
                     continue
+                for (mkey, mimg), (ox, oy) in zip(g.get("mis", []), ((9, 6), (-7, -5))):
+                    mim = sprites.transformed(mkey, mimg, scale, total_angle, a * 0.9, crop_top, crop_right)
+                    if mim is not None:
+                        frame.paste(mim, (int(ax + rx + gdx - mim.size[0] / 2 + ox),
+                                          int(ay + ry + gdy - mim.size[1] / 2 + oy)), mim)
                 im = sprites.transformed(g["key"], g["img"], scale, total_angle, a, crop_top, crop_right)
                 if im is None:
                     continue
                 px = ax + rx + gdx - im.size[0] / 2
                 py = ay + ry + gdy - im.size[1] / 2
+                remain = (dur - tl) * FPS
+                if cut.get("exit") == "split" and remain < 8:
+                    q = 1 - max(remain, 0) / 8
+                    half = im.size[1] // 2
+                    top, bottom = im.crop((0, 0, im.size[0], half)), im.crop((0, half, im.size[0], im.size[1]))
+                    frame.paste(top, (int(px - 70 * q), int(py - 50 * q)), top)
+                    frame.paste(bottom, (int(px + 70 * q), int(py + half + 50 * q)), bottom)
+                    continue
                 frame.paste(im, (int(px), int(py)), im)
 
-        # 斬る: 斜めの線が走る
+        if self.overlay is not None:
+            self._draw_overlay(frame, tl, dur)
+        self._draw_slash(frame, tl)
+        if cut.get("exit") == "split":
+            remain = (dur - tl) * FPS
+            if 5 < remain < 8:
+                d = ImageDraw.Draw(frame)
+                d.line([(-50, ay + 60), (VIDEO_SIZE[0] + 50, ay - 60)], fill=(255, 255, 255), width=8)
+
+    def _draw_overlay(self, frame, tl, dur):
+        cut = self.cut
+        f = tl * FPS
+        remain = (dur - tl) * FPS
+        if cut["layout"] == "grid":
+            a = min(f / 4, 1.0)
+            scale = 1.0
+        else:
+            p = f - ((cut["land"] - cut["start"]) * FPS - 3)
+            if p < 3:
+                return
+            a = 1.0
+            scale = 1.0 if p >= ENTRANCE_FRAMES["stamp"] else _lerp(0.9, 1.0, (p - 3) / 3)
+        if remain < EXIT_FRAMES:
+            a *= max(remain, 0) / EXIT_FRAMES
+        if cut.get("exit") == "fly" and remain < 7:
+            q = 1 - max(remain, 0) / 7
+            scale *= 1 + 3.0 * q * q
+            a *= 1 - q * q
+        if a <= 0.02:
+            return
+        key = ("overlay", cut["index"], id(self.overlay))
+        im = self._shared.transformed(key, self.overlay, scale, self.base_angle, a, 0.0, 0.0)
+        if im is None:
+            return
+        ax, ay = self.anchor
+        x0, y0, x1, y1 = self._bounds()
+        cx = ax + (x0 + x1) / 2 * scale if cut["layout"] != "grid" else ax
+        cy = ay + (y0 + y1) / 2 * scale if cut["layout"] != "grid" else ay
+        frame.paste(im, (int(cx - im.size[0] / 2), int(cy - im.size[1] / 2)), im)
+
+    def _draw_slash(self, frame, tl):
+        cut = self.cut
+        ax, ay = self.anchor
         if cut["entrance"] == "slash":
             p = (tl - (cut["land"] - cut["start"])) * FPS
             if 0 <= p <= 6:
@@ -658,6 +929,7 @@ class _Cut:
 # 背景
 
 _SPRITES = None
+_DECOR = None
 _COVERS = {}
 
 
@@ -667,6 +939,13 @@ def _shared_sprites():
     if _SPRITES is None:
         _SPRITES = _Sprites(_Fonts())
     return _SPRITES
+
+
+def _shared_decor():
+    global _DECOR
+    if _DECOR is None:
+        _DECOR = kinetic_fx.Decor(_shared_sprites().fonts)
+    return _DECOR
 
 
 class _Background:
@@ -865,7 +1144,8 @@ class KineticRenderer:
                 bg, text, stroke, accent = DEFAULT_PALETTE[c["bg"]]
                 colors = (text, stroke, accent)
                 palette_bg = bg
-            self.cuts.append(_Cut(c, self.sprites, colors, palette_bg))
+            self.cuts.append(_Cut(c, self.sprites, colors, palette_bg, beats))
+        self.decor = _shared_decor()
 
     def _active(self, t):
         k = bisect.bisect_right(self.starts, t + 0.2) - 1
@@ -952,14 +1232,24 @@ class KineticRenderer:
             else:
                 w = VIDEO_SIZE[0] - cut_x
                 frame.paste(old.crop((0, 0, w, VIDEO_SIZE[1])), (0, 0))
-        for j in self._active(t):
+        active = self._active(t)
+        for j in active:
+            text_color, _stroke, accent = self.cuts[j].colors
+            self.decor.draw(frame, self.plan[j], t, _hex(text_color), _hex(accent), bg_cam)
+        grain = 0.0
+        for j in active:
             self.cuts[j].draw(frame, t, self.sprites, bg_cam)
             c = self.plan[j]
+            if c.get("texture") == "grain":
+                tl = t - c["start"]
+                grain = max(grain, min(max(tl + 0.2, 0) / 0.3, (c["end"] - t) / 0.3 + 1, 1.0))
             if c["flash"]:
                 df = (t - c["land"]) * FPS
                 if 0 <= df < 2:
                     white = Image.new("RGB", VIDEO_SIZE, (255, 255, 255))
                     frame = Image.blend(frame, white, 0.7 if df < 1 else 0.3)
+        if grain > 0:
+            frame = kinetic_fx.apply_grain(frame, t, grain)
         if g_zoom > 1.0005 or sx or sy:
             W, H = VIDEO_SIZE
             z = max(g_zoom, 1.0 + 2 * max(abs(sx), abs(sy)) / W)
@@ -1022,18 +1312,23 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8):
     return sheets
 
 
-def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False):
+PLAN_VERSION = 2
+
+
+def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None):
     plan_path = Path(plan_path)
     lines = [a["line"] for a in alignment]
     if plan_path.exists() and not replan:
         saved = json.loads(plan_path.read_text(encoding="utf-8"))
-        if [c["text"] for c in saved.get("plan", [])] == lines and saved.get("alignment") == alignment:
+        if ([c["text"] for c in saved.get("plan", [])] == lines and saved.get("alignment") == alignment
+                and saved.get("version") == PLAN_VERSION and saved.get("meta") == meta):
             return saved["plan"]
-        print("      kinetic_plan.json は歌詞かタイミングが変わっているため作り直します")
-    plan = build_plan(alignment, sections, beats, style)
+        print("      kinetic_plan.json は歌詞・タイミング・曲情報・設計の版のいずれかが変わったため作り直します")
+    plan = build_plan(alignment, sections, beats, style, meta)
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
-        json.dumps({"alignment": alignment, "plan": plan}, ensure_ascii=False, indent=1),
+        json.dumps({"version": PLAN_VERSION, "meta": meta, "alignment": alignment, "plan": plan},
+                   ensure_ascii=False, indent=1),
         encoding="utf-8",
     )
     plan_path.with_suffix(".md").write_text(plan_to_markdown(plan), encoding="utf-8")

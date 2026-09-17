@@ -164,7 +164,7 @@ def _plan_for(alignment, style_name):
 
     note = _note()
     sections = sections_for_alignment(alignment, note.lyric_sections)
-    return build_plan(alignment, sections, _beats(), STYLES[style_name])
+    return build_plan(alignment, sections, _beats(), STYLES[style_name], note.meta)
 
 
 def _preview_jpeg(alignment, t, style_name):
@@ -201,7 +201,8 @@ def _run_render(style_name, stills_only):
         alignment = cache["alignment"]
         style = STYLES[style_name]
         sections = sections_for_alignment(alignment, note.lyric_sections)
-        plan = load_or_build_plan(cache_dir / "kinetic_plan.json", alignment, sections, _beats(), style)
+        plan = load_or_build_plan(cache_dir / "kinetic_plan.json", alignment, sections, _beats(), style,
+                                  meta=note.meta)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         if stills_only:
             out_dir = cache_dir / f"gui_stills_{stamp}"

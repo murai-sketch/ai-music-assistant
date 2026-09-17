@@ -114,8 +114,15 @@ class SongNote:
         self.text = self.path.read_text(encoding="utf-8")
         self.title = read_frontmatter_value(self.text, "title") or self.path.stem
         self.bpm = read_bpm(self.text)
+        self.genre = read_frontmatter_value(self.text, "genre")
+        self.tags = read_frontmatter_value(self.text, "tags")
         self.lyric_sections = extract_lyric_lines_with_sections(self.text)
         self.lyric_lines = [line for line, _section in self.lyric_sections]
+
+    @property
+    def meta(self):
+        """描画の技法選び（kinetic_fx.song_profile）に渡す曲の情報。"""
+        return {"title": self.title, "genre": self.genre, "tags": self.tags, "bpm": self.bpm}
 
     def __repr__(self):
         return f"SongNote(title={self.title!r}, bpm={self.bpm}, lines={len(self.lyric_lines)})"
