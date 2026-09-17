@@ -303,6 +303,7 @@ class _Sprites:
         self.fonts = fonts
         self.base = {}
         self.xform = {}
+        self.echoes = {}
 
     def glyph(self, ch, font_path, size, fill, stroke, stroke_w):
         key = (ch, font_path, size, fill, stroke, stroke_w)
@@ -319,6 +320,19 @@ class _Sprites:
             g = (img, l, t, font.getlength(ch))
             self.base[key] = g
         return g
+
+    def echo(self, text, color):
+        key = (text, color)
+        im = self.echoes.get(key)
+        if im is None:
+            size = int(min(1500 / max(len(text), 1), 900))
+            font = self.fonts.get(FONT_HEAVY, size)
+            l, t, r, b = font.getbbox(text)
+            im = Image.new("RGBA", (max(r - l, 1), max(b - t, 1)), (0, 0, 0, 0))
+            ImageDraw.Draw(im).text((-l, -t), text, font=font, fill=color + (255,))
+            im.putalpha(im.getchannel("A").point(lambda v: int(v * 0.08)))
+            self.echoes[key] = im
+        return im
 
     def transformed(self, key, img, scale, angle, alpha, crop_top, crop_right):
         sq = round(scale / 0.02) * 0.02
@@ -455,15 +469,8 @@ class _Cut:
 
         # 背景に敷く巨大な文字
         echo_text = max(rows, key=len)
-        echo_size = int(min(1500 / max(len(echo_text), 1), 900))
-        echo_font = sprites.fonts.get(FONT_HEAVY, echo_size)
-        l, t, r, b = echo_font.getbbox(echo_text)
-        echo = Image.new("RGBA", (max(r - l, 1), max(b - t, 1)), (0, 0, 0, 0))
         echo_color = _hex(text_color) if palette_bg is not None else (255, 255, 255)
-        ImageDraw.Draw(echo).text((-l, -t), echo_text, font=echo_font, fill=echo_color + (255,))
-        a = echo.getchannel("A").point(lambda v: int(v * 0.08))
-        echo.putalpha(a)
-        self.echo = echo
+        self.echo = sprites.echo(echo_text, echo_color)
 
     def glyph_state(self, g, tl, dur):
         """時刻tl（カット開始からの秒）での1文字の変形を返す:
@@ -650,16 +657,35 @@ class _Cut:
 # ---------------------------------------------------------------------------
 # 背景
 
+_SPRITES = None
+_COVERS = {}
+
+
+def _shared_sprites():
+    """文字画像のキャッシュはレンダラーを作り直しても使い回す（GUIのプレビュー用）。"""
+    global _SPRITES
+    if _SPRITES is None:
+        _SPRITES = _Sprites(_Fonts())
+    return _SPRITES
+
+
 class _Background:
     """背景画像は画面を覆う大きさ（縦長画面に横長画像なら横に余りが出る）で
     保持し、カメラの窓（寄り・パン位置・傾き）で切り出す。"""
 
     def __init__(self, image_path, beats, style):
-        img = Image.open(image_path).convert("RGB")
-        W, H = VIDEO_SIZE
-        s = max(W / img.width, H / img.height)
-        img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1), Image.LANCZOS)
-        self.cover = ImageEnhance.Brightness(img).enhance(0.55)
+        path = Path(image_path)
+        key = (str(path), path.stat().st_mtime)
+        cover = _COVERS.get(key)
+        if cover is None:
+            img = Image.open(path).convert("RGB")
+            W, H = VIDEO_SIZE
+            s = max(W / img.width, H / img.height)
+            img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1), Image.LANCZOS)
+            cover = ImageEnhance.Brightness(img).enhance(0.55)
+            _COVERS.clear()
+            _COVERS[key] = cover
+        self.cover = cover
         self.beats = beats or []
         self.pulse_scale = style.get("pulse_scale", 1.08)
         self.pulse_decay = style.get("pulse_decay_sec", 0.14)
@@ -826,7 +852,7 @@ class KineticRenderer:
             lo, hi = self.shot_span[shots[-1]]
             self.shot_span[shots[-1]] = (lo, hi + 4.0)
         self.bg = _Background(image_path, beats, style)
-        self.sprites = _Sprites(_Fonts())
+        self.sprites = _shared_sprites()
         self.duration = duration
         self.interludes = find_interludes(plan, duration)
         self.interlude_starts = [s for s, _e, _n in self.interludes]

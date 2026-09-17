@@ -649,7 +649,7 @@ async function loadConfig() {
   const st = $('styleSelect');
   Object.keys(CONFIG.styles).forEach(n => st.add(new Option(n, n, n === CONFIG.default_style, n === CONFIG.default_style)));
   const s = CONFIG.state;
-  if (s.audio) { markDrop('dropAudio', '🎵 ' + s.audio); audio.src = '/audio'; }
+  if (s.audio) markDrop('dropAudio', '🎵 ' + s.audio);
   if (s.image) markDrop('dropImage', '🖼 ' + s.image);
   if (s.song) ss.value = s.song;
   if (s.audio && s.song) await loadProject();
@@ -671,7 +671,14 @@ async function loadProject() {
 }
 
 async function decodeWaveform() {
-  const buf = await (await fetch('/audio')).arrayBuffer();
+  const res = await fetch('/audio?' + Date.now());
+  const type = res.headers.get('Content-Type') || 'audio/mpeg';
+  const buf = await res.arrayBuffer();
+  // 再生は手元に読み込んだデータから行う（サーバーはプレビュー描画に専念させる）
+  const pos = audio.currentTime || 0;
+  if (audio.src.startsWith('blob:')) URL.revokeObjectURL(audio.src);
+  audio.src = URL.createObjectURL(new Blob([buf.slice(0)], {type}));
+  audio.currentTime = pos;
   const actx = new (window.AudioContext || window.webkitAudioContext)();
   const ab = await actx.decodeAudioData(buf);
   duration = ab.duration;
@@ -704,13 +711,13 @@ function setupDrop(dropId, inputId, url, done) {
     done();
   }
 }
-setupDrop('dropAudio', 'fileAudio', '/upload/audio', async () => { audio.src = '/audio?' + Date.now(); peaks = null; await decodeWaveform(); await loadProject(); });
+setupDrop('dropAudio', 'fileAudio', '/upload/audio', async () => { peaks = null; await decodeWaveform(); await loadProject(); });
 setupDrop('dropImage', 'fileImage', '/upload/image', () => requestPreview(true));
 $('songSelect').onchange = async e => {
   if (!e.target.value) return;
   const r = await (await fetch('/song?name=' + encodeURIComponent(e.target.value), {method: 'POST'})).json();
   $('alignStatus').textContent = r.ok ? `${r.title}（BPM ${r.bpm ?? '不明'}／${r.lines}行）` : r.error;
-  if (audio.src) await loadProject();
+  if ($('dropAudio').classList.contains('ready')) await loadProject();
 };
 
 async function runAlign(reset) {
@@ -1111,7 +1118,7 @@ $('unusedList').onclick = e => {
 let previewBusy = false, previewPending = false, lastPreviewT = -1;
 async function requestPreview(force) {
   if (!rows.length || !$('dropImage').classList.contains('ready')) return;
-  if (previewBusy) { previewPending = true; return; }
+  if (previewBusy) { if (audio.paused) previewPending = true; return; }
   previewBusy = true;
   const t = audio.currentTime;
   try {
@@ -1136,16 +1143,22 @@ function seek(t) { audio.currentTime = clamp(t, 0, duration || t); const L = vie
 $('playBtn').onclick = () => audio.paused ? audio.play() : audio.pause();
 audio.onplay = () => $('playBtn').textContent = '⏸ 停止';
 audio.onpause = () => { $('playBtn').textContent = '▶ 再生'; requestPreview(); };
-let lastLive = 0;
+let lastLive = 0, lastPlaying = -2, lastDrawT = -1;
 function tick(ts) {
-  $('time').textContent = `${fmt(audio.currentTime)} / ${fmt(duration)}`;
-  followPlayhead();
-  drawTimeline();
   const t = audio.currentTime;
-  document.querySelectorAll('#rows tr.playing').forEach(tr => tr.classList.remove('playing'));
-  const pi = rows.findIndex((r, i) => t >= r.start && t < shownEnd(r, i));
-  if (pi >= 0) document.querySelector(`#rows tr[data-i="${pi}"]`)?.classList.add('playing');
-  if (!audio.paused && $('livePreview').checked && ts - lastLive > 180) { lastLive = ts; requestPreview(); }
+  if (t !== lastDrawT || drag) {
+    lastDrawT = t;
+    $('time').textContent = `${fmt(t)} / ${fmt(duration)}`;
+    followPlayhead();
+    drawTimeline();
+    const pi = rows.findIndex((r, i) => t >= r.start && t < shownEnd(r, i));
+    if (pi !== lastPlaying) {
+      document.querySelectorAll('#rows tr.playing').forEach(tr => tr.classList.remove('playing'));
+      if (pi >= 0) document.querySelector(`#rows tr[data-i="${pi}"]`)?.classList.add('playing');
+      lastPlaying = pi;
+    }
+  }
+  if (!audio.paused && $('livePreview').checked && !previewBusy && ts - lastLive > 350) { lastLive = ts; requestPreview(); }
   requestAnimationFrame(tick);
 }
 
@@ -1222,6 +1235,7 @@ $('renderBtn').onclick = () => startRender(false);
 
 // ---------- refresh ----------
 function refresh(rebuildTable = true) {
+  lastPlaying = -2; lastDrawT = -1;
   const issues = computeIssues();
   if (rebuildTable) renderTable(); else document.querySelectorAll('#rows tr').forEach(tr => tr.classList.toggle('sel', sel.has(+tr.dataset.i)));
   $('selInfo').textContent = sel.size ? `${sel.size}行選択中` : '';
