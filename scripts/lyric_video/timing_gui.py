@@ -41,6 +41,7 @@ import hashlib
 import io
 import json
 import shutil
+import subprocess
 import sys
 import threading
 import traceback
@@ -53,7 +54,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from align import WORK_DIR, _audio_hash, align_lyrics  # noqa: E402
+from align import WORK_DIR, _audio_hash, _get_audio_duration, align_lyrics  # noqa: E402
 from beats import detect_beats  # noqa: E402
 from song_note import SongNote, sections_for_alignment  # noqa: E402
 from styles import DEFAULT_STYLE, STYLES  # noqa: E402
@@ -175,7 +176,10 @@ def _preview_jpeg(alignment, t, style_name):
     with _LOCK:
         if _PREVIEW["key"] != key:
             plan = _plan_for(alignment, style_name)
-            _PREVIEW["renderer"] = KineticRenderer(STATE["image_path"], plan, _beats(), STYLES[style_name])
+            _PREVIEW["renderer"] = KineticRenderer(
+                STATE["image_path"], plan, _beats(), STYLES[style_name],
+                duration=_get_audio_duration(STATE["audio_path"]),
+            )
             _PREVIEW["key"] = key
         frame = _PREVIEW["renderer"].frame_at(t)
     frame = frame.resize((432, 768))
@@ -414,6 +418,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._json({"error": traceback.format_exc()}, 500); return
             self._bytes(jpeg, "image/jpeg")
+        elif path == "/open-folder":
+            params = json.loads(body.decode("utf-8")) if body else {}
+            if params.get("what") == "stills" and STATE["stills"]:
+                target = ["open", str(Path(STATE["stills"][0]).parent)]
+            elif STATE["render_output"] and Path(STATE["render_output"]).exists():
+                target = ["open", "-R", STATE["render_output"]]
+            elif STATE["audio_path"]:
+                target = ["open", str(_cache_dir())]
+            else:
+                self._json({"error": "開くフォルダがありません"}, 404); return
+            subprocess.run(target, check=False)
+            self._json({"ok": True})
         elif path == "/render/run":
             if not self._need("audio_path", "song_path", "image_path"):
                 return
@@ -508,7 +524,10 @@ kbd { background:#2a2a30; border:1px solid #444; border-radius:3px; padding:0 4p
       <button class="primary" id="renderBtn">書き出す</button>
     </div>
     <div class="status" id="renderStatus"></div>
-    <a id="downloadLink" class="hidden" href="/render/download" download>⬇ 書き出した動画</a>
+    <div class="toolbar">
+      <a id="downloadLink" class="hidden" href="/render/download" download>⬇ 書き出した動画</a>
+      <button id="openFolderBtn" class="hidden">📂 フォルダを開く</button>
+    </div>
     <div id="stills"></div>
     <p class="hint">
       <kbd>Space</kbd> 再生/停止　<kbd>Enter</kbd> 行の頭から<br>
@@ -1174,6 +1193,7 @@ async function startRender(stills) {
   if (dirty && !(await save())) return;
   const st = $('renderStatus');
   $('downloadLink').classList.add('hidden');
+  $('openFolderBtn').classList.add('hidden');
   const r = await fetch('/render/run', {method: 'POST', body: JSON.stringify({style: $('styleSelect').value, stills})});
   if (!r.ok) { st.textContent = (await r.json()).error; return; }
   st.textContent = stills ? '静止画を作成中…' : '書き出し中… 0%';
@@ -1184,12 +1204,19 @@ async function startRender(stills) {
       clearInterval(poll);
       if (stills) {
         st.textContent = '✅ 静止画チェック（各カットの 0/25/50/75/97%）';
+        openWhat = 'stills'; $('openFolderBtn').classList.remove('hidden');
         $('stills').innerHTML = s.stills.map(n => `<a href="/stills?name=${encodeURIComponent(n)}" target="_blank"><img src="/stills?name=${encodeURIComponent(n)}&v=${Date.now()}"></a>`).join('');
-      } else { st.textContent = '✅ ' + s.output; $('downloadLink').classList.remove('hidden'); }
+      } else {
+        st.textContent = '✅ ' + s.output;
+        openWhat = 'video';
+        $('downloadLink').classList.remove('hidden'); $('openFolderBtn').classList.remove('hidden');
+      }
     }
     if (s.status === 'error') { clearInterval(poll); st.textContent = '❌ ' + (s.error || '').trim().split('\n').pop(); }
   }, 1500);
 }
+let openWhat = 'video';
+$('openFolderBtn').onclick = () => fetch('/open-folder', {method: 'POST', body: JSON.stringify({what: openWhat})});
 $('stillsBtn').onclick = () => startRender(true);
 $('renderBtn').onclick = () => startRender(false);
 

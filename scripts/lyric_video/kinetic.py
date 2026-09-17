@@ -16,6 +16,8 @@ render.py（字幕を中央下にポップインさせる方式）とは別に�
       囁き→静かな動き・明朝・暗い背景 / Hook・Chorus→叩きつけ・背景色の切り替え
   - 背景に同じ言葉を巨大・薄く（不透明度7%前後）敷く
   - 叩きつけ系の着地をビートに合わせる
+  - 間奏（歌詞のない区間）: 背景画像にビート連動のエフェクト（RGBずらし /
+    グリッチ / 二色刷り / 走査線）をかける。明るさを激しく変える点滅は使わない
   - カメラ: 背景が変わらない一続きのカット（ショット）ごとに、背景画像を
     パン/ティルト/寄り/引き/傾きで動かす。Hookの着地では画面全体を
     パンチイン＋揺れ。背景の動きを文字より大きくして奥行きを出す
@@ -81,6 +83,10 @@ EXIT_FRAMES = 3
 MIN_FLASH_GAP = 2.0
 MIN_BG_SWITCH_GAP = 0.5
 GAP_FOR_REST = 1.2  # これ以上の無歌詞区間は「間」として背景を画像に戻す
+
+INTERLUDE_EFFECTS = ["rgb_split", "glitch", "duotone", "scan"]
+INTERLUDE_FADE = 0.35  # 間奏の出入りでエフェクトを強める/弱める秒数
+INTERLUDE_MIN = 2.5    # これより短い歌詞の切れ目は間奏として扱わない
 
 VERTICAL_MAP = {"ー": "｜", "「": "﹁", "」": "﹂", "『": "﹃", "』": "﹄", "（": "︵", "）": "︶", "…": "︙"}
 
@@ -702,6 +708,71 @@ class _Background:
         return self.solid(DEFAULT_PALETTE[mode][0]).copy()
 
 
+def find_interludes(plan, duration=None):
+    """歌詞のない区間（INTERLUDE_MIN秒以上）を [(開始, 終了, エフェクト名)] で返す。
+    イントロ（最初の行まで）とアウトロ（最後の行の後）も含む。"""
+    spans = []
+    if plan and plan[0]["start"] > INTERLUDE_MIN:
+        spans.append((0.0, plan[0]["start"]))
+    for a, b in zip(plan, plan[1:]):
+        if b["start"] - a["end"] > INTERLUDE_MIN:
+            spans.append((a["end"], b["start"]))
+    if plan and duration and duration - plan[-1]["end"] > INTERLUDE_MIN:
+        spans.append((plan[-1]["end"], duration))
+    return [(s, e, INTERLUDE_EFFECTS[k % len(INTERLUDE_EFFECTS)]) for k, (s, e) in enumerate(spans)]
+
+
+def _hash01(n):
+    x = math.sin(n * 12.9898) * 43758.5453
+    return x - math.floor(x)
+
+
+def apply_interlude_effect(frame, name, strength, t, beat_idx, beat_amt, palette):
+    """frame(PIL RGB) に間奏エフェクトをかける。strength 0..1、beat_amt はビート直後ほど1。"""
+    if strength <= 0.01:
+        return frame
+    arr = np.asarray(frame).astype(np.int16)
+    H, W, _ = arr.shape
+    out = arr
+    if name in ("rgb_split", "glitch"):
+        shift = int((12 + 30 * beat_amt) * strength)
+        if shift:
+            out = arr.copy()
+            out[:, :, 0] = np.roll(arr[:, :, 0], shift, axis=1)
+            out[:, :, 2] = np.roll(arr[:, :, 2], -shift, axis=1)
+    if name == "glitch":
+        out = out.copy() if out is arr else out
+        amt = max(beat_amt, 0.35)
+        for k in range(int(4 + 6 * strength)):
+            r = _hash01(beat_idx * 31 + k)
+            y0 = int(r * (H - 40))
+            h = int(20 + _hash01(beat_idx * 17 + k) * 160)
+            dx = int((_hash01(beat_idx * 7 + k) - 0.5) * 320 * strength * amt)
+            out[y0:y0 + h] = np.roll(out[y0:y0 + h], dx, axis=1)
+    if name == "duotone":
+        lum = (arr[:, :, 0] * 0.299 + arr[:, :, 1] * 0.587 + arr[:, :, 2] * 0.114) / 255.0
+        lum = np.clip(lum * (1.25 + 0.25 * beat_amt), 0, 1)[:, :, None]
+        dark = np.array(_hex(palette[0]), dtype=np.float32)
+        light = np.array(_hex(palette[1]), dtype=np.float32)
+        tone = dark + (light - dark) * lum
+        out = (arr * (1 - strength) + tone * strength).astype(np.int16)
+    if name in ("scan", "duotone"):
+        out = out.copy() if out is arr else out
+        offset = int(t * 60) % 6
+        out[offset::6] = (out[offset::6] * (1 - 0.5 * strength)).astype(np.int16)
+        out[offset + 1::6] = (out[offset + 1::6] * (1 - 0.3 * strength)).astype(np.int16)
+    if name == "scan":
+        # VHS風: 暗い帯がゆっくり流れ、帯の中は横にずれる
+        band_y = int((t * 260) % (H + 300)) - 300
+        y0, y1 = max(band_y, 0), min(band_y + 300, H)
+        if y1 > y0:
+            out[y0:y1] = (np.roll(out[y0:y1], int(18 * strength), axis=1) * (1 - 0.35 * strength)).astype(np.int16)
+        g_shift = int((4 + 14 * beat_amt) * strength)
+        if g_shift:
+            out[:, :, 1] = np.roll(out[:, :, 1], g_shift, axis=0)
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
+
+
 def _smooth(u):
     u = min(max(u, 0.0), 1.0)
     return u * u * (3 - 2 * u)
@@ -739,7 +810,7 @@ def camera_move(name, u, since_land, index):
 # ---------------------------------------------------------------------------
 
 class KineticRenderer:
-    def __init__(self, image_path, plan, beats, style):
+    def __init__(self, image_path, plan, beats, style, duration=None):
         self.plan = plan
         self.starts = [c["start"] for c in plan]
         # ショットごとの開始・終了（次のショットの開始まで動き続ける）
@@ -756,6 +827,9 @@ class KineticRenderer:
             self.shot_span[shots[-1]] = (lo, hi + 4.0)
         self.bg = _Background(image_path, beats, style)
         self.sprites = _Sprites(_Fonts())
+        self.duration = duration
+        self.interludes = find_interludes(plan, duration)
+        self.interlude_starts = [s for s, _e, _n in self.interludes]
         self.cuts = []
         for c in plan:
             if c["bg"] == "image":
@@ -788,7 +862,8 @@ class KineticRenderer:
             return "image", None, 1.0
         c = self.plan[k]
         mode = c["bg"]
-        if t > c["end"] + GAP_FOR_REST:
+        next_start = self.plan[k + 1]["start"] if k + 1 < len(self.plan) else float("inf")
+        if t > c["end"] and next_start - c["end"] > INTERLUDE_MIN:
             return "image", None, 1.0
         prev = "image"
         if k > 0 and c["start"] - self.plan[k - 1]["end"] <= GAP_FOR_REST:
@@ -830,6 +905,18 @@ class KineticRenderer:
         bg_cam, g_zoom, sx, sy = self.camera_at(t)
         mode, prev, p = self._bg_mode_at(t)
         frame = self.bg.frame(mode, t, bg_cam)
+        k = bisect.bisect_right(self.interlude_starts, t) - 1
+        if k >= 0 and mode == "image" and prev is None:
+            s0, e0, effect = self.interludes[k]
+            if s0 <= t <= e0:
+                strength = min((t - s0) / INTERLUDE_FADE, (e0 - t) / INTERLUDE_FADE, 1.0)
+                bi = bisect.bisect_right(self.bg.beats, t) - 1
+                beat_amt = 0.0
+                if bi >= 0:
+                    beat_amt = math.exp(-(t - self.bg.beats[bi]) / 0.12)
+                frame = apply_interlude_effect(frame, effect, strength, t, bi, beat_amt,
+                                               (DEFAULT_PALETTE[0][0], DEFAULT_PALETTE[0][3]) if k % 2
+                                               else (DEFAULT_PALETTE[1][0], DEFAULT_PALETTE[2][0]))
         if prev is not None:
             old = self.bg.frame(prev, t, bg_cam)
             cut_x = int(VIDEO_SIZE[0] * _ease_out(p))
@@ -860,8 +947,8 @@ class KineticRenderer:
 def render_kinetic(image_path, audio_path, plan, beats, style, output_path, progress=None):
     from moviepy import AudioFileClip, VideoClip
 
-    renderer = KineticRenderer(image_path, plan, beats, style)
     audio = AudioFileClip(str(audio_path))
+    renderer = KineticRenderer(image_path, plan, beats, style, duration=audio.duration)
     total = max(audio.duration, 0.1)
 
     def frame(t):
