@@ -52,7 +52,9 @@ def _mix(a, b, t):
 
 def assign_backgrounds(plan, profile):
     """ショットごとに bgfx、カットごとに under / card、背景の切り替え方 wipe を決める。"""
-    if profile.get("wa"):
+    if profile.get("kids"):
+        patterns, wipe_kinds = ["dots", "waves", "rings", "checker"], ["circle", "circle", "straight"]
+    elif profile.get("wa"):
         patterns, wipe_kinds = PATTERNS_WA, ["torn", "straight"]
     elif profile.get("pop"):
         patterns, wipe_kinds = PATTERNS_POP, ["circle", "straight"]
@@ -66,7 +68,8 @@ def assign_backgrounds(plan, profile):
         if sh not in shot_fx:
             if c["bg"] == "image":
                 image_shots += 1
-                shot_fx[sh] = "duotone" if image_shots % 3 == 0 and c["level"] >= 2 else None
+                kids = profile.get("kids")
+                shot_fx[sh] = "duotone" if image_shots % 3 == 0 and c["level"] >= 2 and not kids else None
             else:
                 solid_shots += 1
                 shot_fx[sh] = "pattern:" + patterns[solid_shots % len(patterns)] if solid_shots % 2 == 0 or c["level"] == 3 else None
@@ -343,7 +346,7 @@ def assign_bg_images(plan, backgrounds):
             if c["level"] == 1:
                 c["bg"] = "image"
                 c["bgfx"] = None
-    if any(i.get("use") == "hook" for i in backgrounds or []):
+    if any(i.get("use") == "hook" for i in backgrounds or []) and not any(c.get("profile_kids") for c in plan):
         k = 0
         for c in plan:
             if c["level"] == 3:
@@ -374,3 +377,27 @@ def assign_bg_images(plan, backgrounds):
 def interlude_images(backgrounds, n):
     pool = _pool(backgrounds, "interlude")
     return [pool[k % len(pool)] if pool else None for k in range(n)]
+
+
+def sparkle(frame, t, strength, beat_amt, palette):
+    """間奏用: 背景にきらめく星を散らす（子ども向け）。"""
+    layer = Image.new("RGBA", VIDEO_SIZE, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    W, H = VIDEO_SIZE
+    rng = np.random.default_rng(11)
+    cols = [_hex(palette[0]), _hex(palette[1]), (255, 255, 255)]
+    for k in range(60):
+        x = rng.uniform(0, W)
+        y0 = rng.uniform(0, H)
+        y = (y0 - t * (30 + 40 * rng.uniform())) % H
+        r = rng.uniform(10, 40) * (1 + 0.3 * beat_amt)
+        tw = 0.5 + 0.5 * math.sin(t * rng.uniform(2, 5) + k)
+        pts = []
+        for j in range(10):
+            ang = -math.pi / 2 + j * math.pi / 5
+            rr = r if j % 2 == 0 else r * 0.45
+            pts.append((x + rr * math.cos(ang), y + rr * math.sin(ang)))
+        d.polygon(pts, fill=cols[k % 3] + (int(220 * strength * (0.3 + 0.7 * tw)),))
+    out = frame.convert("RGBA")
+    out.alpha_composite(layer)
+    return out.convert("RGB")

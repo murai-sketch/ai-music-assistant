@@ -56,6 +56,20 @@ DEFAULT_PALETTE = [
     ("#FF5FA2", "#111111", "#FF5FA2", "#FFFFFF"),
 ]
 
+# 子ども向けの曲（淡い色。文字は濃い色で読みやすく）
+KIDS_PALETTE = [
+    ("#FFF4D6", "#3A2A5A", "#FFF4D6", "#FF6FA8"),
+    ("#BDE7FF", "#2B3A67", "#BDE7FF", "#FF8A00"),
+    ("#FFD1E8", "#5A2A4A", "#FFD1E8", "#7A5CFF"),
+    ("#FFE66D", "#3A2A5A", "#FFE66D", "#00A6A6"),
+]
+FONT_KIDS = "/System/Library/Fonts/ヒラギノ丸ゴ ProN W4.ttc"
+
+
+def palette_for(plan):
+    return KIDS_PALETTE if any(c.get("profile_kids") for c in plan) else DEFAULT_PALETTE
+
+
 # 言葉 → 動き。先に書いたものが優先
 MEANING_RULES = [
     (("刃", "斬", "切", "刑", "裂"), "slash"),
@@ -68,6 +82,11 @@ MEANING_RULES = [
     (("燃", "炎", "怒", "叫"), "shake"),
     (("大", "巨", "増", "膨"), "grow"),
     (("息", "浮", "軽", "舞"), "float"),
+    # 仮名の擬音・動詞（一般的な語）
+    (("きら", "ぴか", "かがや", "ひか"), "grow"),
+    (("ころ", "ぐる", "くる", "まわ"), "rotate"),
+    (("ぴょん", "じゃんぷ", "ジャンプ", "はね", "とぶ"), "bounce"),
+    (("だっしゅ", "ダッシュ", "はし", "にげ"), "dash"),
 ]
 
 VERSE_MOTIONS = ["slide_l", "stagger", "mask", "slide_r", "rotate", "stagger", "spread", "mask"]
@@ -81,7 +100,7 @@ ENTRANCE_FRAMES = {
     "slam": 6, "slash": 6, "shake": 6, "stagger": 4, "slide_l": 7, "slide_r": 7,
     "dash": 6, "mask": 9, "spread": 12, "converge": 10, "rotate": 8, "fall": 8,
     "grow": 10, "float": 14, "erase": 9,
-    "stamp": 6, "scatter": 5, "pop": 6, "neon": 6,
+    "stamp": 6, "scatter": 5, "pop": 6, "neon": 6, "bounce": 12,
 }
 EXIT_FRAMES = 3
 MIN_FLASH_GAP = 2.0
@@ -120,16 +139,65 @@ def _pick_meaning(text):
     return None
 
 
-def _split_rows(text):
+NO_HEAD = set("ーっゃゅょぁぃぅぇぉッャュョァィゥェォ☆★！？!?、。」』）…〜♪")
+PARTICLE_ENDS = ("じゃ", "は", "が", "を", "に", "で", "も", "の", "と", "へ", "て", "ね", "よ", "から", "まで")
+
+
+def _script(ch):
+    o = ord(ch)
+    if 0x3040 <= o <= 0x309F:
+        return "hira"
+    if 0x30A0 <= o <= 0x30FF:
+        return "kata" if ch != "ー" else "long"
+    if kinetic_fx._is_kanji(ch):
+        return "kanji"
+    return "other"
+
+
+def _chunk(token, limit=8):
+    """長い段を、言葉の切れ目らしい位置で limit 文字以下に折る。"""
+    if len(token) <= limit:
+        return [token]
+    best, best_score = None, -1e9
+    for i in range(2, len(token) - 1):
+        left, right = token[:i], token[i:]
+        if right[0] in NO_HEAD:
+            continue
+        score = -abs(len(left) - len(right)) * 0.8
+        if any(left.endswith(pw) for pw in PARTICLE_ENDS):
+            score += 3
+        k = len(left) - 1
+        while k > 0 and left[k] == "ー":
+            k -= 1
+        a, b = _script(left[k]), _script(right[0])
+        if a != b and "other" not in (a, b):
+            score += 2.5
+        if left[-1] in "！？!?」』" or right[0] in "「『":
+            score += 3
+        if len(left) >= 4 and left[-2:] == left[-4:-2]:
+            score += 2.5
+        if score > best_score:
+            best, best_score = i, score
+    if best is None:
+        best = (len(token) + 1) // 2
+    return _chunk(token[:best], limit) + _chunk(token[best:], limit)
+
+
+def _split_rows(text, short=False):
     """全角/半角スペースで区切られた行は、区切りごとに段を分ける。
-    区切りがなく12文字を超える行は半分で折る。"""
+    区切りがなく12文字を超える行は、言葉の切れ目らしい位置で折る。
+    short=True（子ども向け）は、8文字を超える段も折って文字を大きくする。"""
+    if short:
+        rows = []
+        for r in _split_rows(text):
+            rows.extend(_chunk(r, 8))
+        return rows
     tokens = [t for t in text.replace("　", " ").split(" ") if t]
     if len(tokens) >= 2 and _clean_len(text) > 6:
         return tokens
     joined = "".join(tokens) or text
     if len(joined) > 12:
-        mid = (len(joined) + 1) // 2
-        return [joined[:mid], joined[mid:]]
+        return _chunk(joined, 12)
     return [joined]
 
 
@@ -138,6 +206,7 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
     カットごとの設計を作る。meta（曲ノートの title/genre/tags/bpm）があれば、
     曲の性格に合わせて参考作品由来の技法（kinetic_fx）を割り当てる。"""
     max_hold = style.get("max_hold_sec", 2.8)
+    profile = kinetic_fx.song_profile(alignment, sections, beats, meta)
     counts = {}
     for item in alignment:
         counts[item["line"]] = counts.get(item["line"], 0) + 1
@@ -161,7 +230,7 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
         start = float(item["start"])
         next_start = float(alignment[i + 1]["start"]) if i + 1 < len(alignment) else float(item["end"])
         show_end = min(next_start, start + max_hold)
-        rows = _split_rows(text)
+        rows = _split_rows(text, short=profile.get("kids", False))
         n = _clean_len(text)
         if level == 3 and len(rows) == 1 and 4 <= n <= 8:
             rows = [rows[0][:-2], rows[0][-2:]]
@@ -196,7 +265,7 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
         elif level == 1:
             tier = 2
         else:
-            tier = 1 if n <= 8 else 2
+            tier = 1 if n <= 8 or profile.get("kids") else 2
 
         # 背景: Hookは毎行切り替え、Verseは4行ごと、囁きは暗色固定、長い間の後は画像に戻す
         prev_gap = start - (float(alignment[i - 1]["start"]) + max_hold) if i > 0 else 99
@@ -252,12 +321,14 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
                      and (i == 0 or plan[-1]["level"] != 3),
         })
 
-    profile = kinetic_fx.song_profile(alignment, sections, beats, meta)
     kinetic_fx.assign_techniques(plan, profile)
     kinetic_bg.assign_backgrounds(plan, profile)
     kinetic_bg.assign_bg_images(plan, backgrounds)
     for cut in plan:
         cut["profile_wa"] = profile["wa"]
+        cut["profile_kids"] = profile.get("kids", False)
+        if cut["profile_kids"]:
+            cut["flash"] = False
 
     last_flash = -99.0
     for cut in plan:
@@ -332,6 +403,26 @@ class _Sprites:
                 (-l, -t), ch, font=font, fill=_hex(fill) + (255,),
                 stroke_width=stroke_w, stroke_fill=_hex(stroke) + (255,),
             )
+            g = (img, l, t, font.getlength(ch))
+            self.base[key] = g
+        return g
+
+    def outlined(self, ch, font_path, size, fill, outline):
+        """太い外側の縁取り＋文字色の細い縁取り（細い書体を太く見せる）。"""
+        key = ("outlined", ch, font_path, size, fill, outline)
+        g = self.base.get(key)
+        if g is None:
+            font = self.fonts.get(font_path, size)
+            sw_out = max(size // 9, 6)
+            sw_in = max(size // 28, 2)
+            l, t, r, b = font.getbbox(ch, stroke_width=sw_out)
+            w, h = max(r - l, 1), max(b - t, 1)
+            img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.text((-l, -t), ch, font=font, fill=_hex(outline) + (255,),
+                   stroke_width=sw_out, stroke_fill=_hex(outline) + (255,))
+            d.text((-l, -t), ch, font=font, fill=_hex(fill) + (255,),
+                   stroke_width=sw_in, stroke_fill=_hex(fill) + (255,))
             g = (img, l, t, font.getlength(ch))
             self.base[key] = g
         return g
@@ -424,6 +515,8 @@ class _Cut:
         rows = cut["rows"]
         vertical = cut["layout"] == "vertical"
         font_path = FONT_QUIET if level == 1 else FONT_HEAVY
+        if cut.get("profile_kids"):
+            font_path = FONT_KIDS
         emphasis = bool(cut.get("emphasis"))
         neon = cut.get("entrance") == "neon"
         self.overlay = None
@@ -471,7 +564,11 @@ class _Cut:
             emph_idx = set(range(*best))
         mis_colors = [accent, "#F2C200"] if cut.get("texture") == "misregister" else []
 
+        kids_style = bool(cut.get("profile_kids"))
+
         def make_glyph(draw_ch, fpath, gsize, fill, stroke, sw):
+            if kids_style:
+                return sprites.outlined(draw_ch, fpath, gsize, fill, "#FFFFFF"), ("outlined", draw_ch, fpath, gsize, fill)
             if neon:
                 return sprites.neon(draw_ch, fpath, gsize, accent if fill == accent else "#FF5FA2"), ("neon", draw_ch, fpath, gsize, fill)
             return sprites.glyph(draw_ch, fpath, gsize, fill, stroke, sw), (draw_ch, fpath, gsize, fill, stroke, sw)
@@ -751,6 +848,16 @@ class _Cut:
             q = _ease_out(f / E)
             dy = _lerp(70, 0, q) + 6 * math.sin(tl * 3 + o * 0.5)
             alpha = q
+        elif motion == "bounce":
+            p = f - o * 1.5
+            if p < 0:
+                alpha = 0.0
+            else:
+                q = min(p / E, 1.0)
+                # 上から落ちて2回弾む
+                dy = -420 * abs(math.cos(q * math.pi * 1.5)) * (1 - q) ** 1.5
+                scale = 1.0 + 0.08 * math.sin(q * math.pi * 3) * (1 - q)
+                alpha = min(p / 2, 1.0)
         elif motion == "stamp":
             lead = (cut["land"] - cut["start"]) * FPS - 3
             p = f - lead
@@ -1006,20 +1113,20 @@ def _shared_decor():
 VIDEO_EXTS = (".mp4", ".mov", ".webm", ".m4v")
 
 
-def _make_cover(img):
+def _make_cover(img, brightness=0.55):
     W, H = VIDEO_SIZE
     s = max(W / img.width, H / img.height)
     img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1), Image.LANCZOS)
-    return ImageEnhance.Brightness(img).enhance(0.55)
+    return ImageEnhance.Brightness(img).enhance(brightness)
 
 
 class _ImageSource:
-    def __init__(self, path):
+    def __init__(self, path, brightness=0.55):
         path = Path(path)
-        key = (str(path), path.stat().st_mtime)
+        key = (str(path), path.stat().st_mtime, brightness)
         cover = _COVERS.get(key)
         if cover is None:
-            cover = _make_cover(Image.open(path).convert("RGB"))
+            cover = _make_cover(Image.open(path).convert("RGB"), brightness)
             if len(_COVERS) > 16:
                 _COVERS.clear()
             _COVERS[key] = cover
@@ -1032,12 +1139,13 @@ class _ImageSource:
 class _VideoSource:
     """動画の背景。曲の時刻に合わせて繰り返し再生する。"""
 
-    def __init__(self, path):
+    def __init__(self, path, brightness=0.6):
         from moviepy import VideoFileClip
 
         self.clip = VideoFileClip(str(path), audio=False)
         self.duration = max(self.clip.duration, 0.1)
         self._last = (None, None)
+        self.brightness = brightness
 
     def cover_at(self, t):
         fi = int((t % self.duration) * FPS)
@@ -1048,7 +1156,7 @@ class _VideoSource:
         W, H = VIDEO_SIZE
         s = max(W / img.width, H / img.height) * 1.12
         img = img.resize((int(img.width * s) + 1, int(img.height * s) + 1), Image.BILINEAR)
-        cover = ImageEnhance.Brightness(img).enhance(0.6)
+        cover = ImageEnhance.Brightness(img).enhance(self.brightness)
         self._last = (fi, cover)
         return cover
 
@@ -1058,15 +1166,17 @@ class _Background:
     保持し、カメラの窓（寄り・パン位置・傾き）で切り出す。
     複数の背景（画像・動画）を持ち、カットごとに bg_image で選ぶ。"""
 
-    def __init__(self, image_path, beats, style):
+    def __init__(self, image_path, beats, style, brightness=0.55):
         self.main = str(image_path)
         self._sources = {}
+        self.brightness = brightness
         self.cover = self._source(self.main).cover_at(0)
         self.beats = beats or []
         self.pulse_scale = style.get("pulse_scale", 1.08)
         self.pulse_decay = style.get("pulse_decay_sec", 0.14)
         self._solid = {}
         self.wa = False
+        self.palette = DEFAULT_PALETTE
 
     def _source(self, path):
         path = str(path or self.main)
@@ -1077,7 +1187,10 @@ class _Background:
                 src = self._sources.get(path)
                 if src is not None:
                     return src
-            src = _VideoSource(path) if Path(path).suffix.lower() in VIDEO_EXTS else _ImageSource(path)
+            if Path(path).suffix.lower() in VIDEO_EXTS:
+                src = _VideoSource(path, self.brightness + 0.05)
+            else:
+                src = _ImageSource(path, self.brightness)
             self._sources[path] = src
         return src
 
@@ -1125,13 +1238,13 @@ class _Background:
         if mode == "image":
             im = self.image_at(t, cam, image or (cut.get("bg_image") if cut else None))
             if bgfx == "duotone":
-                accent = DEFAULT_PALETTE[cut["index"] % len(DEFAULT_PALETTE)][0]
+                accent = self.palette[cut["index"] % len(self.palette)][0]
                 im = kinetic_bg.apply_bgfx(im, bgfx, t, "#0C0C0F", accent, self.beat_amt(t), cut["index"])
             return im
-        color = DEFAULT_PALETTE[mode][0]
+        color = self.palette[mode][0]
         if bgfx and bgfx.startswith("pattern:"):
             im = kinetic_bg.apply_bgfx(Image.new("RGB", VIDEO_SIZE, _hex(color)), bgfx, t, color,
-                                       DEFAULT_PALETTE[mode][3], self.beat_amt(t), cut.get("shot", 0))
+                                       self.palette[mode][3], self.beat_amt(t), cut.get("shot", 0))
             return kinetic_bg.apply_paper(im, self.wa)
         return self.solid(color).copy()
 
@@ -1165,6 +1278,10 @@ def apply_interlude_effect(frame, name, strength, t, beat_idx, beat_amt, palette
     """frame(PIL RGB) に間奏エフェクトをかける。strength 0..1、beat_amt はビート直後ほど1。"""
     if strength <= 0.01:
         return frame
+    if name == "kaleido_soft":
+        return kinetic_bg.kaleidoscope(frame, t, strength)
+    if name == "sparkle":
+        return kinetic_bg.sparkle(frame, t, strength, beat_amt, palette)
     if name == "kaleido":
         frame = kinetic_bg.kaleidoscope(frame, t, strength)
         name = "rgb_split"
@@ -1263,8 +1380,12 @@ class KineticRenderer:
         if shots:
             lo, hi = self.shot_span[shots[-1]]
             self.shot_span[shots[-1]] = (lo, hi + 4.0)
-        self.bg = _Background(image_path, beats, style)
+        kids = any(c.get("profile_kids") for c in plan)
+        self.bg = _Background(image_path, beats, style, brightness=0.92 if kids else 0.55)
         self.bg.wa = any(c.get("profile_wa") for c in plan)
+        self.kids = any(c.get("profile_kids") for c in plan)
+        self.palette = palette_for(plan)
+        self.bg.palette = self.palette
         self.sprites = _shared_sprites()
         self.duration = duration
         self.interludes = find_interludes(plan, duration)
@@ -1273,10 +1394,13 @@ class KineticRenderer:
         self.cuts = []
         for c in plan:
             if c["bg"] == "image":
-                colors = ("#FFFFFF", "#0B0B0F", style.get("caption_color", "#FF3B70"))
+                if self.kids:
+                    colors = ("#3A2A5A", "#FFFFFF", "#FF4F9A")
+                else:
+                    colors = ("#FFFFFF", "#0B0B0F", style.get("caption_color", "#FF3B70"))
                 palette_bg = None
             else:
-                bg, text, stroke, accent = DEFAULT_PALETTE[c["bg"]]
+                bg, text, stroke, accent = self.palette[c["bg"]]
                 colors = (text, stroke, accent)
                 palette_bg = bg
             self.cuts.append(_Cut(c, self.sprites, colors, palette_bg, beats))
@@ -1334,7 +1458,7 @@ class KineticRenderer:
         sx = sy = 0.0
         if c["level"] == 3 and since_land >= 0:
             g_zoom += 0.07 * math.exp(-since_land / 0.12)
-            amp = 14 * math.exp(-since_land / 0.08)
+            amp = (4 if self.kids else 14) * math.exp(-since_land / 0.08)
             sx = amp * math.sin(t * 90)
             sy = amp * math.cos(t * 77)
             g_zoom += 0.012 * (self.bg.pulse(t) - 1.0) / max(self.bg.pulse_scale - 1.0, 1e-3)
@@ -1362,9 +1486,11 @@ class KineticRenderer:
                 beat_amt = 0.0
                 if bi >= 0:
                     beat_amt = math.exp(-(t - self.bg.beats[bi]) / 0.12)
+                pal = self.palette
+                if self.kids:
+                    effect = ("sparkle", "kaleido_soft", "duotone")[k % 3]
                 frame = apply_interlude_effect(frame, effect, strength, t, bi, beat_amt,
-                                               (DEFAULT_PALETTE[0][0], DEFAULT_PALETTE[0][3]) if k % 2
-                                               else (DEFAULT_PALETTE[1][0], DEFAULT_PALETTE[2][0]))
+                                               (pal[0][0], pal[0][3]) if k % 2 else (pal[1][0], pal[2][0]))
         if prev is not None:
             prev_cut = self.plan[kc - 1] if kc > 0 else None
             old = self.bg.frame(prev, t, bg_cam, prev_cut if prev_cut and prev_cut["bg"] == prev else None)
@@ -1459,7 +1585,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
     return sheets
 
 
-PLAN_VERSION = 4
+PLAN_VERSION = 7
 
 
 def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None):

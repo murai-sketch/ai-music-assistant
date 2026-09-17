@@ -95,21 +95,20 @@ def _get_model(model_size="large-v3", device="cpu", compute_type="int8"):
     return _model
 
 
-def _transcribe_words(audio_path):
+def _transcribe_words(audio_path, audio_duration=None):
     """whisperで単語タイムスタンプ付きの文字起こしをし、
     [{"start", "end", "text", "words": [{"start", "end", "word"}, ...]}, ...] を返す。
 
     まずVAD(vad_filter=True)で試す。歪んだ/デスコア的な発声・ミックスに
-    埋もれたボーカルなど、通常の音声と大きく異なる音源ではVADが
-    「音声区間なし」と誤判定し、セグメントが0件になることがある
-    （実測: 「空気で有罪 - カワイ民謡デスコアMIX」でvad_filter=Trueだと
-    0件、vad_filter=Falseだと94件検出）。0件だった場合はvad_filter=False
-    で再試行し、それでも0件なら明示的に警告を出す。"""
+    埋もれたボーカル、子どもっぽい歌声など、通常の音声と大きく異なる音源では
+    VADが「音声区間なし」「ごく一部だけ」と誤判定することがある
+    （実測: デスコア系のリミックスで0件、子ども向けの曲で冒頭40秒だけ）。
+    結果が曲の6割に届かなければ vad_filter=False でもやり直し、単語の多い方を使う。"""
     model = _get_model()
 
     def run(vad):
         kwargs = dict(beam_size=5, vad_filter=vad, word_timestamps=True,
-                      language=WHISPER_LANGUAGE)
+                      language=WHISPER_LANGUAGE, condition_on_previous_text=False)
         if vad:
             kwargs["vad_parameters"] = dict(min_silence_duration_ms=200)
         segments, _info = model.transcribe(str(audio_path), **kwargs)
@@ -124,12 +123,22 @@ def _transcribe_words(audio_path):
             for seg in segments
         ]
 
+    def n_words(res):
+        return sum(len(s["words"]) for s in res)
+
     result = run(True)
-    if result:
+    covered = result[-1]["end"] if result else 0.0
+    if result and (not audio_duration or covered >= audio_duration * 0.6):
         return result
-    print("[WARN] VAD(音声区間検出)がセグメントを1つも検出できませんでした。"
-          "vad_filter=Falseで再試行します。")
-    result = run(False)
+    if result:
+        print(f"[WARN] VAD(音声区間検出)で取れたのが {covered:.0f}秒までだけでした。"
+              "vad_filter=Falseでもやり直して、単語の多い方を使います。")
+    else:
+        print("[WARN] VAD(音声区間検出)がセグメントを1つも検出できませんでした。"
+              "vad_filter=Falseで再試行します。")
+    retry = run(False)
+    if n_words(retry) > n_words(result):
+        result = retry
     if not result:
         print("[WARN] vad_filter=Falseでもセグメントを検出できませんでした。"
               "曲全体への機械的な文字数比分配にフォールバックします"
@@ -480,7 +489,7 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
     if use_cache and words_path.exists():
         word_segments = json.loads(words_path.read_text(encoding="utf-8"))
     else:
-        word_segments = _transcribe_words(audio_path)
+        word_segments = _transcribe_words(audio_path, audio_duration)
         cache_dir.mkdir(parents=True, exist_ok=True)
         words_path.write_text(
             json.dumps(word_segments, ensure_ascii=False, indent=1), encoding="utf-8"

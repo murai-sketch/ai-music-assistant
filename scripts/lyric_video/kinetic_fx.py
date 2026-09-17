@@ -35,6 +35,7 @@ FONT_QUIET = "/System/Library/Fonts/ヒラギノ明朝 ProN.ttc"
 WA_WORDS = ("和", "民謡", "演歌", "三味線", "尺八", "太鼓", "祭", "wa-", "wa metal", "wametal", "japanese folk", "enka")
 POP_WORDS = ("pop", "city", "neon", "electro", "エレクトロ", "シティ", "ポップ", "future bass", "hyperpop")
 NIGHT_WORDS = ("夜", "光", "星", "月", "ネオン", "街")
+KIDS_WORDS = ("kids", "nursery", "童謡", "わらべ", "こども", "子ども", "キッズ", "toddler", "子守", "children")
 HEART_WORDS = ("心", "胸", "鼓", "脈", "息", "命")
 BREAK_WORDS = ("壊", "裂", "砕", "破", "斬", "切")
 
@@ -84,7 +85,8 @@ def song_profile(alignment, sections, beats, meta=None):
             while bpm > 180:
                 bpm /= 2
     return {
-        "wa": any(w in label for w in WA_WORDS),
+        "wa": any(w in label for w in WA_WORDS) and not any(w in label for w in KIDS_WORDS),
+        "kids": any(w in label for w in KIDS_WORDS),
         "pop": any(w in label for w in POP_WORDS) or sum(text.count(w) for w in NIGHT_WORDS) >= 3,
         "bpm": float(bpm or 120),
         "density": len(text) / sung,
@@ -112,6 +114,10 @@ def enabled_techniques(profile):
         on |= {"grain", "scatter", "heartbeat"}
     if not on & {"wall", "tunnel", "rings", "tape", "radial", "kanji"}:
         on |= {"wall", "radial"}
+    if profile.get("kids"):
+        # 幼児と親向け: 攻撃的な部品を外し、弾む・きらめく部品にする
+        on -= {"tape", "split", "stamp", "misregister", "grain", "kanji", "neon", "wall", "tunnel", "radial"}
+        on |= {"rings", "scatter", "heartbeat", "sparkle", "bounce"}
     return on
 
 
@@ -119,8 +125,9 @@ def assign_techniques(plan, profile):
     """plan の各カットに decor / texture / exit / hold / emphasis を割り当てる。
     必要に応じて motion / entrance / layout も置き換える。"""
     on = enabled_techniques(profile)
-    hook_order = [d for d in ("tunnel", "wall", "rings", "radial", "tape") if d in on]
-    verse_order = [d for d in ("tape", "kanji", "wall", "radial") if d in on]
+    hook_order = [d for d in ("tunnel", "wall", "rings", "radial", "tape", "sparkle") if d in on]
+    verse_order = [d for d in ("tape", "kanji", "wall", "radial", "sparkle") if d in on]
+    kids = profile.get("kids")
     prev_decor = None
     hook_k = verse_k = 0
     for i, c in enumerate(plan):
@@ -190,6 +197,10 @@ def assign_techniques(plan, profile):
                 c["exit"] = "fly"
             elif "split" in on and any(w in text for w in BREAK_WORDS):
                 c["exit"] = "split"
+        if kids and c["entrance"] in ("slam", "slash", "shake", "fall", "stamp"):
+            c["motion"] = c["entrance"] = "bounce"
+        if kids and c["hold"] is None and c["level"] == 3:
+            c["hold"] = "heartbeat"
         if dur < 0.9 and c["decor"] not in (None, "radial"):
             c["decor"] = None
         prev_decor = c["decor"]
@@ -376,6 +387,28 @@ class Decor:
                    (cx + R * math.cos(a0 + width), cy + R * math.sin(a0 + width))]
             col = color if k % 2 else accent
             d.polygon(pts, fill=col + (int(60 * fade),))
+        frame.paste(layer, (0, 0), layer)
+
+    # --- きらめく星
+    def _sparkle(self, frame, cut, tl, dur, color, accent, cam, fade):
+        layer = Image.new("RGBA", VIDEO_SIZE, (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        W, H = VIDEO_SIZE
+        for k in range(26):
+            x = _hash01(cut["index"] * 7 + k) * W
+            y = _hash01(cut["index"] * 13 + k * 3) * H
+            if abs(y - H * 0.5) < 260:
+                y += 420 if y > H * 0.5 else -420
+            size = 18 + 46 * _hash01(k * 5 + cut["index"])
+            tw = 0.5 + 0.5 * math.sin(tl * (3 + k % 4) + k)
+            r = size * (0.6 + 0.4 * tw)
+            pts = []
+            for j in range(10):
+                ang = -math.pi / 2 + j * math.pi / 5 + tl * 0.5 * (1 if k % 2 else -1)
+                rr = r if j % 2 == 0 else r * 0.45
+                pts.append((x + rr * math.cos(ang), y + rr * math.sin(ang)))
+            col = accent if k % 3 else (255, 255, 255)
+            d.polygon(pts, fill=col + (int(200 * fade * (0.4 + 0.6 * tw)),))
         frame.paste(layer, (0, 0), layer)
 
     # --- 巨大な漢字1文字
