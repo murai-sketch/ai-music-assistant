@@ -18,6 +18,12 @@ ERPJ楽曲ノート + 音声 + 画像 から、ビート連動アニメーショ
     --style は kawaii / deathcore / kawaii-deathcore-wametal から選択
     （省略時は kawaii-deathcore-wametal）。
 
+    --renderer は kinetic（既定。キネティックタイポグラフィ、kinetic.py）/
+    classic（中央下の字幕ポップイン、render.py）。
+    kinetic では書き出す前に --stills <DIR> で各カットの静止画一覧を出し、
+    文字の重なり・見切れ・読みにくさを確認してから --out で書き出す。
+    カット設計は _work/<hash>/kinetic_plan.json（手で直せる。--replan で作り直し）。
+
 align.py/beats.py の結果は音声ファイルのハッシュでキャッシュされる
 （scripts/lyric_video/_work/<hash>/ 配下）ため、スタイルだけ変えて
 再生成する場合はwhisper文字起こし・ビート検出をスキップできる。
@@ -32,7 +38,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from align import align_lyrics
+from align import WORK_DIR, _audio_hash, align_lyrics
 from beats import detect_beats
 from render import render_video
 from song_note import SongNote
@@ -51,10 +57,23 @@ def parse_args():
         choices=list(STYLES),
         help=f"アニメーションスタイル（デフォルト: {DEFAULT_STYLE}）",
     )
-    parser.add_argument("--out", required=True, help="出力mp4のパス")
+    parser.add_argument("--out", help="出力mp4のパス（--stills のときは不要）")
     parser.add_argument(
         "--no-cache", action="store_true",
         help="align/beatsのキャッシュを無視して再計算する",
+    )
+    parser.add_argument(
+        "--renderer", default="kinetic", choices=["kinetic", "classic"],
+        help="kinetic: 文字が動いて意味を伝えるキネティックタイポグラフィ（kinetic.py） / "
+             "classic: 中央下の字幕がポップインする旧方式（render.py）",
+    )
+    parser.add_argument(
+        "--replan", action="store_true",
+        help="kinetic: _work/<hash>/kinetic_plan.json を作り直す（手で直した設計は消える）",
+    )
+    parser.add_argument(
+        "--stills", metavar="DIR",
+        help="kinetic: 動画は書き出さず、各カットの静止画一覧をDIRに出す（書き出し前の確認用）",
     )
     return parser.parse_args()
 
@@ -91,15 +110,36 @@ def main():
     )
     print(f"      {len(beats)}個のビート/オンセットを検出")
 
-    print(f"[4/4] 動画を書き出し中 (style={args.style})...")
-    output_path = render_video(
-        image_path=image_path,
-        audio_path=audio_path,
-        alignment=alignment,
-        beats=beats,
-        style=style,
-        output_path=args.out,
-    )
+    if args.renderer == "classic":
+        if not args.out:
+            print("[ERROR] --out を指定してください")
+            sys.exit(1)
+        print(f"[4/4] 動画を書き出し中 (renderer=classic, style={args.style})...")
+        output_path = render_video(
+            image_path=image_path,
+            audio_path=audio_path,
+            alignment=alignment,
+            beats=beats,
+            style=style,
+            output_path=args.out,
+        )
+    else:
+        from kinetic import load_or_build_plan, render_kinetic, render_stills
+
+        plan_path = WORK_DIR / _audio_hash(audio_path) / "kinetic_plan.json"
+        sections = [section for _line, section in note.lyric_sections]
+        plan = load_or_build_plan(plan_path, alignment, sections, beats, style, replan=args.replan)
+        print(f"      カット設計: {plan_path}（一覧は {plan_path.with_suffix('.md').name}）")
+        if args.stills:
+            print(f"[4/4] 静止画一覧を書き出し中: {args.stills}")
+            sheets = render_stills(image_path, plan, beats, style, args.stills)
+            print(f"[DONE] {len(sheets)}枚: {args.stills}")
+            return
+        if not args.out:
+            print("[ERROR] --out を指定してください")
+            sys.exit(1)
+        print(f"[4/4] 動画を書き出し中 (renderer=kinetic, style={args.style})...")
+        output_path = render_kinetic(image_path, audio_path, plan, beats, style, args.out)
 
     print(f"[DONE] 出力: {output_path}")
 

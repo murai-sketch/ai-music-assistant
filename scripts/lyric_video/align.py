@@ -30,12 +30,30 @@ correct() 関数（whisperの生セグメントを既知の台本テキストに
 「セグメントの開始/終了時刻はおおむね合っている」という前提のもと、
 歌詞行ごとに一番近い位置を探して割り当てる。
 
-キャッシュ: 音声ファイルのSHA256先頭8桁をキーに、_work/<hash>/alignment.json
-に結果を保存する。既に存在すればwhisper文字起こしをスキップする。
+さらに同じ曲で、v7まで手動補正しても「字幕が歌より先に出る」ままだった。
+原因は2つ:
+  1. 先頭から順に1行ずつ当てはめる貪欲な探索は、歌詞ノートに1回しか
+     書かれていない繰り返し（サビの2回し等）や、whisperの認識抜けに
+     出会うと、そこから後ろの行を全部前に詰めてしまう
+     （実例: 最後の6行が実際より40〜60秒早く配置された）。
+  2. セグメントの開始時刻は、直前の間奏・無音を含んで早めに出ることがある。
+そのため、単語単位のタイムスタンプ（word_timestamps）を取り、歌詞全体と
+認識テキスト全体を文字単位で一括照合する方式（_global_align）を標準にした。
+繰り返し・抜けは照合側で読み飛ばされ、一致しなかった行は前後の一致行の
+間に文字数比で配置される。
+
+キャッシュ: 音声ファイルのSHA256先頭8桁をキーに、_work/<hash>/ 配下に
+whisper_words.json（生の文字起こし）と alignment.json（行タイミング）を
+保存する。whisper_words.json があれば文字起こしをスキップするので、
+照合ロジックだけを変えて再計算できる（whisperは実行ごとに結果が揺れるため）。
 """
 
+import bisect
+import difflib
 import hashlib
 import json
+import statistics
+import unicodedata
 from pathlib import Path
 
 try:
@@ -44,6 +62,13 @@ except ImportError:
     WhisperModel = None
 
 WORK_DIR = Path(__file__).resolve().parent / "_work"
+
+# 歌詞が日本語前提のVault。自動判定に任せると、歪んだボーカルで判定が
+# 揺れることがあるため固定する。
+WHISPER_LANGUAGE = "ja"
+
+# これより短い一致ブロックは偶然の一致（助詞1文字など）として捨てる
+MIN_MATCH_BLOCK = 2
 
 _model = None
 
@@ -70,35 +95,189 @@ def _get_model(model_size="large-v3", device="cpu", compute_type="int8"):
     return _model
 
 
-def _transcribe_segments(audio_path):
-    """whisperで文字起こしし、[(start, end, text), ...] のリストを返す。
+def _transcribe_words(audio_path):
+    """whisperで単語タイムスタンプ付きの文字起こしをし、
+    [{"start", "end", "text", "words": [{"start", "end", "word"}, ...]}, ...] を返す。
 
     まずVAD(vad_filter=True)で試す。歪んだ/デスコア的な発声・ミックスに
     埋もれたボーカルなど、通常の音声と大きく異なる音源ではVADが
     「音声区間なし」と誤判定し、セグメントが0件になることがある
     （実測: 「空気で有罪 - カワイ民謡デスコアMIX」でvad_filter=Trueだと
     0件、vad_filter=Falseだと94件検出）。0件だった場合はvad_filter=False
-    で再試行し、それでも0件なら呼び出し元が明示的に警告を出す。"""
+    で再試行し、それでも0件なら明示的に警告を出す。"""
     model = _get_model()
 
-    segments, _info = model.transcribe(
-        str(audio_path),
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=200),
-    )
-    result = [(seg.start, seg.end, seg.text) for seg in segments]
+    def run(vad):
+        kwargs = dict(beam_size=5, vad_filter=vad, word_timestamps=True,
+                      language=WHISPER_LANGUAGE)
+        if vad:
+            kwargs["vad_parameters"] = dict(min_silence_duration_ms=200)
+        segments, _info = model.transcribe(str(audio_path), **kwargs)
+        return [
+            {
+                "start": seg.start, "end": seg.end, "text": seg.text,
+                "words": [
+                    {"start": w.start, "end": w.end, "word": w.word}
+                    for w in (seg.words or [])
+                ],
+            }
+            for seg in segments
+        ]
+
+    result = run(True)
     if result:
         return result
-
     print("[WARN] VAD(音声区間検出)がセグメントを1つも検出できませんでした。"
           "vad_filter=Falseで再試行します。")
-    segments, _info = model.transcribe(str(audio_path), beam_size=5, vad_filter=False)
-    result = [(seg.start, seg.end, seg.text) for seg in segments]
+    result = run(False)
     if not result:
         print("[WARN] vad_filter=Falseでもセグメントを検出できませんでした。"
               "曲全体への機械的な文字数比分配にフォールバックします"
               "（タイミング精度は大きく低下します）。")
+    return result
+
+
+def _normalize_char(c):
+    """照合用に1文字を正規化する。空白・記号は None（照合対象外）。"""
+    c = unicodedata.normalize("NFKC", c)
+    if not c or c.isspace():
+        return None
+    if unicodedata.category(c[0])[0] in ("P", "S"):
+        return None
+    # カタカナ→ひらがな（whisperの表記揺れ吸収）
+    o = ord(c[0])
+    if 0x30A1 <= o <= 0x30F6:
+        c = chr(o - 0x60)
+    return c.lower()
+
+
+def _global_align(lyric_lines, word_segments, audio_duration):
+    """歌詞全体とwhisper認識テキスト全体を文字単位で一括照合し、
+    行ごとの{line, start, end}を返す。
+
+    - 一致ブロックは両側で単調増加なので、繰り返し・認識抜けは読み飛ばされる
+    - 行の開始は、その行で最初に一致した文字の時刻（単語内は線形補間）から、
+      それより前の不一致文字ぶんを平均文字長で差し引いて求める
+    - 1文字も一致しなかった行は、前後の一致行の間に文字数比で配置する
+    """
+    w_chars, w_start, w_end = [], [], []
+    for seg in word_segments:
+        for w in seg["words"]:
+            raw = [c for c in (_normalize_char(ch) for ch in w["word"]) if c]
+            n = len(raw)
+            if not n:
+                continue
+            dur = max(w["end"] - w["start"], 0.0)
+            for i, c in enumerate(raw):
+                w_chars.append(c)
+                w_start.append(w["start"] + dur * i / n)
+                w_end.append(w["start"] + dur * (i + 1) / n)
+
+    l_chars, l_line = [], []
+    line_len = []
+    for idx, line in enumerate(lyric_lines):
+        cs = [c for c in (_normalize_char(ch) for ch in line) if c]
+        line_len.append(max(len(cs), 1))
+        for c in cs:
+            l_chars.append(c)
+            l_line.append(idx)
+
+    matcher = difflib.SequenceMatcher(None, l_chars, w_chars, autojunk=False)
+    matched = {}  # lyric char index -> whisper char index
+    for a, b, size in matcher.get_matching_blocks():
+        if size < MIN_MATCH_BLOCK:
+            continue
+        for k in range(size):
+            matched[a + k] = b + k
+
+    char_durs = [e - s for s, e in zip(w_start, w_end) if e > s]
+    per_char = min(statistics.median(char_durs), 0.4) if char_durs else 0.2
+
+    n_lines = len(lyric_lines)
+    starts = [None] * n_lines
+    ends = [None] * n_lines
+    line_first_char = {}
+    for li_char, line_idx in enumerate(l_line):
+        line_first_char.setdefault(line_idx, li_char)
+    for li_char in sorted(matched):
+        line_idx = l_line[li_char]
+        wi = matched[li_char]
+        if starts[line_idx] is None:
+            offset = li_char - line_first_char[line_idx]
+            starts[line_idx] = max(w_start[wi] - offset * per_char, 0.0)
+        ends[line_idx] = w_end[wi]
+
+    matched_count = sum(1 for s in starts if s is not None)
+    print(f"      一括照合: {matched_count}/{n_lines}行が認識テキストと一致")
+    if matched_count == 0:
+        return None
+
+    # 不一致行は、前後の一致文字に挟まれた「認識テキスト側の隙間」へ
+    # 位置の比率で対応づける（認識が崩れただけの行は、ここで拾える）
+    matched_keys = sorted(matched)
+    for i in range(n_lines):
+        if starts[i] is not None:
+            continue
+        la = line_first_char.get(i)
+        if la is None:
+            continue
+        k = bisect.bisect_left(matched_keys, la)
+        if k == 0 or k == len(matched_keys):
+            continue
+        pa, na = matched_keys[k - 1], matched_keys[k]
+        pb, nb = matched[pa], matched[na]
+        if nb - pb - 1 <= 0:
+            continue
+        wi = pb + 1 + (la - pa - 1) * (nb - pb - 1) // max(na - pa - 1, 1)
+        starts[i] = w_start[wi]
+        gap_chars = line_len[i] * (nb - pb - 1) // max(na - pa - 1, 1)
+        ends[i] = w_end[min(wi + max(gap_chars, 1) - 1, nb - 1)]
+
+    # それでも決まらない行は、前後の決まった行の間に文字数比で配置
+    anchors = [i for i in range(n_lines) if starts[i] is not None]
+    first, last = anchors[0], anchors[-1]
+    for i in range(first - 1, -1, -1):
+        starts[i] = max(starts[i + 1] - line_len[i] * per_char * 2, 0.0)
+    for left, right in zip(anchors, anchors[1:]):
+        gap = right - left - 1
+        if gap <= 0:
+            continue
+        t0 = ends[left] if ends[left] is not None else starts[left]
+        t1 = starts[right]
+        span = max(t1 - t0, 0.0)
+        total = sum(line_len[left + 1:right]) or 1
+        cursor = t0
+        for i in range(left + 1, right):
+            starts[i] = cursor
+            cursor += span * line_len[i] / total
+    tail_end = audio_duration or (ends[last] or starts[last]) + 3.0
+    if last < n_lines - 1:
+        t0 = ends[last] if ends[last] is not None else starts[last]
+        span = max(tail_end - t0, 0.1)
+        total = sum(line_len[last + 1:]) or 1
+        cursor = t0
+        for i in range(last + 1, n_lines):
+            starts[i] = cursor
+            cursor += span * line_len[i] / total
+
+    result = []
+    for i, line in enumerate(lyric_lines):
+        if i + 1 < n_lines:
+            end = starts[i + 1]
+        else:
+            end = ends[i] + 0.5 if ends[i] is not None else tail_end
+            if audio_duration:
+                end = min(end, audio_duration)
+        result.append({"line": line, "start": starts[i], "end": end})
+
+    for i in range(1, len(result)):
+        if result[i]["start"] < result[i - 1]["start"]:
+            result[i]["start"] = result[i - 1]["start"]
+    for i in range(len(result)):
+        if i + 1 < len(result):
+            result[i]["end"] = result[i + 1]["start"]
+        if result[i]["end"] <= result[i]["start"]:
+            result[i]["end"] = result[i]["start"] + 0.3
     return result
 
 
@@ -283,11 +462,25 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
             return cached["alignment"]
 
     audio_duration = _get_audio_duration(audio_path)
-    whisper_segments = _transcribe_segments(audio_path)
-
-    if whisper_segments:
-        alignment = _content_aware_align(lyric_lines, whisper_segments, audio_duration)
+    words_path = cache_dir / "whisper_words.json"
+    if use_cache and words_path.exists():
+        word_segments = json.loads(words_path.read_text(encoding="utf-8"))
     else:
+        word_segments = _transcribe_words(audio_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        words_path.write_text(
+            json.dumps(word_segments, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+
+    alignment = None
+    if word_segments:
+        alignment = _global_align(lyric_lines, word_segments, audio_duration)
+        if alignment is None:
+            print("[WARN] 一括照合で1行も一致しませんでした。"
+                  "セグメント単位の逐次照合にフォールバックします。")
+            segments = [(s["start"], s["end"], s["text"]) for s in word_segments]
+            alignment = _content_aware_align(lyric_lines, segments, audio_duration)
+    if alignment is None:
         alignment = _uniform_fallback_align(lyric_lines, audio_duration)
 
     cache_dir.mkdir(parents=True, exist_ok=True)

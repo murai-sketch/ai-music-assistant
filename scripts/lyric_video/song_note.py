@@ -49,6 +49,12 @@ def read_bpm(text):
 def extract_lyric_lines(text):
     """「## 歌詞 & 楽曲構成」直下の最初のフェンスコードブロックから、
     歌詞行のリストを返す。構成タグ行([Verse]等)と空行は除外する。"""
+    return [line for line, _section in extract_lyric_lines_with_sections(text)]
+
+
+def extract_lyric_lines_with_sections(text):
+    """extract_lyric_lines と同じ行を、直前の構成タグ名つきで返す。
+    [(歌詞行, "Chorus – Hook A"), ...]。タグより前の行のセクションは ""。"""
     section_match = re.search(
         r"^##\s*歌詞\s*&?\s*楽曲構成\s*$", text, re.MULTILINE
     )
@@ -63,13 +69,15 @@ def extract_lyric_lines(text):
     block = fence_match.group(1)
 
     lines = []
+    section = ""
     for raw_line in block.split("\n"):
         line = raw_line.strip()
         if not line:
             continue
         if _TAG_LINE_RE.match(line):
+            section = line.strip()[1:-1].strip()
             continue
-        lines.append(line)
+        lines.append((line, section))
 
     if not lines:
         raise ValueError("歌詞行を1行も抽出できませんでした")
@@ -83,7 +91,8 @@ class SongNote:
         self.text = self.path.read_text(encoding="utf-8")
         self.title = read_frontmatter_value(self.text, "title") or self.path.stem
         self.bpm = read_bpm(self.text)
-        self.lyric_lines = extract_lyric_lines(self.text)
+        self.lyric_sections = extract_lyric_lines_with_sections(self.text)
+        self.lyric_lines = [line for line, _section in self.lyric_sections]
 
     def __repr__(self):
         return f"SongNote(title={self.title!r}, bpm={self.bpm}, lines={len(self.lyric_lines)})"
