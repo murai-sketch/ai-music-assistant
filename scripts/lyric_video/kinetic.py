@@ -303,6 +303,7 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
 
         plan.append({
             "index": i + 1,
+            "text_y": 0.42 if profile.get("kids") else 0.5,
             "shot": shot,
             "camera": camera,
             "text": text,
@@ -669,14 +670,27 @@ class _Cut:
                                                outline=_hex(accent) + (255,), width=8)
                 self.under = card
 
+        # text_y は画面の高さに対する文字の中心位置（0.5 が中央）。
+        # kinetic_plan.json で1カットずつ直せる
+        ty = float(cut.get("text_y", 0.5))
         if cut["layout"] == "left":
-            self.anchor = (VIDEO_SIZE[0] * 0.47, VIDEO_SIZE[1] * 0.45)
+            self.anchor = (VIDEO_SIZE[0] * 0.47, VIDEO_SIZE[1] * (ty - 0.05))
         elif cut["layout"] == "right":
-            self.anchor = (VIDEO_SIZE[0] * 0.53, VIDEO_SIZE[1] * 0.55)
+            self.anchor = (VIDEO_SIZE[0] * 0.53, VIDEO_SIZE[1] * (ty + 0.05))
         elif cut["layout"] == "vertical":
-            self.anchor = (VIDEO_SIZE[0] * (0.68 if cut["index"] % 2 else 0.32), VIDEO_SIZE[1] * 0.46)
+            self.anchor = (VIDEO_SIZE[0] * (0.68 if cut["index"] % 2 else 0.32), VIDEO_SIZE[1] * (ty - 0.04))
         else:
-            self.anchor = (VIDEO_SIZE[0] / 2, VIDEO_SIZE[1] * 0.5)
+            self.anchor = (VIDEO_SIZE[0] / 2, VIDEO_SIZE[1] * ty)
+        if self.glyphs:
+            # 画面の上下からはみ出さないよう、文字の中心位置を戻す
+            _x0, y0, _x1, y1 = self._bounds()
+            ax, ay = self.anchor
+            margin = 70
+            if ay + y0 < margin:
+                ay = margin - y0
+            if ay + y1 > VIDEO_SIZE[1] - margin:
+                ay = VIDEO_SIZE[1] - margin - y1
+            self.anchor = (ax, ay)
         self.base_angle = -8 if cut["layout"] == "diagonal" else 0
         if cut.get("entrance") == "stamp":
             self.base_angle = -4 if cut["index"] % 2 else 3
@@ -1585,7 +1599,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
     return sheets
 
 
-PLAN_VERSION = 7
+PLAN_VERSION = 8
 
 
 def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None):
