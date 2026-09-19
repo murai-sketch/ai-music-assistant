@@ -72,6 +72,59 @@ python3 scripts/import_songs.py title "曲名" "アーティスト名"
 4. **結果をVaultに戻す**: 気に入った生成結果は `01_Songs/` のノートに追記し、`status` を `Demo` や `WIP` に更新する。リリースしたら `Released` に変更し、配信リンクを埋める。
 5. **プロモーション文の生成**: リリース済み曲の「制作エピソード・ストーリー」セクションを文脈として、Claude/GeminiにSNS投稿文やプロモーション文を生成させる。
 
+### 4. 歌詞動画をつくる（`scripts/lyric_video/`）
+
+曲ノートの歌詞・音源・背景画像から、歌詞が動いて意味を伝える縦型（1080×1920 / 30fps）の
+歌詞動画を作ります。歌詞のタイミングは音源の文字起こし（faster-whisper）と
+曲ノートの歌詞を突き合わせて自動で決め、あとから GUI で直せます。
+
+```bash
+# 専用の仮想環境を作る（他プロジェクトのvenvとは分ける）
+python3 -m venv scripts/lyric_video/.venv
+scripts/lyric_video/.venv/bin/pip install -r scripts/lyric_video/requirements.txt
+```
+
+**書き出し（CLI）**
+
+```bash
+scripts/lyric_video/.venv/bin/python scripts/lyric_video/make_lyric_video.py \
+  --song "01_Songs/<曲名>.md" --audio <音源> --image <背景画像> \
+  --out scripts/lyric_video/_work/<曲名>/output.mp4
+```
+
+- `--stills <DIR>` で、書き出す前に各カットの静止画一覧を出して読みにくさを確認できます
+- カット設計は `_work/<音源ハッシュ>/kinetic_plan.json` に残り、手で直せます（`--replan` で作り直し）
+- 曲ノートの `genre` と構成タグ（`[Chorus]` 等）が、使う技法と強弱の選び方を決めます
+
+**タイミングの調整（GUI）**
+
+```bash
+scripts/lyric_video/.venv/bin/python scripts/lyric_video/timing_gui.py \
+  --audio <音源> --image <背景画像> --song "01_Songs/<曲名>.md"
+```
+
+波形上のドラッグ、再生しながらの `T` タップ入力、歌詞の抜け・漏れの一覧、
+描画のプレビュー、部分書き出しができます。ブラウザから使うローカル専用のツールで、
+`127.0.0.1` のみを待ち受けます。
+
+**ショート動画（TikTok / YouTube ショート）**
+
+15〜60秒の切り抜き区間を自動で選びます。行の途中では切らず、サビの頭から始まり、
+まとまりの切れ目で終わる区間を優先します。
+
+```bash
+# 候補の一覧を見る → 書き出す（1本 / 複数 / 全部）
+... --shorts
+... --short 1        # --short 1,3 / --short all / --short-sec 15
+```
+
+**背景素材**
+
+画像でも動画でも使えます。用途（Verse／サビ／囁き／間奏／どこでも）を付けて複数登録でき、
+カットの強さに合うものが順番に使われます。GUI の「背景素材」から追加するか、CLI なら
+`--bg <ファイル>:<用途>` を繰り返し指定します。縦画面に対して横長の画像を渡すと、
+カメラが大きく動けるぶん見栄えがします。
+
 ## ライセンス
 
 MIT License
