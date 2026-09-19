@@ -125,6 +125,11 @@ scripts/lyric_video/.venv/bin/python scripts/lyric_video/timing_gui.py \
 `--bg <ファイル>:<用途>` を繰り返し指定します。縦画面に対して横長の画像を渡すと、
 カメラが大きく動けるぶん見栄えがします。
 
+手持ちの素材が無ければ、生成して用意する方法もあります。たとえば
+[ElevenLabs](https://try.elevenlabs.io/j4tv8xnnfqid) では、縦（9:16）の画像・短い動画・効果音を
+テキストから作れます（※ 紹介リンクです）。曲ノートの歌詞や制作エピソードを
+そのままプロンプトの下地にすると、曲に沿った背景がそろいます。
+
 ## ライセンス
 
 MIT License

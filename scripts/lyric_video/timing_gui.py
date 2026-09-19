@@ -721,7 +721,9 @@ fieldset.part legend { color:var(--dim); font-size:12px; }
         <input type="file" id="fileBg" class="hidden" accept="image/*,video/*" multiple>
       </div>
       <div id="bgList"></div>
-      <div class="hint">画像背景のカットに、強さに合う用途の素材が順番に使われます。無い用途は「どこでも」→ 上の🖼背景で代用します。</div>
+      <div class="hint">画像背景のカットに、強さに合う用途の素材が順番に使われます。無い用途は「どこでも」→ 上の🖼背景で代用します。<br>
+        素材が無いときは生成して用意する方法もあります（縦9:16の画像・短い動画・効果音）:
+        <a href="https://try.elevenlabs.io/j4tv8xnnfqid" target="_blank" rel="noopener noreferrer">ElevenLabs</a>（※紹介リンクです）</div>
     </fieldset>
     <div class="status" id="renderStatus"></div>
     <div class="toolbar">
