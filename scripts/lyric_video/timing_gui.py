@@ -29,6 +29,8 @@ timing_gui.py
     - キネティック描画の実物プレビュー、静止画チェック、書き出し（進捗表示つき）
     - 背景素材: 複数の画像・動画を用途（Verse／サビ／囁き／間奏／どこでも）つきで追加
     - 部分書き出し: 開始・終了（再生位置から／選択行の範囲から）を決めて、その区間だけを音声付きで書き出す
+    - ショート動画: TikTok / YouTube ショート向けの切り抜き区間（15〜60秒）を
+      自動で選び（shorts.py）、試聴して、1本ずつ／まとめて書き出す
     - 保存のたびに直前の alignment.json を alignment.bak-<日時>.json に退避する
 
 キーボード:
@@ -58,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from align import WORK_DIR, _audio_hash, _get_audio_duration, align_lyrics  # noqa: E402
 from beats import detect_beats  # noqa: E402
+import shorts as shorts_mod  # noqa: E402
 from song_note import SongNote, sections_for_alignment  # noqa: E402
 from styles import DEFAULT_STYLE, STYLES  # noqa: E402
 
@@ -82,6 +85,7 @@ STATE = {
     "render_status": "idle",
     "render_error": None,
     "render_output": None,
+    "render_outputs": [],
     "render_progress": 0.0,
     "stills": [],
 }
@@ -196,7 +200,28 @@ def _preview_jpeg(alignment, t, style_name):
     return buf.getvalue()
 
 
-def _run_render(style_name, stills_only, part=None):
+def _short_candidates(target=30.0, min_sec=None, max_sec=None, limit=5):
+    """ショート動画の切り抜き候補。GUI表示用に先頭行の文言も添える。"""
+    note = _note()
+    cache = _load_json(_cache_dir() / "alignment.json", {})
+    alignment = cache.get("alignment", [])
+    if not alignment:
+        return []
+    sections = sections_for_alignment(alignment, note.lyric_sections)
+    style = STYLES[DEFAULT_STYLE]
+    cands = shorts_mod.find_shorts(
+        alignment, sections, _beats(), duration=_get_audio_duration(Path(STATE["audio_path"])),
+        target=float(target),
+        min_sec=float(min_sec if min_sec is not None else shorts_mod.SHORT_MIN),
+        max_sec=float(max_sec if max_sec is not None else shorts_mod.SHORT_MAX),
+        limit=int(limit), max_hold=style.get("max_hold_sec", 2.8),
+    )
+    for c in cands:
+        c["line"] = alignment[c["start_row"]]["line"]
+    return cands
+
+
+def _run_render(style_name, stills_only, part=None, parts=None):
     from kinetic import load_or_build_plan, render_kinetic, render_stills
 
     STATE["render_status"] = "running"
@@ -213,7 +238,22 @@ def _run_render(style_name, stills_only, part=None):
         plan = load_or_build_plan(cache_dir / "kinetic_plan.json", alignment, sections, _beats(), style,
                                   meta=note.meta, backgrounds=backgrounds)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        if stills_only:
+
+        def render_range(out, t0, t1, done=0, of=1):
+            def progress(p):
+                STATE["render_progress"] = (done + p) / of
+
+            render_kinetic(STATE["image_path"], STATE["audio_path"], plan, _beats(), style, out,
+                           progress=progress, t_start=t0, t_end=t1, backgrounds=backgrounds)
+
+        if parts:
+            STATE["render_outputs"] = []
+            for k, (t0, t1) in enumerate(parts):
+                out = cache_dir / f"gui_short_{k + 1:02d}_{t0:07.2f}-{t1:07.2f}_{t1 - t0:.0f}s_{stamp}.mp4"
+                render_range(out, t0, t1, done=k, of=len(parts))
+                STATE["render_outputs"].append(str(out))
+                STATE["render_output"] = str(out)
+        elif stills_only:
             out_dir = cache_dir / f"gui_stills_{stamp}"
             STATE["stills"] = [str(p) for p in render_stills(STATE["image_path"], plan, _beats(), style, out_dir,
                                                              backgrounds=backgrounds)]
@@ -225,12 +265,9 @@ def _run_render(style_name, stills_only, part=None):
                 t0 = t1 = None
                 out = cache_dir / f"gui_kinetic_{stamp}.mp4"
 
-            def progress(p):
-                STATE["render_progress"] = p
-
-            render_kinetic(STATE["image_path"], STATE["audio_path"], plan, _beats(), style, out,
-                           progress=progress, t_start=t0, t_end=t1, backgrounds=backgrounds)
+            render_range(out, t0, t1)
             STATE["render_output"] = str(out)
+            STATE["render_outputs"] = [str(out)]
         STATE["render_progress"] = 1.0
         STATE["render_status"] = "done"
     except Exception:
@@ -357,6 +394,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._bytes(buf.getvalue(), "image/jpeg")
             else:
                 self.send_response(404); self.end_headers()
+        elif path == "/shorts":
+            if not self._need("audio_path", "song_path"):
+                return
+            try:
+                self._json({"candidates": _short_candidates(
+                    target=float(query.get("sec", ["30"])[0]),
+                    min_sec=float(query.get("min", [shorts_mod.SHORT_MIN])[0]),
+                    max_sec=float(query.get("max", [shorts_mod.SHORT_MAX])[0]),
+                    limit=int(query.get("count", ["5"])[0]),
+                )})
+            except Exception:
+                self._json({"error": traceback.format_exc().strip().split("\n")[-1]}, 500)
         elif path == "/align/status":
             self._json({"status": STATE["align_status"], "error": STATE["align_error"]})
         elif path == "/render/status":
@@ -364,6 +413,7 @@ class Handler(BaseHTTPRequestHandler):
                 "status": STATE["render_status"], "error": STATE["render_error"],
                 "progress": STATE["render_progress"],
                 "output": Path(STATE["render_output"]).name if STATE["render_output"] else None,
+                "outputs": [Path(p).name for p in STATE["render_outputs"]],
                 "stills": [Path(p).name for p in STATE["stills"]],
             })
         elif path == "/render/download":
@@ -500,7 +550,12 @@ class Handler(BaseHTTPRequestHandler):
                 if t1 - t0 < 0.1:
                     self._json({"error": "区間の終了を開始より後にしてください"}, 400); return
                 part = (t0, t1)
-            args = (params.get("style", DEFAULT_STYLE), bool(params.get("stills")), part)
+            parts = None
+            if params.get("shorts"):
+                parts = [(float(a), float(b)) for a, b in params["shorts"] if float(b) - float(a) >= 0.1]
+                if not parts:
+                    self._json({"error": "書き出す区間がありません"}, 400); return
+            args = (params.get("style", DEFAULT_STYLE), bool(params.get("stills")), part, parts)
             threading.Thread(target=_run_render, args=args, daemon=True).start()
             self._json({"ok": True})
         else:
@@ -561,6 +616,14 @@ kbd { background:#2a2a30; border:1px solid #444; border-radius:3px; padding:0 4p
 fieldset.part { border:1px solid var(--line); border-radius:6px; margin:8px 0; padding:4px 8px 8px; }
 fieldset.part legend { color:var(--dim); font-size:12px; }
 .hidden { display:none !important; }
+.short { border:1px solid var(--line); border-radius:5px; padding:4px 6px; margin:4px 0; }
+.short.top { border-color:var(--accent); }
+.short .head { display:flex; gap:6px; align-items:baseline; }
+.short .rank { color:var(--accent); font-weight:600; }
+.short .t { font-family: ui-monospace, monospace; color:var(--dim); font-size:11px; }
+.short .why { color:var(--dim); font-size:11px; }
+.short .line { font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.short .acts { display:flex; gap:4px; margin-top:3px; }
 </style>
 </head>
 <body>
@@ -606,6 +669,24 @@ fieldset.part legend { color:var(--dim); font-size:12px; }
         <button class="primary" id="partRenderBtn">部分を書き出す</button>
       </div>
       <div class="hint" id="partInfo"></div>
+    </fieldset>
+    <fieldset class="part">
+      <legend>ショート動画（TikTok / YouTube ショート）</legend>
+      <div class="toolbar">
+        <label>長さの目安
+          <select id="shortSec">
+            <option value="15">15秒</option>
+            <option value="20">20秒</option>
+            <option value="30" selected>30秒</option>
+            <option value="45">45秒</option>
+            <option value="60">60秒</option>
+          </select>
+        </label>
+        <button class="small" id="shortFindBtn">候補を探す</button>
+        <button class="small" id="shortRenderAllBtn" title="表示中の候補をすべて順に書き出す">まとめて書き出す</button>
+      </div>
+      <div id="shortList"></div>
+      <div class="hint">サビの頭から始まり、行の途中で切れない区間を自動で選びます（15〜60秒）。縦1080×1920のまま切り出すので、そのまま投稿できます。</div>
     </fieldset>
     <fieldset class="part">
       <legend>背景素材（複数・用途ごと）</legend>
@@ -1308,14 +1389,15 @@ document.addEventListener('keydown', e => {
 $('undoBtn').onclick = undo; $('redoBtn').onclick = redo;
 
 // ---------- render ----------
-async function startRender(stills, part) {
+async function startRender(stills, part, shorts) {
   if (dirty && !(await save())) return;
   const st = $('renderStatus');
   $('downloadLink').classList.add('hidden');
   $('openFolderBtn').classList.add('hidden');
-  const r = await fetch('/render/run', {method: 'POST', body: JSON.stringify({style: $('styleSelect').value, stills, part})});
+  const r = await fetch('/render/run', {method: 'POST', body: JSON.stringify({style: $('styleSelect').value, stills, part, shorts})});
   if (!r.ok) { st.textContent = (await r.json()).error; return; }
-  const what = part ? `部分（${fmt(part[0])}〜${fmt(part[1])}秒）` : '全体';
+  const what = shorts ? (shorts.length > 1 ? `ショート${shorts.length}本` : `ショート（${fmt(shorts[0][0])}〜${fmt(shorts[0][1])}秒）`)
+             : part ? `部分（${fmt(part[0])}〜${fmt(part[1])}秒）` : '全体';
   st.textContent = stills ? '静止画を作成中…' : `${what}を書き出し中… 0%`;
   const poll = setInterval(async () => {
     const s = await (await fetch('/render/status')).json();
@@ -1327,7 +1409,7 @@ async function startRender(stills, part) {
         openWhat = 'stills'; $('openFolderBtn').classList.remove('hidden');
         $('stills').innerHTML = s.stills.map(n => `<a href="/stills?name=${encodeURIComponent(n)}" target="_blank"><img src="/stills?name=${encodeURIComponent(n)}&v=${Date.now()}"></a>`).join('');
       } else {
-        st.textContent = '✅ ' + s.output;
+        st.textContent = '✅ ' + (s.outputs && s.outputs.length > 1 ? s.outputs.join(' / ') : s.output);
         openWhat = 'video';
         $('downloadLink').classList.remove('hidden'); $('openFolderBtn').classList.remove('hidden');
       }
@@ -1399,18 +1481,55 @@ $('partFromSel').onclick = () => {
   setPart(rows[idx[0]].start - 0.5, shownEnd(rows[idx[idx.length - 1]], idx[idx.length - 1]) + 0.5);
 };
 let partStop = null;
-$('partPlay').onclick = () => {
-  const [a, b] = partRange();
+function playRange(a, b) {
   seek(a); audio.play();
   clearInterval(partStop);
   partStop = setInterval(() => { if (audio.currentTime >= b || audio.paused) { audio.pause(); clearInterval(partStop); } }, 50);
-};
+}
+$('partPlay').onclick = () => { const [a, b] = partRange(); playRange(a, b); };
 $('partRenderBtn').onclick = () => {
   const [a, b] = partRange();
   if (b - a < 0.1) return alert('終了を開始より後にしてください');
   startRender(false, [a, b]);
 };
 updatePartInfo();
+
+// ---------- ショート動画 ----------
+let shortCands = [];
+async function findShorts() {
+  const st = $('renderStatus');
+  $('shortList').innerHTML = '<div class="hint">探しています…</div>';
+  const sec = $('shortSec').value;
+  const r = await fetch(`/shorts?sec=${sec}&count=5`);
+  const d = await r.json();
+  if (!r.ok || d.error) { $('shortList').innerHTML = ''; st.textContent = '❌ ' + (d.error || '候補を出せませんでした'); return; }
+  shortCands = d.candidates || [];
+  if (!shortCands.length) { $('shortList').innerHTML = '<div class="hint">候補が見つかりません（先に自動タイミングを作ってください）</div>'; return; }
+  $('shortList').innerHTML = shortCands.map((c, i) => `
+    <div class="short ${i === 0 ? 'top' : ''}" data-i="${i}">
+      <div class="head"><span class="rank">${c.rank}</span><span>${esc(c.label)}</span>
+        <span class="t">${fmt(c.start)}〜${fmt(c.end)}（${c.length.toFixed(1)}秒）</span></div>
+      <div class="line">${esc(c.line || '')}</div>
+      <div class="why">${esc((c.reasons || []).join('、'))}</div>
+      <div class="acts">
+        <button class="small" data-a="play">▶ 試聴</button>
+        <button class="small" data-a="set" title="部分書き出しの開始・終了に入れる">区間にセット</button>
+        <button class="small" data-a="render">書き出す</button>
+      </div>
+    </div>`).join('');
+}
+$('shortList').onclick = e => {
+  const btn = e.target.closest('button[data-a]'); if (!btn) return;
+  const c = shortCands[+btn.closest('.short').dataset.i];
+  if (btn.dataset.a === 'play') playRange(c.start, c.end);
+  else if (btn.dataset.a === 'set') setPart(c.start, c.end);
+  else startRender(false, null, [[c.start, c.end]]);
+};
+$('shortFindBtn').onclick = findShorts;
+$('shortRenderAllBtn').onclick = () => {
+  if (!shortCands.length) return alert('先に「候補を探す」を押してください');
+  startRender(false, null, shortCands.map(c => [c.start, c.end]));
+};
 
 // ---------- refresh ----------
 function refresh(rebuildTable = true) {

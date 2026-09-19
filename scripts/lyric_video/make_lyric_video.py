@@ -24,6 +24,13 @@ ERPJ楽曲ノート + 音声 + 画像 から、ビート連動アニメーショ
     文字の重なり・見切れ・読みにくさを確認してから --out で書き出す。
     カット設計は _work/<hash>/kinetic_plan.json（手で直せる。--replan で作り直し）。
 
+    ショート動画（TikTok / YouTube ショート）は --shorts で候補を確認し、
+    --short で書き出す（出力はいつもの縦1080x1920のまま、区間だけを切る）:
+
+      python3 scripts/lyric_video/make_lyric_video.py ... --shorts
+      python3 scripts/lyric_video/make_lyric_video.py ... --short 1
+      python3 scripts/lyric_video/make_lyric_video.py ... --short all --short-sec 15
+
 align.py/beats.py の結果は音声ファイルのハッシュでキャッシュされる
 （scripts/lyric_video/_work/<hash>/ 配下）ため、スタイルだけ変えて
 再生成する場合はwhisper文字起こし・ビート検出をスキップできる。
@@ -38,9 +45,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from align import WORK_DIR, _audio_hash, align_lyrics
+from align import WORK_DIR, _audio_hash, _get_audio_duration, align_lyrics
 from beats import detect_beats
 from render import render_video
+import shorts
 from song_note import SongNote, sections_for_alignment
 from styles import DEFAULT_STYLE, STYLES, get_style
 
@@ -78,10 +86,44 @@ def parse_args():
              "指定すると _work/<hash>/backgrounds.json を置き換える（省略時はそのファイルを使う）",
     )
     parser.add_argument(
+        "--shorts", action="store_true",
+        help="kinetic: ショート動画（TikTok / YouTube ショート）の切り抜き候補を出して終わる",
+    )
+    parser.add_argument(
+        "--short", metavar="SPEC",
+        help="kinetic: 切り抜き候補を書き出す。SPEC は順位（1）、複数（1,3）、all（上位すべて）",
+    )
+    parser.add_argument(
+        "--short-sec", type=float, default=shorts.DEFAULT_TARGET,
+        help=f"ショートの長さの目安・秒（デフォルト: {shorts.DEFAULT_TARGET:.0f}）",
+    )
+    parser.add_argument(
+        "--short-range", default=f"{shorts.SHORT_MIN:.0f}:{shorts.SHORT_MAX:.0f}",
+        help=f"ショートの下限:上限・秒（デフォルト: {shorts.SHORT_MIN:.0f}:{shorts.SHORT_MAX:.0f}）",
+    )
+    parser.add_argument(
+        "--short-count", type=int, default=3,
+        help="候補を何本まで出すか（デフォルト: 3）",
+    )
+    parser.add_argument(
         "--stills", metavar="DIR",
         help="kinetic: 動画は書き出さず、各カットの静止画一覧をDIRに出す（書き出し前の確認用）",
     )
     return parser.parse_args()
+
+
+def _pick_shorts(spec, candidates):
+    """--short の指定（1 / 1,3 / all）を候補の並びから選ぶ。"""
+    if spec.strip().lower() == "all":
+        return candidates
+    picked = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part.isdigit():
+            continue
+        match = [c for c in candidates if c["rank"] == int(part)]
+        picked.extend(match)
+    return picked
 
 
 def main():
@@ -148,6 +190,31 @@ def main():
         plan = load_or_build_plan(plan_path, alignment, sections, beats, style,
                                   replan=args.replan, meta=note.meta, backgrounds=backgrounds)
         print(f"      カット設計: {plan_path}（一覧は {plan_path.with_suffix('.md').name}）")
+
+        if args.shorts or args.short:
+            lo, _, hi = args.short_range.partition(":")
+            candidates = shorts.find_shorts(
+                alignment, sections, beats, duration=_get_audio_duration(audio_path),
+                target=args.short_sec, min_sec=float(lo), max_sec=float(hi or shorts.SHORT_MAX),
+                limit=max(args.short_count, 1), max_hold=style.get("max_hold_sec", 2.8),
+            )
+            print(f"[4/4] ショート候補（目安 {args.short_sec:.0f}秒 / {lo}〜{hi}秒）:")
+            print(shorts.format_candidates(candidates))
+            if not args.short:
+                return
+            picks = _pick_shorts(args.short, candidates)
+            if not picks:
+                print(f"[ERROR] --short {args.short} に当たる候補がありません")
+                sys.exit(1)
+            for cand in picks:
+                out = (Path(args.out) if args.out and len(picks) == 1
+                       else cache_dir / shorts.output_name(cand))
+                print(f"      [{cand['rank']}] {cand['start']:.2f}〜{cand['end']:.2f}秒 を書き出し中...")
+                render_kinetic(image_path, audio_path, plan, beats, style, out,
+                               t_start=cand["start"], t_end=cand["end"], backgrounds=backgrounds)
+                print(f"[DONE] 出力: {out}")
+            return
+
         if args.stills:
             print(f"[4/4] 静止画一覧を書き出し中: {args.stills}")
             sheets = render_stills(image_path, plan, beats, style, args.stills, backgrounds=backgrounds)
