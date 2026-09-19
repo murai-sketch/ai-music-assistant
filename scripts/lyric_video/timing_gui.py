@@ -1594,6 +1594,9 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}/"
     print(f"[INFO] GUIを起動しました: {url}  （Ctrl+C で終了）", flush=True)
+    if STATE["audio_path"] and not _backgrounds():
+        from kinetic_bg import GENERATE_HINT
+        print(GENERATE_HINT, flush=True)
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:

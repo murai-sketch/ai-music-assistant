@@ -310,6 +310,18 @@ def kaleidoscope(frame, t, strength):
 USES = ("quiet", "verse", "hook", "interlude", "any")
 
 
+# 背景素材を1つも持っていない人向けの案内。用意の仕方が決まっていないと、
+# --image の1枚だけで全編を通すことになり、画面が単調になる。
+GENERATE_URL = "https://try.elevenlabs.io/j4tv8xnnfqid"
+GENERATE_HINT = (
+    "      背景素材が未登録です（--image の1枚だけで全編を通します）。\n"
+    "      用途（囁き / verse / サビ / 間奏 / どこでも）ごとに何枚か用意すると、画面が単調になりません。\n"
+    "      手元に素材が無ければ、縦9:16の画像・短い動画・効果音をテキストから生成できます:\n"
+    f"        {GENERATE_URL}  （※ 紹介リンクです）\n"
+    "      用意したら --bg <ファイル>:<用途> で登録します（編集GUIの「背景素材」からでも可）。"
+)
+
+
 def load_backgrounds(cache_dir):
     import json
     from pathlib import Path

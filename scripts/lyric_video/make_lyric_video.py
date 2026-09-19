@@ -83,7 +83,8 @@ def parse_args():
         "--bg", action="append", metavar="FILE:USE",
         help="kinetic: 背景素材（画像・動画）を用途つきで登録する。複数指定可。"
              "USE = quiet / verse / hook / interlude / any。"
-             "指定すると _work/<hash>/backgrounds.json を置き換える（省略時はそのファイルを使う）",
+             "指定すると _work/<hash>/backgrounds.json を置き換える（省略時はそのファイルを使う）。"
+             "素材が無いときは、生成して用意する方法を書き出しの前に案内する",
     )
     parser.add_argument(
         "--shorts", action="store_true",
@@ -173,7 +174,7 @@ def main():
         )
     else:
         from kinetic import load_or_build_plan, render_kinetic, render_stills
-        from kinetic_bg import load_backgrounds, save_backgrounds
+        from kinetic_bg import GENERATE_HINT, load_backgrounds, save_backgrounds
 
         cache_dir = WORK_DIR / _audio_hash(audio_path)
         plan_path = cache_dir / "kinetic_plan.json"
@@ -186,6 +187,8 @@ def main():
         backgrounds = load_backgrounds(cache_dir)
         if backgrounds:
             print(f"      背景素材: {len(backgrounds)}件（{cache_dir / 'backgrounds.json'}）")
+        else:
+            print(GENERATE_HINT)
         sections = sections_for_alignment(alignment, note.lyric_sections)
         plan = load_or_build_plan(plan_path, alignment, sections, beats, style,
                                   replan=args.replan, meta=note.meta, backgrounds=backgrounds)
