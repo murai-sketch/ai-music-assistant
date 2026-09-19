@@ -3,7 +3,7 @@
 """
 kinetic_bg.py
 背景の見せ方（kinetic.py から使う）。単色の背景を平板にしないための部品と、
-背景の切り替え方。参考：CL側 clients/ERPJ/参考/キネティック参考分析_20260917b.md
+背景の切り替え方。既存のモーショングラフィックス作品の分析から取り入れた。
 
 bgfx（ショットごとの背景処理）:
     pattern:<種類>  2色の動く模様。種類 = stripes / dots / rings / checker / waves /

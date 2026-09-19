@@ -70,6 +70,10 @@ SONGS_DIR = VAULT_ROOT / "01_Songs"
 UPLOAD_DIR = WORK_DIR / "uploads"
 MAX_BACKUPS = 30
 
+# ブラウザで開いた別のサイトから、この編集用サーバーを勝手に操作されないようにする
+# （DNSリバインディング・CSRF対策）。待ち受けは 127.0.0.1 のみ。
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
 MIME_TYPES = {
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".flac": "audio/flac",
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
@@ -330,6 +334,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
 
+    def _from_this_machine(self):
+        """Host と（POST なら）Origin が自分自身かを確かめる。
+        別サイトのページから fetch されても、ここで弾く。"""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+        if host not in ALLOWED_HOSTS:
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed = urlparse(origin)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if parsed.hostname not in ALLOWED_HOSTS or port != self.server.server_address[1]:
+                return False
+        return True
+
     def _need(self, *keys):
         missing = [k for k in keys if not STATE[k]]
         if missing:
@@ -338,6 +356,8 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        if not self._from_this_machine():
+            self.send_response(403); self.end_headers(); return
         parsed = urlparse(self.path)
         path, query = parsed.path, parse_qs(parsed.query)
 
@@ -432,6 +452,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
+        if not self._from_this_machine():
+            self.send_response(403); self.end_headers(); return
         parsed = urlparse(self.path)
         path, query = parsed.path, parse_qs(parsed.query)
         length = int(self.headers.get("Content-Length", 0))

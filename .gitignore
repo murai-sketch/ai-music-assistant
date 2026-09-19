@@ -29,9 +29,8 @@ Backup/
 Bounced Files/
 *.asd
 
-# --- Obsidian個人設定 ---
-.obsidian/workspace.json
-.obsidian/workspace-mobile.json
+# --- Obsidian個人設定（プラグイン設定ごと追跡しない）---
+.obsidian/
 
 # --- Python ---
 __pycache__/

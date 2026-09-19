@@ -2,18 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 make_lyric_video.py
-ERPJ楽曲ノート + 音声 + 画像 から、ビート連動アニメーション歌詞字幕付きの
+楽曲ノート + 音声 + 画像 から、ビート連動アニメーション歌詞字幕付きの
 ショート動画(mp4)を生成するCLI。
 
 --------------------------------------------------------------------------
 使い方:
 
     python3 scripts/lyric_video/make_lyric_video.py \\
-      --song "01_Songs/空気で有罪.md" \\
+      --song "01_Songs/<曲名>.md" \\
       --audio /path/to/song.mp3 \\
       --image /path/to/cover.jpg \\
       --style kawaii-deathcore-wametal \\
-      --out scripts/lyric_video/_work/空気で有罪/output.mp4
+      --out scripts/lyric_video/_work/<曲名>/output.mp4
 
     --style は kawaii / deathcore / kawaii-deathcore-wametal から選択
     （省略時は kawaii-deathcore-wametal）。
