@@ -1358,7 +1358,8 @@ async function requestPreview(force) {
 $('styleSelect').onchange = () => { refresh(); requestPreview(); };
 
 // ---------- transport ----------
-function seek(t) { audio.currentTime = clamp(t, 0, duration || t); const L = viewLen(); if (t < viewStart || t > viewStart + L) viewStart = clamp(t - L * 0.2, 0, Math.max(duration - L, 0)); requestPreview(); drawTimeline(); }
+function seek(t) {
+  if (!partStop) audio.volume = 1; audio.currentTime = clamp(t, 0, duration || t); const L = viewLen(); if (t < viewStart || t > viewStart + L) viewStart = clamp(t - L * 0.2, 0, Math.max(duration - L, 0)); requestPreview(); drawTimeline(); }
 $('playBtn').onclick = () => audio.paused ? audio.play() : audio.pause();
 audio.onplay = () => $('playBtn').textContent = '⏸ 停止';
 audio.onpause = () => { $('playBtn').textContent = '▶ 再生'; requestPreview(); };
@@ -1513,12 +1514,21 @@ $('partFromSel').onclick = () => {
   setPart(rows[idx[0]].start - 0.5, shownEnd(rows[idx[idx.length - 1]], idx[idx.length - 1]) + 0.5);
 };
 let partStop = null;
-function playRange(a, b) {
-  seek(a); audio.play();
+// 試聴も書き出しと同じ出入りにする（頭0.25秒で上げ、終わりは最大0.8秒で絞る）
+function playRange(a, b, fade = true) {
+  const fin = fade ? 0.25 : 0, fout = fade ? Math.min(0.8, (b - a) * 0.25) : 0;
+  seek(a); audio.volume = fin ? 0 : 1; audio.play();
   clearInterval(partStop);
-  partStop = setInterval(() => { if (audio.currentTime >= b || audio.paused) { audio.pause(); clearInterval(partStop); } }, 50);
+  partStop = setInterval(() => {
+    const t = audio.currentTime;
+    if (t >= b || audio.paused) { audio.pause(); audio.volume = 1; clearInterval(partStop); return; }
+    let v = 1;
+    if (fin && t < a + fin) v = Math.min(v, (t - a) / fin);
+    if (fout && t > b - fout) v = Math.min(v, (b - t) / fout);
+    audio.volume = Math.max(0, Math.min(1, v));
+  }, 30);
 }
-$('partPlay').onclick = () => { const [a, b] = partRange(); playRange(a, b); };
+$('partPlay').onclick = () => { const [a, b] = partRange(); playRange(a, b); };  // 出入りつき
 $('partRenderBtn').onclick = () => {
   const [a, b] = partRange();
   if (b - a < 0.1) return alert('終了を開始より後にしてください');

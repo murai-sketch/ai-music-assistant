@@ -1590,21 +1590,22 @@ def render_kinetic(image_path, audio_path, plan, beats, style, output_path, prog
     from moviepy import AudioFileClip, VideoClip
 
     audio = AudioFileClip(str(audio_path))
-    renderer = KineticRenderer(image_path, plan, beats, style, duration=audio.duration, backgrounds=backgrounds)
+    # subclipped の後は audio.duration が切り出した長さになるので、曲全体の長さは先に控える
+    song_duration = audio.duration
+    renderer = KineticRenderer(image_path, plan, beats, style, duration=song_duration, backgrounds=backgrounds)
     t0 = max(float(t_start or 0.0), 0.0)
-    t1 = min(float(t_end), audio.duration) if t_end is not None else audio.duration
+    t1 = min(float(t_end), song_duration) if t_end is not None else song_duration
     if t1 - t0 < 0.1:
         raise ValueError(f"書き出す区間が短すぎます: {t0:.2f}〜{t1:.2f}秒")
-    if t0 > 0 or t1 < audio.duration:
+    if t0 > 0 or t1 < song_duration:
         audio = audio.subclipped(t0, t1)
     total = t1 - t0
 
     # 途中で切り出したものは、頭と尻が唐突に始まって唐突に終わる。
     # 短い出入りを付けて、曲の途中から切ったことが分かるようにする。
-    partial = t0 > 0 or t1 < audio.duration
     fade_in = 0.25 if t0 > 0 else 0.0
-    fade_out = min(0.8, total * 0.25) if t1 < audio.duration else 0.0
-    if partial and (fade_in or fade_out):
+    fade_out = min(0.8, total * 0.25) if t1 < song_duration - 0.05 else 0.0
+    if fade_in or fade_out:
         from moviepy.audio.fx import AudioFadeIn, AudioFadeOut
         fx = []
         if fade_in:
