@@ -111,6 +111,12 @@ INTERLUDE_EFFECTS = ["rgb_split", "glitch", "duotone", "scan", "kaleido"]
 INTERLUDE_FADE = 0.35  # 間奏の出入りでエフェクトを強める/弱める秒数
 INTERLUDE_MIN = 2.5    # これより短い歌詞の切れ目は間奏として扱わない
 
+# 文字を収める横幅。画面の端はプラットフォームのUI（TikTok の右の操作ボタン、
+# 下のユーザー名やキャプション、YouTube ショートの操作列）に隠れる可能性があるので、
+# 1080px の画面に対して左右に余白を残す。
+TEXT_WIDTH = 860          # center / diagonal（左右それぞれ約110px の余白）
+TEXT_WIDTH_NARROW = 790   # 左右に寄せたレイアウト（寄せた側がより端に近づくため）
+
 VERTICAL_MAP = {"ー": "｜", "「": "﹁", "」": "﹂", "『": "﹃", "』": "﹄", "（": "︵", "）": "︶", "…": "︙"}
 
 
@@ -207,6 +213,11 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
     曲の性格に合わせて参考作品由来の技法（kinetic_fx）を割り当てる。"""
     max_hold = style.get("max_hold_sec", 2.8)
     profile = kinetic_fx.song_profile(alignment, sections, beats, meta)
+    if profile.get("kids"):
+        # 子ども向けの曲は1行を4〜5秒かけてゆっくり歌う。既定の頭打ち（約3秒）だと
+        # 歌い終わる前に文字が消えて「歌詞が抜けている」ように見えるので、長く残す。
+        # 次の行が始まればどのみちそこで消える。
+        max_hold = max(max_hold, 5.5)
     counts = {}
     for item in alignment:
         counts[item["line"]] = counts.get(item["line"], 0) + 1
@@ -531,7 +542,7 @@ class _Cut:
             n = weight(row)
             if vertical:
                 return max(min(int(1500 / n), 320 if cut["tier"] == 1 else 220), 60)
-            budget = 980 if cut["layout"] in ("center", "diagonal") else 900
+            budget = TEXT_WIDTH if cut["layout"] in ("center", "diagonal") else TEXT_WIDTH_NARROW
             if cut["tier"] == 1:
                 cap = 480 if n <= 2 else 400 if n <= 4 else 300
             else:
@@ -547,6 +558,23 @@ class _Cut:
             sizes = [min(row_size(r) for r in rows)] * len(rows)
         else:
             sizes = [row_size(r) for r in rows]
+            # 実際に描いたときの横幅で詰める。文字数からの見積もりだけだと、
+            # 書体ごとの字送りや強調の縮小でずれて、端のUIに重なることがある。
+            safe_w = TEXT_WIDTH if cut["layout"] in ("center", "diagonal") else TEXT_WIDTH_NARROW
+
+            def row_width(row, s):
+                return sum(
+                    sprites.fonts.get(
+                        font_path,
+                        int(s * 0.66) if emphasis and not kinetic_fx._is_kanji(ch) else s,
+                    ).getlength(ch)
+                    for ch in row
+                )
+
+            # 縁取り（白フチ）は字送りの外側に出るので、その分を見込む
+            for ri, row in enumerate(rows):
+                while sizes[ri] > 60 and row_width(row, sizes[ri]) * 1.09 > safe_w:
+                    sizes[ri] = max(int(sizes[ri] * 0.94), 60)
         size = max(sizes)
         self.size = size
 
@@ -1175,12 +1203,21 @@ class _VideoSource:
         return cover
 
 
+def _thin_beats(beats, min_gap):
+    """min_gap 秒より近い拍を間引く。背景の弾みを落ち着かせるために使う。"""
+    out = []
+    for b in beats or []:
+        if not out or b - out[-1] >= min_gap:
+            out.append(b)
+    return out
+
+
 class _Background:
     """背景画像は画面を覆う大きさ（縦長画面に横長画像なら横に余りが出る）で
     保持し、カメラの窓（寄り・パン位置・傾き）で切り出す。
     複数の背景（画像・動画）を持ち、カットごとに bg_image で選ぶ。"""
 
-    def __init__(self, image_path, beats, style, brightness=0.55):
+    def __init__(self, image_path, beats, style, brightness=0.55, calm=False):
         self.main = str(image_path)
         self._sources = {}
         self.brightness = brightness
@@ -1188,6 +1225,13 @@ class _Background:
         self.beats = beats or []
         self.pulse_scale = style.get("pulse_scale", 1.08)
         self.pulse_decay = style.get("pulse_decay_sec", 0.14)
+        if calm:
+            # 背景が拍のたびに弾むと、文字を追う目が休まらない。子ども向けの曲は
+            # 拍が細かい（1秒に2つ前後）ので、弾みを弱めたうえで間引き、
+            # 「ときどき息をする」程度にする。
+            self.pulse_scale = 1.0 + (self.pulse_scale - 1.0) * 0.28
+            self.pulse_decay *= 0.7
+            self.beats = _thin_beats(self.beats, 0.75)
         self._solid = {}
         self.wa = False
         self.palette = DEFAULT_PALETTE
@@ -1395,7 +1439,8 @@ class KineticRenderer:
             lo, hi = self.shot_span[shots[-1]]
             self.shot_span[shots[-1]] = (lo, hi + 4.0)
         kids = any(c.get("profile_kids") for c in plan)
-        self.bg = _Background(image_path, beats, style, brightness=0.92 if kids else 0.55)
+        self.bg = _Background(image_path, beats, style,
+                              brightness=0.92 if kids else 0.55, calm=kids)
         self.bg.wa = any(c.get("profile_wa") for c in plan)
         self.kids = any(c.get("profile_kids") for c in plan)
         self.palette = palette_for(plan)
@@ -1554,10 +1599,29 @@ def render_kinetic(image_path, audio_path, plan, beats, style, output_path, prog
         audio = audio.subclipped(t0, t1)
     total = t1 - t0
 
+    # 途中で切り出したものは、頭と尻が唐突に始まって唐突に終わる。
+    # 短い出入りを付けて、曲の途中から切ったことが分かるようにする。
+    partial = t0 > 0 or t1 < audio.duration
+    fade_in = 0.25 if t0 > 0 else 0.0
+    fade_out = min(0.8, total * 0.25) if t1 < audio.duration else 0.0
+    if partial and (fade_in or fade_out):
+        from moviepy.audio.fx import AudioFadeIn, AudioFadeOut
+        fx = []
+        if fade_in:
+            fx.append(AudioFadeIn(fade_in))
+        if fade_out:
+            fx.append(AudioFadeOut(fade_out))
+        audio = audio.with_effects(fx)
+
     def frame(t):
         if progress:
             progress(min(t / total, 0.99))
-        return np.asarray(renderer.frame_at(t0 + t))
+        im = np.asarray(renderer.frame_at(t0 + t))
+        # 画は音より短く暗転させる（切れ際だけ。頭は暗転させない）
+        if fade_out and t > total - fade_out * 0.6:
+            k = max(0.0, (total - t) / (fade_out * 0.6))
+            im = (im * k).astype(np.uint8)
+        return im
 
     clip = VideoClip(frame_function=frame, duration=total).with_audio(audio)
     output_path = Path(output_path)
@@ -1599,7 +1663,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
     return sheets
 
 
-PLAN_VERSION = 8
+PLAN_VERSION = 9
 
 
 def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None):

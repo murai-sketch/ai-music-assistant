@@ -204,7 +204,7 @@ def _preview_jpeg(alignment, t, style_name):
     return buf.getvalue()
 
 
-def _short_candidates(target=30.0, min_sec=None, max_sec=None, limit=5):
+def _short_candidates(target=30.0, min_sec=None, max_sec=None, limit=5, mode="hook"):
     """ショート動画の切り抜き候補。GUI表示用に先頭行の文言も添える。"""
     note = _note()
     cache = _load_json(_cache_dir() / "alignment.json", {})
@@ -218,7 +218,7 @@ def _short_candidates(target=30.0, min_sec=None, max_sec=None, limit=5):
         target=float(target),
         min_sec=float(min_sec if min_sec is not None else shorts_mod.SHORT_MIN),
         max_sec=float(max_sec if max_sec is not None else shorts_mod.SHORT_MAX),
-        limit=int(limit), max_hold=style.get("max_hold_sec", 2.8),
+        limit=int(limit), max_hold=style.get("max_hold_sec", 2.8), mode=mode,
     )
     for c in cands:
         c["line"] = alignment[c["start_row"]]["line"]
@@ -423,6 +423,7 @@ class Handler(BaseHTTPRequestHandler):
                     min_sec=float(query.get("min", [shorts_mod.SHORT_MIN])[0]),
                     max_sec=float(query.get("max", [shorts_mod.SHORT_MAX])[0]),
                     limit=int(query.get("count", ["5"])[0]),
+                    mode=query.get("mode", ["hook"])[0],
                 )})
             except Exception:
                 self._json({"error": traceback.format_exc().strip().split("\n")[-1]}, 500)
@@ -704,11 +705,18 @@ fieldset.part legend { color:var(--dim); font-size:12px; }
             <option value="60">60秒</option>
           </select>
         </label>
+        <label>切り口
+          <select id="shortMode">
+            <option value="hook" selected>サビ頭から</option>
+            <option value="scene">情景・心情</option>
+            <option value="mix">両方</option>
+          </select>
+        </label>
         <button class="small" id="shortFindBtn">候補を探す</button>
         <button class="small" id="shortRenderAllBtn" title="表示中の候補をすべて順に書き出す">まとめて書き出す</button>
       </div>
       <div id="shortList"></div>
-      <div class="hint">サビの頭から始まり、行の途中で切れない区間を自動で選びます（15〜60秒）。縦1080×1920のまま切り出すので、そのまま投稿できます。</div>
+      <div class="hint">行の途中で切れない区間を自動で選びます（15〜60秒）。「サビ頭から」は掴み重視、「情景・心情」はサビの繰り返しを避けてその曲だけの場面を拾います。縦1080×1920のまま切り出し、終わりは自動でフェードします。</div>
     </fieldset>
     <fieldset class="part">
       <legend>背景素材（複数・用途ごと）</legend>
@@ -1524,7 +1532,7 @@ async function findShorts() {
   const st = $('renderStatus');
   $('shortList').innerHTML = '<div class="hint">探しています…</div>';
   const sec = $('shortSec').value;
-  const r = await fetch(`/shorts?sec=${sec}&count=5`);
+  const r = await fetch(`/shorts?sec=${sec}&count=5&mode=${$('shortMode').value}`);
   const d = await r.json();
   if (!r.ok || d.error) { $('shortList').innerHTML = ''; st.textContent = '❌ ' + (d.error || '候補を出せませんでした'); return; }
   shortCands = d.candidates || [];

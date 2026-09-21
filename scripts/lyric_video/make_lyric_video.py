@@ -30,6 +30,7 @@ make_lyric_video.py
       python3 scripts/lyric_video/make_lyric_video.py ... --shorts
       python3 scripts/lyric_video/make_lyric_video.py ... --short 1
       python3 scripts/lyric_video/make_lyric_video.py ... --short all --short-sec 15
+      python3 scripts/lyric_video/make_lyric_video.py ... --shorts --short-mode scene
 
 align.py/beats.py の結果は音声ファイルのハッシュでキャッシュされる
 （scripts/lyric_video/_work/<hash>/ 配下）ため、スタイルだけ変えて
@@ -101,6 +102,10 @@ def parse_args():
     parser.add_argument(
         "--short-range", default=f"{shorts.SHORT_MIN:.0f}:{shorts.SHORT_MAX:.0f}",
         help=f"ショートの下限:上限・秒（デフォルト: {shorts.SHORT_MIN:.0f}:{shorts.SHORT_MAX:.0f}）",
+    )
+    parser.add_argument(
+        "--short-mode", default="hook", choices=list(shorts.MODES),
+        help="ショートの切り口。hook=サビ頭から（既定）／scene=情景・心情の場面（サビの繰り返しを避ける）／mix=両方",
     )
     parser.add_argument(
         "--short-count", type=int, default=3,
@@ -200,8 +205,10 @@ def main():
                 alignment, sections, beats, duration=_get_audio_duration(audio_path),
                 target=args.short_sec, min_sec=float(lo), max_sec=float(hi or shorts.SHORT_MAX),
                 limit=max(args.short_count, 1), max_hold=style.get("max_hold_sec", 2.8),
+                mode=args.short_mode,
             )
-            print(f"[4/4] ショート候補（目安 {args.short_sec:.0f}秒 / {lo}〜{hi}秒）:")
+            mode_ja = {"hook": "サビ頭から", "scene": "情景・心情の場面", "mix": "サビと情景の両方"}
+            print(f"[4/4] ショート候補（{mode_ja[args.short_mode]} / 目安 {args.short_sec:.0f}秒 / {lo}〜{hi}秒）:")
             print(shorts.format_candidates(candidates))
             if not args.short:
                 return
