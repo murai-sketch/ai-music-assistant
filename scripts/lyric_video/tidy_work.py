@@ -22,6 +22,14 @@ _work/ の掃除。作業ファイルは一定期間で消し、完成版は保�
     完成版を移したあとは、同じ場所に <名前>.moved.txt を置き、どこへ移したかを書く。
     「消えた」と「移した」を後から区別できるようにするため。
 
+対象（--profile）:
+
+    lyric （既定）  歌詞動画の _work/。上の考え方のとおり
+    shorts          ShortsVault の pipeline/output/。1話ごとのフォルダの中で、
+                    投稿した mp4（final_with_cta_bump.mp4。無ければ final_with_title.mp4）
+                    だけを完成版とし、題字入り前の版・確認用の静止画・ログを作業ファイルとする。
+                    看板（title.txt）・キャプション・サムネイルは残す
+
 使い方:
 
     # 何が起きるかだけ見る（既定。何も変更しない）
@@ -50,6 +58,7 @@ import time
 from pathlib import Path
 
 WORK_DIR = Path(__file__).resolve().parent / "_work"
+SHORTS_DIR = Path("/Users/armada/YAMADA/ShortsVault/pipeline/output")
 HASH_DIR_RE = re.compile(r"^[0-9a-f]{8}$")          # 音源ハッシュのフォルダ
 MEDIA_EXT = {".mp4", ".mov", ".m4v", ".png", ".jpg", ".jpeg", ".webp"}
 # 作り直すために要るもの。日付に関わらず残す
@@ -141,6 +150,30 @@ def move_to_remote(path, remote_path):
     return True
 
 
+SHORTS_FINAL = ("final_with_cta_bump.mp4", "final_with_title.mp4")
+SHORTS_KEEP_EXT = {".txt", ".json", ".md"}
+SHORTS_KEEP_NAMES = {"thumbnail.jpg"}
+
+
+def scan_shorts(out_dir, work_days, final_days):
+    """ShortsVault: 1話ごとのフォルダを見て、投稿した動画だけを完成版とする。"""
+    to_delete, to_move = [], []
+    for ep in sorted(p for p in out_dir.iterdir() if p.is_dir()):
+        files = [p for p in ep.iterdir() if p.is_file()]
+        final = next((ep / n for n in SHORTS_FINAL if (ep / n).exists()), None)
+        for path in files:
+            if path.suffix.lower() in SHORTS_KEEP_EXT or path.name in SHORTS_KEEP_NAMES:
+                continue
+            age = _age_days(path)
+            if final is not None and path == final:
+                if age >= final_days:
+                    to_move.append(path)
+            elif path.suffix.lower() in MEDIA_EXT or path.suffix.lower() == ".log":
+                if age >= work_days:
+                    to_delete.append(path)
+    return to_delete, to_move
+
+
 def main():
     ap = argparse.ArgumentParser(description="_work/ の作業ファイルを消し、完成版を保存先へ移す")
     ap.add_argument("--work-days", type=int, default=7, help="作業ファイルを消すまでの日数（既定 7）")
@@ -149,16 +182,21 @@ def main():
                     help="完成版の移動先。ローカルのパス、または rclone の remote:path"
                          "（環境変数 TIDY_DEST でも指定できる）")
     ap.add_argument("--apply", action="store_true", help="実際に削除・移動する（省略時は表示のみ）")
-    ap.add_argument("--work-dir", default=str(WORK_DIR), help="対象の _work（既定はこのスクリプトの隣）")
+    ap.add_argument("--profile", default="lyric", choices=("lyric", "shorts"),
+                    help="どの並びのフォルダを見るか（既定 lyric）")
+    ap.add_argument("--work-dir", help="対象フォルダ（既定は profile ごとの標準の場所）")
+    ap.add_argument("--log", help="結果を追記するログファイル")
     args = ap.parse_args()
 
-    work_dir = Path(args.work_dir)
+    work_dir = Path(args.work_dir) if args.work_dir else (
+        WORK_DIR if args.profile == "lyric" else SHORTS_DIR)
     remote = args.dest is not None and is_remote(args.dest)
     if not work_dir.exists():
         print(f"[ERROR] ありません: {work_dir}")
         raise SystemExit(1)
 
-    to_delete, to_move = scan(work_dir, args.work_days, args.final_days)
+    scanner = scan if args.profile == "lyric" else scan_shorts
+    to_delete, to_move = scanner(work_dir, args.work_days, args.final_days)
     dest = (args.dest if remote else Path(args.dest).expanduser()) if args.dest else None
 
     print(f"対象: {work_dir}")
@@ -201,6 +239,14 @@ def main():
             p.with_suffix(p.suffix + ".moved.txt").write_text(
                 f"{time.strftime('%Y-%m-%d %H:%M')} に移動しました\n{target}\n", encoding="utf-8")
             moved += 1
+    line = (f"{time.strftime('%Y-%m-%d %H:%M')} [{args.profile}] "
+            f"削除 {len(to_delete)}件 {_human(freed)} ／ 移動 {moved}件"
+            + (f" → {dest}" if dest else ""))
+    if args.log:
+        log = Path(args.log).expanduser()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
     print(f"\n[DONE] 削除 {len(to_delete)}件 {_human(freed)} ／ 移動 {moved}件")
     if to_move and not dest:
         print("       --dest を指定していないので、完成版は移していません。")

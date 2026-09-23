@@ -103,7 +103,7 @@ def enabled_techniques(profile):
     if profile["kanji_ratio"] >= 0.25:
         on |= {"kanji", "emphasis"}
     if profile["bpm"] >= 128:
-        on |= {"tape", "split", "fly"}
+        on |= {"tape", "split", "fly", "shatter"}
     if profile["wa"]:
         on |= {"radial", "stamp", "misregister", "rings"}
     elif profile["pop"]:
@@ -116,7 +116,8 @@ def enabled_techniques(profile):
         on |= {"wall", "radial"}
     if profile.get("kids"):
         # 幼児と親向け: 攻撃的な部品を外し、弾む・きらめく部品にする
-        on -= {"tape", "split", "stamp", "misregister", "grain", "kanji", "neon", "wall", "tunnel", "radial"}
+        on -= {"tape", "split", "shatter", "stamp", "misregister", "grain", "kanji",
+               "neon", "wall", "tunnel", "radial"}
         on |= {"rings", "scatter", "heartbeat", "sparkle", "bounce"}
     return on
 
@@ -157,6 +158,10 @@ def assign_techniques(plan, profile):
                 c["texture"] = "misregister"
             if "split" in on and any(w in text for w in BREAK_WORDS):
                 c["exit"] = "split"
+            elif ("shatter" in on and nxt is not None and nxt["section"] != c["section"]
+                    and hook_k % 2 == 1):
+                # サビの締め。文字が砕けて飛び、次の区分へ渡す
+                c["exit"] = "shatter"
             elif "fly" in on and nxt is not None and nxt["section"] != c["section"]:
                 c["exit"] = "fly"
         elif c["level"] == 1:

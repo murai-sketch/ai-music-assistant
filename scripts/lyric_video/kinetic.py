@@ -92,7 +92,7 @@ MEANING_RULES = [
 VERSE_MOTIONS = ["slide_l", "stagger", "mask", "slide_r", "rotate", "stagger", "spread", "mask"]
 QUIET_MOTIONS = ["mask", "float"]
 HOOK_MOTIONS = ["slam", "grow", "slam", "converge"]
-LAYOUTS = ["center", "left", "right", "vertical", "diagonal"]
+LAYOUTS = ["center", "left", "right", "vertical", "diagonal", "arc"]
 CAMERA_MOVES = ["pan_l", "push_in", "tilt_up", "pan_r", "pull_out", "dutch", "tilt_down"]
 
 # 入り（フレーム数）。記事の目安: 叩きつけ4〜8f / スライド5〜10f / マスク6〜12f
@@ -145,7 +145,7 @@ def _pick_meaning(text):
     return None
 
 
-NO_HEAD = set("ーっゃゅょぁぃぅぇぉッャュョァィゥェォ☆★！？!?、。」』）…〜♪")
+NO_HEAD = set("んーっゃゅょぁぃぅぇぉンッャュョァィゥェォ☆★！？!?、。」』）…〜♪")
 PARTICLE_ENDS = ("じゃ", "は", "が", "を", "に", "で", "も", "の", "と", "へ", "て", "ね", "よ", "から", "まで")
 
 
@@ -170,8 +170,20 @@ def _chunk(token, limit=8):
         if right[0] in NO_HEAD:
             continue
         score = -abs(len(left) - len(right)) * 0.8
-        if any(left.endswith(pw) for pw in PARTICLE_ENDS):
-            score += 3
+        if min(len(left), len(right)) <= 2:
+            # 「おふろあが／りで」のような、片方だけ極端に短い割り方を避ける
+            score -= 3
+        if left[-1] in "ゃゅょャュョ":
+            # 拗音の途中で言葉が終わったように見える
+            score -= 2.5
+        # 助詞で終わるなら切れ目らしい。ただし1文字の助詞は語の途中にも頻出するので弱く
+        # （「のらね｜こさわって」のような割り方を防ぐ）
+        hit = next((pw for pw in PARTICLE_ENDS if left.endswith(pw)), None)
+        if hit:
+            score += 2.5 if len(hit) >= 2 else 1.0
+        if right[0] in "のにをがはでともへ":
+            # 段の頭が助詞だと、前の段から千切れて見える（「はじめて／のねつで」）
+            score -= 2.0
         k = len(left) - 1
         while k > 0 and left[k] == "ー":
             k -= 1
@@ -192,11 +204,11 @@ def _chunk(token, limit=8):
 def _split_rows(text, short=False):
     """全角/半角スペースで区切られた行は、区切りごとに段を分ける。
     区切りがなく12文字を超える行は、言葉の切れ目らしい位置で折る。
-    short=True（子ども向け）は、8文字を超える段も折って文字を大きくする。"""
+    short=True（子ども向け）は、7文字を超える段も折る。1段が短いほど文字が大きくなる。"""
     if short:
         rows = []
         for r in _split_rows(text):
-            rows.extend(_chunk(r, 8))
+            rows.extend(_chunk(r, 7))
         return rows
     tokens = [t for t in text.replace("　", " ").split(" ") if t]
     if len(tokens) >= 2 and _clean_len(text) > 6:
@@ -374,6 +386,32 @@ def _hex(c):
     return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
 
 
+def _luma(color):
+    r, g, b = _hex(color)[:3]
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255
+
+
+def _darken(color, k):
+    r, g, b = _hex(color)[:3]
+    return "#%02X%02X%02X" % (int(r * k), int(g * k), int(b * k))
+
+
+def _readable(color, bg, fallback, gap=0.45):
+    """背景と明度が近すぎる文字色を、読める色にする。
+    パステルの背景にパステルの差し色を置くと、輪郭は見えても文字が沈む。
+    まず色味を保ったまま暗くし、それでも足りなければ本文色に逃がす。"""
+    if bg is None:
+        return color
+    bg_l = _luma(bg)
+    if abs(_luma(color) - bg_l) >= gap:
+        return color
+    for k in (0.8, 0.65, 0.5, 0.4):
+        darker = _darken(color, k)
+        if abs(_luma(darker) - bg_l) >= gap:
+            return darker
+    return fallback if abs(_luma(fallback) - bg_l) >= gap else color
+
+
 def _ease_out(p):
     p = min(max(p, 0.0), 1.0)
     return 1 - (1 - p) ** 3
@@ -529,6 +567,9 @@ class _Cut:
         font_path = FONT_QUIET if level == 1 else FONT_HEAVY
         if cut.get("profile_kids"):
             font_path = FONT_KIDS
+        if cut.get("profile_kids"):
+            accent = _readable(accent, palette_bg, text_color)
+            colors = (text_color, stroke_color, accent)
         emphasis = bool(cut.get("emphasis"))
         neon = cut.get("entrance") == "neon"
         self.overlay = None
@@ -543,18 +584,23 @@ class _Cut:
             if vertical:
                 return max(min(int(1500 / n), 320 if cut["tier"] == 1 else 220), 60)
             budget = TEXT_WIDTH if cut["layout"] in ("center", "diagonal") else TEXT_WIDTH_NARROW
+            kids = bool(cut.get("profile_kids"))
             if cut["tier"] == 1:
                 cap = 480 if n <= 2 else 400 if n <= 4 else 300
             else:
-                cap = 210
+                cap = 300 if kids else 210
             if len(rows) >= 2:
                 if level == 1:
-                    cap = min(cap, 210)
+                    cap = min(cap, 300 if kids else 210)
+                elif kids:
+                    # 子ども向けは行数が増えても大きく。幅は実寸で詰めるので溢れない
+                    cap = 400 if n <= 2 else 360 if n <= 4 else 320
                 else:
                     cap = 400 if n == 1 else 340 if n <= 2 else 300 if n <= 3 else 260
             return max(min(int(budget / n), cap), 60)
 
-        if vertical:
+        if vertical or cut.get("profile_kids"):
+            # 段ごとに大きさが変わると、2文字の段だけ巨大になって落ち着かない
             sizes = [min(row_size(r) for r in rows)] * len(rows)
         else:
             sizes = [row_size(r) for r in rows]
@@ -623,6 +669,8 @@ class _Cut:
                         return int(rsize * 0.66)
                     return rsize
                 row_w = sum(sprites.fonts.get(font_path, csize(ch)).getlength(ch) for ch in row)
+                # 弧に沿わせるときの半径。段が長いほど緩い弧にして、端が落ちすぎないようにする
+                arc_r = max(row_w * 1.5, 700.0) if cut["layout"] == "arc" else 0.0
                 if cut["layout"] == "left":
                     x = -row_w / 2 - 60 + ri * 40
                 elif cut["layout"] == "right":
@@ -657,6 +705,13 @@ class _Cut:
                     cy = y0 + t + h / 2 + drop
                     x += adv
                     angle = 0
+                    if arc_r:
+                        # 行の中心からの距離を角度に読み替え、円周上へ。文字も接線の向きに傾ける
+                        # （cx は行の中心が 0。ここに row_w/2 を足すと行ごと片側へ寄る）
+                        theta = cx / arc_r
+                        cx = arc_r * math.sin(theta)
+                        cy = cy - arc_r * (1 - math.cos(theta)) * (1 if ri % 2 == 0 else -1)
+                        angle = -math.degrees(theta) * (1 if ri % 2 == 0 else -1)
                 mis = []
                 for mc in mis_colors:
                     mg = sprites.glyph(draw_ch, font_path, gsize, mc, mc, gsw)
@@ -949,6 +1004,9 @@ class _Cut:
             alpha *= 1 - q * q
         elif cut.get("exit") == "split" and remain < 8:
             pass
+        elif cut.get("exit") == "shatter" and remain < 10:
+            q = 1 - max(remain, 0) / 10
+            alpha *= 1 - q * q
         elif cut["motion"] == "erase" and remain < 8:
             crop_right = 1 - max(remain, 0) / 8
         elif remain < EXIT_FRAMES:
@@ -965,7 +1023,8 @@ class _Cut:
             return
         # 背景の巨大文字: ゆっくり流れ、背景カメラと逆向きに大きく動く（単色背景でもカメラが感じられる）
         _zoom, px, py, _angle = cam
-        show_echo = cut.get("decor") not in ("wall", "tunnel", "kanji", "rings")
+        show_echo = (cut.get("decor") not in ("wall", "tunnel", "kanji", "rings")
+                     and not cut.get("profile_kids"))
         ex = int(VIDEO_SIZE[0] / 2 - self.echo.size[0] / 2
                  + (40 - 80 * tl / max(dur, 0.1)) * (1 if cut["index"] % 2 else -1) - px * 260)
         ey = int(VIDEO_SIZE[1] * (0.22 if cut["index"] % 2 else 0.78) - self.echo.size[1] / 2 - py * 360)
@@ -1042,6 +1101,22 @@ class _Cut:
                     top, bottom = im.crop((0, 0, im.size[0], half)), im.crop((0, half, im.size[0], im.size[1]))
                     frame.paste(top, (int(px - 70 * q), int(py - 50 * q)), top)
                     frame.paste(bottom, (int(px + 70 * q), int(py + half + 50 * q)), bottom)
+                    continue
+                if cut.get("exit") == "shatter" and remain < 10:
+                    # 1字を4片に割り、片ごとに違う向きへ飛ばして落とす
+                    q = 1 - max(remain, 0) / 10
+                    w_, h_ = im.size
+                    mx, my = w_ // 2, h_ // 2
+                    for k, (x0, y0, x1, y1, sx, sy) in enumerate((
+                            (0, 0, mx, my, -1, -1), (mx, 0, w_, my, 1, -1),
+                            (0, my, mx, h_, -1, 1), (mx, my, w_, h_, 1, 1))):
+                        if x1 <= x0 or y1 <= y0:
+                            continue
+                        piece = im.crop((x0, y0, x1, y1))
+                        j = kinetic_fx._hash01(g["order"] * 4 + k + cut["index"])
+                        ox = sx * (30 + 150 * j) * q * q
+                        oy = sy * (20 + 90 * (1 - j)) * q * q + 150 * q * q * q
+                        frame.paste(piece, (int(px + x0 + ox), int(py + y0 + oy)), piece)
                     continue
                 frame.paste(im, (int(px), int(py)), im)
 
@@ -1664,7 +1739,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
     return sheets
 
 
-PLAN_VERSION = 9
+PLAN_VERSION = 12
 
 
 def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None):
