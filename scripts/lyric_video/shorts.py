@@ -134,18 +134,21 @@ def find_shorts(alignment, sections=None, beats=None, duration=None,
              section, label, reasons, density, score}
     """
     if mode == "mix":
-        picks = []
-        for m in ("hook", "scene"):
-            picks += find_shorts(alignment, sections, beats, duration, target, min_sec,
-                                 max_sec, limit, max_hold, mode=m)
-        picks.sort(key=lambda c: -c["score"])
+        # 切り口ごとに点の付け方が違うので、点数順に混ぜると片方だけになる
+        # （サビ優先の点は構造的に高く出る）。交互に採って、両方が必ず入るようにする。
+        lists = [find_shorts(alignment, sections, beats, duration, target, min_sec,
+                             max_sec, limit, max_hold, mode=m) for m in ("hook", "scene")]
         out = []
-        for c in picks:
-            if any(_overlap(c, p) > 0.5 for p in out):
-                continue
-            out.append(c)
-            if len(out) >= limit:
-                break
+        while len(out) < limit and any(lists):
+            for lst in lists:
+                while lst:
+                    c = lst.pop(0)
+                    if any(_overlap(c, p) > 0.5 for p in out):
+                        continue
+                    out.append(c)
+                    break
+                if len(out) >= limit:
+                    break
         for rank, c in enumerate(out, 1):
             c["rank"] = rank
         return out
