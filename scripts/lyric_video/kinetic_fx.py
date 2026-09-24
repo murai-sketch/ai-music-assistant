@@ -84,11 +84,18 @@ def song_profile(alignment, sections, beats, meta=None):
                 bpm *= 2
             while bpm > 180:
                 bpm /= 2
+    kids = any(w in label for w in KIDS_WORDS)
+    wa = any(w in label for w in WA_WORDS) and not kids
+    pop = any(w in label for w in POP_WORDS) or sum(text.count(w) for w in NIGHT_WORDS) >= 3
+    bpm = float(bpm or 120)
     return {
-        "wa": any(w in label for w in WA_WORDS) and not any(w in label for w in KIDS_WORDS),
-        "kids": any(w in label for w in KIDS_WORDS),
-        "pop": any(w in label for w in POP_WORDS) or sum(text.count(w) for w in NIGHT_WORDS) >= 3,
-        "bpm": float(bpm or 120),
+        "wa": wa,
+        "kids": kids,
+        "pop": pop,
+        "bpm": bpm,
+        # コマ打ち: 文字の動きを1秒あたり何コマに落とすか（0 = 毎フレーム滑らか）。
+        # 文字PVらしい「カクッ」とした動き。和風と速いポップに入れ、子ども向けとしっとりは滑らかなまま
+        "koma": 12 if (wa or (pop and bpm >= 120)) and not kids else 0,
         "density": len(text) / sung,
         "repeat_ratio": sum(c for c in counts.values() if c >= 2) / max(len(lines), 1),
         "kanji_ratio": sum(_is_kanji(c) for c in text) / max(len(text), 1),
@@ -114,11 +121,19 @@ def enabled_techniques(profile):
         on |= {"grain", "scatter", "heartbeat"}
     if not on & {"wall", "tunnel", "rings", "tape", "radial", "kanji"}:
         on |= {"wall", "radial"}
+    # 保持（行が止まっている間の小さな動き）と、間のある退場
+    on |= {"breathe", "drift"}
+    if profile["bpm"] >= 128:
+        on |= {"jitter"}
+    if profile["bpm"] >= 110:
+        on |= {"fall"}
+    if not profile["wa"] and profile["bpm"] >= 110:
+        on |= {"long_shadow"}
     if profile.get("kids"):
         # 幼児と親向け: 攻撃的な部品を外し、弾む・きらめく部品にする
         on -= {"tape", "split", "shatter", "stamp", "misregister", "grain", "kanji",
-               "neon", "wall", "tunnel", "radial"}
-        on |= {"rings", "scatter", "heartbeat", "sparkle", "bounce"}
+               "neon", "wall", "tunnel", "radial", "jitter", "fall", "long_shadow"}
+        on |= {"rings", "scatter", "heartbeat", "sparkle", "bounce", "wave"}
     return on
 
 
@@ -206,6 +221,30 @@ def assign_techniques(plan, profile):
             c["motion"] = c["entrance"] = "bounce"
         if kids and c["hold"] is None and c["level"] == 3:
             c["hold"] = "heartbeat"
+
+        # 保持: 1.2秒以上止まる行にだけ、小さな動きを1つ。控えめに、全部の行には付けない
+        if c["hold"] is None and dur >= 1.2:
+            if kids and "wave" in on and c["level"] <= 2 and i % 2 == 0:
+                c["hold"] = "wave"
+            elif c["level"] == 1 and "breathe" in on and dur >= 1.5:
+                c["hold"] = "breathe"
+            elif c["level"] == 2 and "jitter" in on and verse_k % 4 == 3:
+                c["hold"] = "jitter"
+        # 間のある退場: 次の行までに 0.3 秒以上の空きがあり、行自体が 1 秒以上あるとき。
+        # 空きが無いと次の行の入りとぶつかる
+        gap = (nxt["start"] - c["end"]) if nxt is not None else 9.0
+        if c["exit"] is None and dur >= 1.0 and gap >= 0.3:
+            if c["level"] == 1 or kids:
+                if "drift" in on:
+                    c["exit"] = "drift"
+            elif "fall" in on and (nxt is None or nxt["section"] != c["section"] or gap >= 0.8):
+                c["exit"] = "fall"
+        # 長い影: サビの単色背景に、版ズレと交互に
+        if (c["texture"] is None and "long_shadow" in on and c["level"] == 3
+                and c["bg"] != "image" and dur >= 0.8 and hook_k % 2 == 1):
+            c["texture"] = "long_shadow"
+        c["koma"] = profile.get("koma", 0)
+
         if dur < 0.9 and c["decor"] not in (None, "radial"):
             c["decor"] = None
         prev_decor = c["decor"]

@@ -103,6 +103,11 @@ ENTRANCE_FRAMES = {
     "stamp": 6, "scatter": 5, "pop": 6, "neon": 6, "bounce": 12,
 }
 EXIT_FRAMES = 3
+# 間のある退場（fall / drift）の長さ。カットの3割、0.14〜0.55秒（JIZURA の目安）
+EXIT_RATIO, EXIT_MIN_SEC, EXIT_MAX_SEC = 0.3, 0.14, 0.55
+# 保持（行が止まっている間の小さな動き）。入りの直後に 0.25 秒かけて立ち上がる
+HOLD_MOTIONS = ("breathe", "wave", "jitter")
+HOLD_RAMP_SEC = 0.25
 MIN_FLASH_GAP = 2.0
 MIN_BG_SWITCH_GAP = 0.5
 GAP_FOR_REST = 1.2  # これ以上の無歌詞区間は「間」として背景を画像に戻す
@@ -365,14 +370,14 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
 
 
 def plan_to_markdown(plan):
-    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for c in plan:
         bg = c["bg"] if c["bg"] == "image" else f"色{c['bg']}"
         out.append(
             f"| {c['index']} | {c['start']:.2f}–{c['end']:.2f} | {c['level']} | {c['layout']} | "
             f"{c['motion']} | {bg} | {c.get('camera', '')} | {c.get('decor') or ''} | "
-            f"{c.get('texture') or ''} | {c.get('exit') or ''} | {'●' if c['flash'] else ''} | "
+            f"{c.get('texture') or ''} | {c.get('hold') or ''} | {c.get('exit') or ''} | {'●' if c['flash'] else ''} | "
             f"{c.get('bgfx') or ''} | {c.get('under') or ''} | {c.get('wipe') or ''} |"
         )
     return "\n".join(out) + "\n"
@@ -573,6 +578,9 @@ class _Cut:
         emphasis = bool(cut.get("emphasis"))
         neon = cut.get("entrance") == "neon"
         self.overlay = None
+        # 長い影（texture == long_shadow）用。文字の形をアクセント色の暗い版で塗った画像を1字ずつ持つ
+        self._shadows = {}
+        self.shadow_color = _darken(accent, 0.55)
 
         def weight(row):
             if not emphasis:
@@ -994,6 +1002,12 @@ class _Cut:
 
         if cut.get("hold") == "heartbeat" and f > E:
             scale *= 1 + 0.08 * self._beat_pulse(cut["start"] + tl)
+        if cut.get("hold") in HOLD_MOTIONS and f > E:
+            hdx, hdy, hscale, hangle = self._hold_state(cut["hold"], g, tl, dur, f - E)
+            dx += hdx
+            dy += hdy
+            scale *= hscale
+            angle += hangle
         scale *= g.get("gscale", 1.0)
 
         # 退場
@@ -1007,6 +1021,13 @@ class _Cut:
         elif cut.get("exit") == "shatter" and remain < 10:
             q = 1 - max(remain, 0) / 10
             alpha *= 1 - q * q
+        elif cut.get("exit") in ("fall", "drift"):
+            edx, edy, escale, eangle, ealpha = self._exit_state(cut["exit"], g, tl, dur)
+            dx += edx
+            dy += edy
+            scale *= escale
+            angle += eangle
+            alpha *= ealpha
         elif cut["motion"] == "erase" and remain < 8:
             crop_right = 1 - max(remain, 0) / 8
         elif remain < EXIT_FRAMES:
@@ -1015,12 +1036,116 @@ class _Cut:
             scale *= _lerp(0.9, 1.0, q)
         return dx, dy, scale, angle, alpha, crop_top, crop_right
 
+    def _exit_frames(self, dur):
+        """退場にかける長さ（フレーム）。fall / drift はカットの長さに応じて伸縮する"""
+        if self.cut.get("exit") in ("fall", "drift"):
+            return max(min(dur * EXIT_RATIO, EXIT_MAX_SEC), EXIT_MIN_SEC) * FPS
+        return {"fly": 7, "split": 8, "shatter": 10}.get(self.cut.get("exit"), EXIT_FRAMES)
+
+    def _noise(self, g, *keys):
+        """この文字・このカットで決まる -1〜1 の乱数（フレームごとに変えたいときは keys に刻みを入れる）"""
+        n = self.cut["index"] * 7919 + g["order"] * 131
+        for k in keys:
+            n = n * 31 + int(k)
+        return kinetic_fx._hash01(n) * 2 - 1
+
+    def _hold_state(self, hold, g, tl, dur, since):
+        """保持: 行が止まっている間の小さな動き。(dx, dy, scale, angle)。
+        量は入りの直後に立ち上がり、退場に入ると消える。控えめが原則"""
+        remain = (dur - tl) * FPS
+        amt = min(since / (HOLD_RAMP_SEC * FPS), 1.0) * min(max(remain, 0) / max(self._exit_frames(dur), 1), 1.0)
+        if amt <= 0:
+            return 0.0, 0.0, 1.0, 0.0
+        size = g["img"].size[1]
+        o = g["order"]
+        if hold == "breathe":
+            # 呼吸: 行全体が 0.9Hz でわずかに膨らみ縮む（しっとりした行）
+            return 0.0, 0.0, 1 + 0.035 * math.sin(tl * math.tau * 0.9) * amt, 0.0
+        if hold == "wave":
+            # ウェーブ: 1字ずつ位相をずらして上下し、少し傾く（弾む曲・子ども向け）
+            ph = tl * 7 + o * 0.75
+            return 0.0, math.sin(ph) * size * 0.07 * amt, 1.0, math.cos(ph) * 5 * amt
+        if hold == "jitter":
+            # ジッター: 12Hz の刻みで 1 字ずつ小さく震える（速い曲）
+            step = int(tl * 12)
+            a = size * 0.025 * amt
+            return (self._noise(g, step, 1) * a, self._noise(g, step, 2) * a,
+                    1.0, self._noise(g, step, 3) * 4 * amt)
+        return 0.0, 0.0, 1.0, 0.0
+
+    def _exit_state(self, exit_name, g, tl, dur):
+        """間のある退場。(dx, dy, scale, angle, alpha)。
+        fall: 直前に震えてから 1 字ずつ重力で落ちる。drift: 1 字ずつ縮みながら舞い上がって消える"""
+        out_f = self._exit_frames(dur)
+        te = out_f - (dur - tl) * FPS  # 退場に入ってからのフレーム数（負なら手前）
+        size = g["img"].size[1]
+        u1, u2, u3 = ((self._noise(g, k) + 1) / 2 for k in (1, 2, 3))
+        if exit_name == "fall":
+            if te < 0:
+                if te > -0.25 * FPS:
+                    return self._noise(g, int(tl * 12)) * size * 0.03, 0.0, 1.0, 0.0, 1.0
+                return 0.0, 0.0, 1.0, 0.0, 1.0
+            x = max(te - u1 * out_f * 0.4, 0.0) / max(out_f * 0.6, 1.0)
+            return ((u2 * 2 - 1) * VIDEO_SIZE[0] * 0.05 * x, VIDEO_SIZE[1] * 1.3 * x * x,
+                    1.0, (u3 * 2 - 1) * 70 * x, 1.0)
+        x = min(max((te - u1 * out_f * 0.3) / max(out_f * 0.7, 1.0), 0.0), 1.0)
+        e = x * x
+        ang = u2 * math.tau
+        dist = size * 1.6 * (0.3 + 0.7 * u3)
+        return (math.cos(ang) * dist * e, math.sin(ang) * dist * e - size * 0.3 * e,
+                1 - 0.35 * e, 0.0, 1 - e * e)
+
+    def _exit_fade(self, tl, dur):
+        """下敷き・重ね物を fall / drift に合わせて消すための不透明度（1 = そのまま）"""
+        if self.cut.get("exit") not in ("fall", "drift"):
+            return 1.0
+        out_f = self._exit_frames(dur)
+        te = out_f - (dur - tl) * FPS
+        return 1.0 if te <= 0 else max(1 - te / max(out_f * 0.6, 1.0), 0.0)
+
+    def _shadow_img(self, g):
+        im = self._shadows.get(g["key"])
+        if im is None:
+            im = Image.new("RGBA", g["img"].size, _hex(self.shadow_color) + (255,))
+            im.putalpha(g["img"].getchannel("A"))
+            self._shadows[g["key"]] = im
+        return im
+
+    def _draw_long_shadow(self, frame, tl, dur, sprites, cos_a, sin_a, total_angle_of):
+        """長い影: 全部の文字の影を右下へ段状に伸ばしてから、文字本体を上に描く。
+        影を先に全字分描くので、隣の文字の上に影がかぶらない"""
+        cut = self.cut
+        ax, ay = self.anchor
+        for g in self.glyphs:
+            dx, dy, scale, angle, alpha, crop_top, crop_right = self.glyph_state(g, tl, dur)
+            if alpha <= 0.05 or cut["entrance"] == "mask":
+                continue
+            size = g["img"].size[1]
+            step = max(size * 0.045, 4) * scale
+            key = ("shadow",) + tuple(g["key"]) if isinstance(g["key"], tuple) else ("shadow", g["key"])
+            im = sprites.transformed(key, self._shadow_img(g), scale, total_angle_of(g, angle), alpha * 0.9,
+                                     crop_top, crop_right)
+            if im is None:
+                continue
+            gx = g["cx"] * scale
+            gy = g["cy"] * scale
+            rx = gx * cos_a - gy * sin_a
+            ry = gx * sin_a + gy * cos_a
+            px = ax + rx + dx - im.size[0] / 2
+            py = ay + ry + dy - im.size[1] / 2
+            for k in range(6, 0, -1):
+                frame.paste(im, (int(px + step * k), int(py + step * k)), im)
+
     def draw(self, frame, t, sprites, cam=(1.0, 0.0, 0.0, 0.0)):
         cut = self.cut
         tl = t - cut["start"]
         dur = cut["end"] - cut["start"]
         if tl < -0.2 or tl > dur:
             return
+        koma = cut.get("koma") or 0
+        if koma:
+            # コマ打ち: 文字の時間だけを 1/koma 秒の刻みに落とす（背景とカメラは滑らかなまま）
+            tl = math.floor(tl * koma + 1e-6) / koma
         # 背景の巨大文字: ゆっくり流れ、背景カメラと逆向きに大きく動く（単色背景でもカメラが感じられる）
         _zoom, px, py, _angle = cam
         show_echo = (cut.get("decor") not in ("wall", "tunnel", "kanji", "rings")
@@ -1045,6 +1170,10 @@ class _Cut:
             ghosts = [(0.35, 3), (0.18, 6)]
         else:
             ghosts = []
+
+        if cut.get("texture") == "long_shadow":
+            self._draw_long_shadow(frame, tl, dur, sprites, cos_a, sin_a,
+                                   lambda g, angle: base_angle + angle + g["angle"])
 
         for g in self.glyphs:
             dx, dy, scale, angle, alpha, crop_top, crop_right = self.glyph_state(g, tl, dur)
@@ -1149,6 +1278,7 @@ class _Cut:
             a = max(remain, 0) / EXIT_FRAMES
         if cut.get("exit") == "fly" and remain < 7:
             a *= (max(remain, 0) / 7)
+        a *= self._exit_fade(tl, dur)
         key = ("under", cut["index"], im.size)
         im = self._shared.transformed(key, im, 1.0, angle, a, 0.0, 0.0)
         if im is None:
@@ -1180,6 +1310,7 @@ class _Cut:
             q = 1 - max(remain, 0) / 7
             scale *= 1 + 3.0 * q * q
             a *= 1 - q * q
+        a *= self._exit_fade(tl, dur)
         if a <= 0.02:
             return
         key = ("overlay", cut["index"], id(self.overlay))
@@ -1739,7 +1870,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
     return sheets
 
 
-PLAN_VERSION = 12
+PLAN_VERSION = 13
 
 
 def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None):
