@@ -25,6 +25,8 @@ import math
 import re
 import unicodedata
 
+from align import detect_language
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -50,6 +52,14 @@ def _is_kana(ch):
 
 def _clean(text):
     return "".join(ch for ch in unicodedata.normalize("NFKC", text) if not ch.isspace())
+
+
+def _decor_text(cut):
+    """背景の装飾（文字の壁・トンネル・輪・帯）に流す文字列。
+    日本語は空白を詰め、英語は語の間の空白を残す（詰めると「Walkdownto…」と読めない）。"""
+    if cut.get("latin"):
+        return " ".join(cut["text"].split())
+    return _clean(cut["text"])
 
 
 def _hash01(n):
@@ -91,6 +101,8 @@ def song_profile(alignment, sections, beats, meta=None):
     return {
         "wa": wa,
         "kids": kids,
+        # 英語詞か（かな・漢字が1割未満）。段割り・縦書き・文字の大きさの見積もりを変える
+        "latin": detect_language(lines) == "en",
         "pop": pop,
         "bpm": bpm,
         # コマ打ち: 文字の動きを1秒あたり何コマに落とすか（0 = 毎フレーム滑らか）。
@@ -304,7 +316,7 @@ class Decor:
         return self._get(("strip", text, size, color, alpha), build)
 
     def _wall(self, frame, cut, tl, dur, color, accent, cam, fade):
-        text = _clean(cut["text"])
+        text = _decor_text(cut)
         size = 150 if len(text) <= 6 else 110
         alpha = 0.2 * fade
         strip, unit_w = self._strip(text, size, color, round(alpha, 2))
@@ -326,7 +338,7 @@ class Decor:
 
     # --- 無限トンネル
     def _tunnel(self, frame, cut, tl, dur, color, accent, cam, fade):
-        text = _clean(cut["text"])
+        text = _decor_text(cut)
 
         def build():
             font = self.fonts.get(FONT_HEAVY, 220)
@@ -373,7 +385,7 @@ class Decor:
         return self._get(("ring", text, diameter, size, color), build)
 
     def _rings(self, frame, cut, tl, dur, color, accent, cam, fade):
-        text = _clean(cut["text"])
+        text = _decor_text(cut)
         cx, cy = VIDEO_SIZE[0] / 2, VIDEO_SIZE[1] * 0.5
         back = self._ring_image(text, 1200, 96, color)
         rot = back.rotate(-tl * 35, resample=Image.BILINEAR)
@@ -388,7 +400,7 @@ class Decor:
 
     # --- 斜めの帯
     def _tape(self, frame, cut, tl, dur, color, accent, cam, fade):
-        text = _clean(cut["text"])
+        text = _decor_text(cut)
         for k, (ang, band, fg, y) in enumerate(((13, accent, (12, 12, 15), 0.3), (-9, (242, 194, 0), (12, 12, 15), 0.72))):
             def build(band=band, fg=fg, ang=ang):
                 font = self.fonts.get(FONT_HEAVY, 72)

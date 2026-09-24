@@ -128,10 +128,22 @@ VERTICAL_MAP = {"ー": "｜", "「": "﹁", "」": "﹂", "『": "﹃", "』": "
 # ---------------------------------------------------------------------------
 # 設計（plan）
 
+# グロウル・スクリーム・ブレイクダウン。甘い歌の部分とはっきり別の声なので、サビと同じ「強」にし、
+# 揺れて入る（build_plan）。構成タグ名で判定する
+GROWL_TAGS = ("growl", "scream", "breakdown", "shout")
+
+
+def is_growl(section):
+    s = (section or "").lower()
+    return any(t in s for t in GROWL_TAGS)
+
+
 def section_intensity(section):
     s = section or ""
     if "囁" in s:
         return 1
+    if is_growl(s):
+        return 3
     if "Pre" in s:
         return 2
     if "Hook" in s or "Chorus" in s:
@@ -206,10 +218,69 @@ def _chunk(token, limit=8):
     return _chunk(token[:best], limit) + _chunk(token[best:], limit)
 
 
-def _split_rows(text, short=False):
+LATIN_ROW_CHARS = 18  # 英語の1段の上限（文字数）。これを超える句を割る。1段が長いと文字が小さくなる
+LATIN_GROWL_ROW_CHARS = 16
+# 段の終わりに来ると、言葉が途中で千切れて見える語（冠詞・前置詞・所有格など）
+LATIN_WEAK_ENDS = {"a", "an", "the", "to", "of", "in", "at", "on", "as", "my", "your", "our",
+                   "and", "but", "or", "if", "when", "where", "i", "you", "we", "me", "that", "what"}
+
+
+def _latin_word(w):
+    return "".join(c for c in w.lower() if c.isalpha())
+
+
+def _split_latin_phrase(words, limit=LATIN_ROW_CHARS):
+    """読点を含まない1句を、LATIN_ROW_CHARS 以下になるまで語の切れ目で二つに割っていく。
+    割る位置は、長い方の段が短く、前の段が冠詞・前置詞で終わらず、1語だけの段ができない所。"""
+    joined = " ".join(words)
+    if len(words) <= 1 or len(joined) <= limit:
+        return [joined]
+    best, best_score = 1, None
+    for i in range(1, len(words)):
+        left, right = " ".join(words[:i]), " ".join(words[i:])
+        score = max(len(left), len(right))
+        if _latin_word(words[i - 1]) in LATIN_WEAK_ENDS:
+            score += 8
+        if i == 1 or i == len(words) - 1:
+            score += 6  # 1語だけの段は千切れて見える
+        if best_score is None or score < best_score:
+            best, best_score = i, score
+    return _split_latin_phrase(words[:best], limit) + _split_latin_phrase(words[best:], limit)
+
+
+def _split_latin_rows(text, limit=LATIN_ROW_CHARS):
+    """英語の行を段に折る。空白ごとに1語1段にすると「Walk / down / to / the …」と
+    細切れになって読めないので、まず読点（,）・ダッシュの後で句に分け、
+    長い句だけを語の切れ目で割る。"""
+    words = text.split()
+    phrases, cur = [], []
+    for w in words:
+        if w in ("—", "–"):
+            if cur:
+                cur.append(w)
+                phrases.append(cur)
+                cur = []
+            continue
+        cur.append(w)
+        if w[-1] in ",;:!?—–":
+            phrases.append(cur)
+            cur = []
+    if cur:
+        phrases.append(cur)
+    rows = []
+    for ph in phrases:
+        rows.extend(_split_latin_phrase(ph, limit))
+    return rows or [text]
+
+
+def _split_rows(text, short=False, latin=False, growl=False):
     """全角/半角スペースで区切られた行は、区切りごとに段を分ける。
     区切りがなく12文字を超える行は、言葉の切れ目らしい位置で折る。
-    short=True（子ども向け）は、7文字を超える段も折る。1段が短いほど文字が大きくなる。"""
+    short=True（子ども向け）は、7文字を超える段も折る。1段が短いほど文字が大きくなる。
+    latin=True（英語詞）は、読点と語の切れ目で折る。"""
+    if latin:
+        # グロウルは短い段で大きく叩きつける
+        return _split_latin_rows(text, LATIN_GROWL_ROW_CHARS if growl else LATIN_ROW_CHARS)
     if short:
         rows = []
         for r in _split_rows(text):
@@ -258,13 +329,17 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
         start = float(item["start"])
         next_start = float(alignment[i + 1]["start"]) if i + 1 < len(alignment) else float(item["end"])
         show_end = min(next_start, start + max_hold)
-        rows = _split_rows(text, short=profile.get("kids", False))
+        latin = profile.get("latin", False)
+        growl = is_growl(section)
+        rows = _split_rows(text, short=profile.get("kids", False), latin=latin, growl=growl)
         n = _clean_len(text)
-        if level == 3 and len(rows) == 1 and 4 <= n <= 8:
+        if level == 3 and len(rows) == 1 and 4 <= n <= 8 and not latin:
             rows = [rows[0][:-2], rows[0][-2:]]
 
         meaning = _pick_meaning(text)
-        if level == 1:
+        if growl:
+            motion = "shake"
+        elif level == 1:
             motion = "erase" if meaning == "erase" else QUIET_MOTIONS[i % len(QUIET_MOTIONS)]
         elif level == 3:
             motion = meaning if meaning in ("slash", "shake", "spread", "fall", "erase") else HOOK_MOTIONS[hook_i % len(HOOK_MOTIONS)]
@@ -281,7 +356,8 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
             layout = "center"
         else:
             choices = [l for l in LAYOUTS if l != prev_layout]
-            if n > 7:
+            if n > 7 or latin:
+                # 英語を縦に積むと読めない
                 choices = [l for l in choices if l != "vertical"]
             if level == 1:
                 choices = [l for l in choices if l in ("center", "vertical", "left")] or ["center"]
@@ -293,7 +369,7 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
         elif level == 1:
             tier = 2
         else:
-            tier = 1 if n <= 8 or profile.get("kids") else 2
+            tier = 1 if n <= (14 if latin else 8) or profile.get("kids") else 2
 
         # 背景: Hookは毎行切り替え、Verseは4行ごと、囁きは暗色固定、長い間の後は画像に戻す
         prev_gap = start - (float(alignment[i - 1]["start"]) + max_hold) if i > 0 else 99
@@ -338,6 +414,8 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
             "section": section,
             "level": level,
             "rows": rows,
+            "latin": latin,
+            "growl": growl,
             "start": round(start, 3),
             "end": round(show_end, 3),
             "land": round(land, 3),
@@ -354,6 +432,12 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
     kinetic_bg.assign_backgrounds(plan, profile)
     kinetic_bg.assign_bg_images(plan, backgrounds)
     for cut in plan:
+        if cut.get("growl") and not profile.get("kids"):
+            # グロウルは技法の割り当て（判子・散らし等）より「揺れて入る」を優先し、
+            # 和風の曲なら版ズレで荒らす。甘い歌の部分と一目で別の声だとわかるように
+            cut["motion"] = cut["entrance"] = "shake"
+            if profile["wa"] and cut.get("texture") in (None, "grain"):
+                cut["texture"] = "misregister"
         cut["profile_wa"] = profile["wa"]
         cut["profile_kids"] = profile.get("kids", False)
         if cut["profile_kids"]:
@@ -582,7 +666,12 @@ class _Cut:
         self._shadows = {}
         self.shadow_color = _darken(accent, 0.55)
 
+        latin = bool(cut.get("latin"))
+
         def weight(row):
+            if latin:
+                # 欧文は1字が全角の約6割の幅。文字数のままだと小さくなりすぎる（幅は後で実寸で詰める）
+                return max(len(row) * 0.6, 1)
             if not emphasis:
                 return max(len(row), 1)
             return max(sum(1.0 if kinetic_fx._is_kanji(ch) else 0.66 for ch in row), 1)
@@ -691,7 +780,11 @@ class _Cut:
                 if emphasis:
                     is_accent = flat_i in emph_idx
                 else:
-                    is_accent = accent_row or (level == 3 and len(rows) == 1 and len(row) >= 4 and ci >= len(row) - 2)
+                    if latin:
+                        # 欧文は末尾2文字ではなく最後の1語を差し色に
+                        is_accent = accent_row or (level == 3 and len(rows) == 1 and " " in row and ci > row.rfind(" "))
+                    else:
+                        is_accent = accent_row or (level == 3 and len(rows) == 1 and len(row) >= 4 and ci >= len(row) - 2)
                 flat_i += 1
                 fill = accent if is_accent else text_color
                 stroke = stroke_color

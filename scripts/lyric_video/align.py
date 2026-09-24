@@ -63,8 +63,8 @@ except ImportError:
 
 WORK_DIR = Path(__file__).resolve().parent / "_work"
 
-# 歌詞が日本語前提のVault。自動判定に任せると、歪んだボーカルで判定が
-# 揺れることがあるため固定する。
+# whisperの自動言語判定は、歪んだボーカルで揺れることがあるため使わない。
+# 言語は歌詞ノートの文字から決める（detect_language）。
 WHISPER_LANGUAGE = "ja"
 
 # これより短い一致ブロックは偶然の一致（助詞1文字など）として捨てる
@@ -95,7 +95,36 @@ def _get_model(model_size="large-v3", device="cpu", compute_type="int8"):
     return _model
 
 
-def _transcribe_words(audio_path, audio_duration=None):
+def detect_language(lyric_lines):
+    """歌詞の文字から、文字起こしと照合に使う言語を決める。
+    かな・漢字が文字の1割に満たなければ英語（"en"）、それ以外は日本語（"ja"）。"""
+    letters = [c for line in lyric_lines for c in line if c.isalpha()]
+    if not letters:
+        return WHISPER_LANGUAGE
+    cjk = sum(1 for c in letters
+              if 0x3040 <= ord(c) <= 0x30FF or 0x4E00 <= ord(c) <= 0x9FFF)
+    return "ja" if cjk / len(letters) >= 0.1 else "en"
+
+
+def _units(text, language):
+    """照合の単位に分ける。日本語は1文字ずつ、英語は1語ずつ（小文字、記号・アポストロフィ除去）。
+    英語を文字単位で照合すると、"th" "in" のような偶然の2文字一致が大量に出て崩れる。"""
+    if language != "en":
+        return [c for c in (_normalize_char(ch) for ch in text) if c]
+    out = []
+    for tok in unicodedata.normalize("NFKC", text).split():
+        w = "".join(c for c in tok.lower() if c.isalnum())
+        if w:
+            out.append(w)
+    return out
+
+
+def words_cache_path(cache_dir, language):
+    """文字起こしキャッシュの置き場所。日本語は従来の名前のまま（既存曲のキャッシュを生かす）。"""
+    return Path(cache_dir) / ("whisper_words.json" if language == "ja" else f"whisper_words.{language}.json")
+
+
+def _transcribe_words(audio_path, audio_duration=None, language=WHISPER_LANGUAGE):
     """whisperで単語タイムスタンプ付きの文字起こしをし、
     [{"start", "end", "text", "words": [{"start", "end", "word"}, ...]}, ...] を返す。
 
@@ -108,7 +137,7 @@ def _transcribe_words(audio_path, audio_duration=None):
 
     def run(vad):
         kwargs = dict(beam_size=5, vad_filter=vad, word_timestamps=True,
-                      language=WHISPER_LANGUAGE, condition_on_previous_text=False)
+                      language=language, condition_on_previous_text=False)
         if vad:
             kwargs["vad_parameters"] = dict(min_silence_duration_ms=200)
         segments, _info = model.transcribe(str(audio_path), **kwargs)
@@ -160,7 +189,42 @@ def _normalize_char(c):
     return c.lower()
 
 
-def _global_align(lyric_lines, word_segments, audio_duration):
+def _monotonic_blocks(a, b):
+    """a と b の最長共通部分列（順序を保つ一致の数が最大になる対応）を動的計画法で求め、
+    連続して一致した区間を (a位置, b位置, 長さ) のブロックで返す。
+
+    difflib.SequenceMatcher は「いちばん長い一致ブロック」から先に決めるため、
+    同じサビが3回あると1回目の歌詞を3回目の歌唱に当ててしまい、間の行が全部ずれる
+    （英語詞の疑似データで54行中30〜44行が1秒以上ずれた）。全体で一致数が最大になる
+    対応を取れば、繰り返しは順番どおりに対応する。英語は語単位なので計算量も小さい。"""
+    n, m = len(a), len(b)
+    # L[i][j] = a[i:] と b[j:] の最長共通部分列の長さ
+    L = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        Li, Li1, ai = L[i], L[i + 1], a[i]
+        for j in range(m - 1, -1, -1):
+            Li[j] = Li1[j + 1] + 1 if ai == b[j] else max(Li1[j], Li[j + 1])
+    pairs = []
+    i = j = 0
+    while i < n and j < m:
+        if a[i] == b[j] and L[i][j] == L[i + 1][j + 1] + 1:
+            pairs.append((i, j))
+            i += 1
+            j += 1
+        elif L[i + 1][j] >= L[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    blocks = []
+    for pi, pj in pairs:
+        if blocks and blocks[-1][0] + blocks[-1][2] == pi and blocks[-1][1] + blocks[-1][2] == pj:
+            blocks[-1][2] += 1
+        else:
+            blocks.append([pi, pj, 1])
+    return [tuple(x) for x in blocks]
+
+
+def _global_align(lyric_lines, word_segments, audio_duration, language=WHISPER_LANGUAGE):
     """歌詞全体とwhisper認識テキスト全体を文字単位で一括照合し、
     行ごとの{line, start, end}を返す。
 
@@ -172,7 +236,7 @@ def _global_align(lyric_lines, word_segments, audio_duration):
     w_chars, w_start, w_end = [], [], []
     for seg in word_segments:
         for w in seg["words"]:
-            raw = [c for c in (_normalize_char(ch) for ch in w["word"]) if c]
+            raw = _units(w["word"], language)
             n = len(raw)
             if not n:
                 continue
@@ -185,15 +249,18 @@ def _global_align(lyric_lines, word_segments, audio_duration):
     l_chars, l_line = [], []
     line_len = []
     for idx, line in enumerate(lyric_lines):
-        cs = [c for c in (_normalize_char(ch) for ch in line) if c]
+        cs = _units(line, language)
         line_len.append(max(len(cs), 1))
         for c in cs:
             l_chars.append(c)
             l_line.append(idx)
 
-    matcher = difflib.SequenceMatcher(None, l_chars, w_chars, autojunk=False)
+    if language == "en":
+        blocks = _monotonic_blocks(l_chars, w_chars)
+    else:
+        blocks = difflib.SequenceMatcher(None, l_chars, w_chars, autojunk=False).get_matching_blocks()
     matched = {}  # lyric char index -> whisper char index
-    for a, b, size in matcher.get_matching_blocks():
+    for a, b, size in blocks:
         if size < MIN_MATCH_BLOCK:
             continue
         for k in range(size):
@@ -467,7 +534,9 @@ def _uniform_fallback_align(lyric_lines, audio_duration):
 
 def align_lyrics(audio_path, lyric_lines, use_cache=True):
     """歌唱音声 + 歌詞行リスト から、行ごとの{line, start, end}リストを返す。
-    結果は音声ファイルのハッシュでキャッシュされる。"""
+    結果は音声ファイルのハッシュでキャッシュされる。
+    言語は歌詞から決め、文字起こしのキャッシュは言語ごとに分ける（日本語の既存曲は従来の名前のまま）。"""
+    language = detect_language(lyric_lines)
     audio_path = Path(audio_path)
     audio_hash = _audio_hash(audio_path)
     cache_dir = WORK_DIR / audio_hash
@@ -485,11 +554,11 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
                   f"手直し済みの版は {backup.name} に退避しました（GUIの「バックアップから戻す」で戻せます）。")
 
     audio_duration = _get_audio_duration(audio_path)
-    words_path = cache_dir / "whisper_words.json"
+    words_path = words_cache_path(cache_dir, language)
     if use_cache and words_path.exists():
         word_segments = json.loads(words_path.read_text(encoding="utf-8"))
     else:
-        word_segments = _transcribe_words(audio_path, audio_duration)
+        word_segments = _transcribe_words(audio_path, audio_duration, language)
         cache_dir.mkdir(parents=True, exist_ok=True)
         words_path.write_text(
             json.dumps(word_segments, ensure_ascii=False, indent=1), encoding="utf-8"
@@ -497,7 +566,7 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
 
     alignment = None
     if word_segments:
-        alignment = _global_align(lyric_lines, word_segments, audio_duration)
+        alignment = _global_align(lyric_lines, word_segments, audio_duration, language)
         if alignment is None:
             print("[WARN] 一括照合で1行も一致しませんでした。"
                   "セグメント単位の逐次照合にフォールバックします。")

@@ -58,7 +58,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from align import WORK_DIR, _audio_hash, _get_audio_duration, align_lyrics  # noqa: E402
+from align import WORK_DIR, _audio_hash, _get_audio_duration, align_lyrics, detect_language, words_cache_path  # noqa: E402
 from beats import detect_beats  # noqa: E402
 import shorts as shorts_mod  # noqa: E402
 from song_note import SongNote, sections_for_alignment  # noqa: E402
@@ -136,7 +136,9 @@ def _backup_alignment(reason):
 
 
 def _transcript():
-    segs = _load_json(_cache_dir() / "whisper_words.json", [])
+    note = _note()
+    language = detect_language(note.lyric_lines) if note else "ja"
+    segs = _load_json(words_cache_path(_cache_dir(), language), [])
     words = []
     for s in segs:
         for w in s.get("words", []):
