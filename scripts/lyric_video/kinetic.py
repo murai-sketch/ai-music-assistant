@@ -115,6 +115,13 @@ GAP_FOR_REST = 1.2  # これ以上の無歌詞区間は「間」として背景�
 INTERLUDE_EFFECTS = ["rgb_split", "glitch", "duotone", "scan", "kaleido"]
 INTERLUDE_FADE = 0.35  # 間奏の出入りでエフェクトを強める/弱める秒数
 INTERLUDE_MIN = 2.5    # これより短い歌詞の切れ目は間奏として扱わない
+# 間奏は小節ごとに背景の絵・カメラ・エフェクトを替える（2026-09-25「歌がない時間が長いと退屈、
+# 1小節ずつでも替えたほうがよい」）。1小節がこれより短い速い曲は2小節ずつにする
+INTERLUDE_BAR_MIN_SEC = 1.8
+INTERLUDE_CAMERAS = ["push_in", "pan_l", "tilt_up", "pull_out", "pan_r", "dutch", "tilt_down"]
+# 小節ごとに回すエフェクト（万華鏡は画面が黒い菱形に割れて見えるので外す）
+INTERLUDE_BAR_EFFECTS = ["rgb_split", "glitch", "duotone", "scan"]
+INTERLUDE_BAR_BRIGHTEN = 1.7  # 背景は文字のために暗く保持しているので、歌の無い間は明るく戻す
 
 # 文字を収める横幅。画面の端はプラットフォームのUI（TikTok の右の操作ボタン、
 # 下のユーザー名やキャプション、YouTube ショートの操作列）に隠れる可能性があるので、
@@ -1534,6 +1541,8 @@ class _Background:
         self._solid = {}
         self.wa = False
         self.palette = DEFAULT_PALETTE
+        # 単色の代わりに色で刷り直す絵（KineticRenderer が背景素材から入れる。空なら従来の単色）
+        self.tint_pool = []
 
     def _source(self, path):
         path = str(path or self.main)
@@ -1589,6 +1598,20 @@ class _Background:
             self._solid[color] = im
         return im
 
+    def tinted(self, color, t, cam, path):
+        """背景の絵を、パレットの色の濃淡だけで刷り直す（単色のベタ塗りの代わり）。
+        明るさの幅を色の 0.7〜1.1 倍に抑え、パレットで決めた文字色との対比を保つ。"""
+        im = self.image_at(t, cam, path)
+        base = np.array(_hex(color), dtype=np.float32)
+        if base.mean() < 60:
+            # 黒に近い色は掛け算では絵が消えるので、暗くした絵をそのまま重ねる（文字は白）
+            tone = base[None, None, :] + np.asarray(im, dtype=np.float32) * 0.45
+        else:
+            lum = np.asarray(im.convert("L"), dtype=np.float32) / 255.0
+            tone = base[None, None, :] * (0.7 + 0.4 * lum[:, :, None])
+        out = Image.fromarray(np.clip(tone, 0, 255).astype(np.uint8))
+        return kinetic_bg.apply_paper(out, self.wa)
+
     def frame(self, mode, t, cam, cut=None, image=None):
         """cut（その時点のカット設計）の bgfx / bg_image があれば背景に反映する。"""
         bgfx = cut.get("bgfx") if cut else None
@@ -1599,10 +1622,18 @@ class _Background:
                 im = kinetic_bg.apply_bgfx(im, bgfx, t, "#0C0C0F", accent, self.beat_amt(t), cut["index"])
             return im
         color = self.palette[mode][0]
+        # 背景素材がある曲は、単色のベタ塗りをやめて絵を色で刷り直す（2026-09-25「ベタ塗りはチープ」）
+        tint_src = None
+        if self.tint_pool:
+            tint_src = (cut.get("bg_image") if cut else None) or \
+                self.tint_pool[(cut.get("shot", 0) if cut else 0) % len(self.tint_pool)]
         if bgfx and bgfx.startswith("pattern:"):
-            im = kinetic_bg.apply_bgfx(Image.new("RGB", VIDEO_SIZE, _hex(color)), bgfx, t, color,
+            base = self.tinted(color, t, cam, tint_src) if tint_src else Image.new("RGB", VIDEO_SIZE, _hex(color))
+            im = kinetic_bg.apply_bgfx(base, bgfx, t, color,
                                        self.palette[mode][3], self.beat_amt(t), cut.get("shot", 0))
             return kinetic_bg.apply_paper(im, self.wa)
+        if tint_src:
+            return self.tinted(color, t, cam, tint_src)
         return self.solid(color).copy()
 
     def beat_amt(self, t):
@@ -1749,6 +1780,18 @@ class KineticRenderer:
         self.interludes = find_interludes(plan, duration)
         self.interlude_starts = [s for s, _e, _n in self.interludes]
         self.interlude_images = kinetic_bg.interlude_images(backgrounds, len(self.interludes))
+        # 間奏で小節ごとに替える絵。間奏用を先頭に、静かな場面用（囁き・Bridge）以外の全素材
+        items = [i for i in (backgrounds or []) if Path(i["file"]).suffix.lower() not in VIDEO_EXTS]
+        order = {"interlude": 0, "hook": 1, "growl": 2, "verse": 3, "any": 4}
+        self.bar_pool = [i["file"] for i in sorted(items, key=lambda i: order.get(i.get("use"), 9))
+                         if i.get("use") in order]
+        if not self.kids:
+            self.bg.tint_pool = [i["file"] for i in items if i.get("use") in ("verse", "hook", "any", "interlude")]
+        bpm = next((c.get("bpm") for c in plan if c.get("bpm")), None) or 120.0
+        bar = 4 * 60.0 / float(bpm)
+        while bar < INTERLUDE_BAR_MIN_SEC:
+            bar *= 2
+        self.bar_sec = bar
         self.cuts = []
         for c in plan:
             if c["bg"] == "image":
@@ -1831,7 +1874,19 @@ class KineticRenderer:
         cur_cut = self.plan[kc] if 0 <= kc < len(self.plan) and mode == self.plan[kc]["bg"] else None
         ki = bisect.bisect_right(self.interlude_starts, t) - 1
         in_interlude = ki >= 0 and self.interludes[ki][0] <= t <= self.interludes[ki][1] and mode == "image" and prev is None
-        if in_interlude:
+        bar_j = None
+        if in_interlude and not self.kids and self.bar_pool:
+            # 小節ごとに、絵・カメラの動き・エフェクトを順に替える。替わり目で一瞬寄る
+            s0 = self.interludes[ki][0]
+            bar_j = int((t - s0) / self.bar_sec)
+            u = (t - s0 - bar_j * self.bar_sec) / self.bar_sec
+            name = INTERLUDE_CAMERAS[(ki * 3 + bar_j) % len(INTERLUDE_CAMERAS)]
+            zoom, px, py, ang = camera_move(name, u, -1, bar_j)
+            zoom *= 1.0 + 0.10 * math.exp(-(u * self.bar_sec) / 0.12)
+            bg_cam = (zoom, px, py, ang)
+            img = self.bar_pool[(ki * 5 + bar_j) % len(self.bar_pool)]
+            frame = ImageEnhance.Brightness(self.bg.frame(mode, t, bg_cam, None, img)).enhance(INTERLUDE_BAR_BRIGHTEN)
+        elif in_interlude:
             frame = self.bg.frame(mode, t, bg_cam, None, self.interlude_images[ki])
         else:
             frame = self.bg.frame(mode, t, bg_cam, cur_cut)
@@ -1847,6 +1902,9 @@ class KineticRenderer:
                 pal = self.palette
                 if self.kids:
                     effect = ("sparkle", "kaleido_soft", "duotone")[k % 3]
+                elif bar_j is not None:
+                    # 絵とエフェクトの組み合わせが同じ周期で固定されないよう、4小節ごとにずらす
+                    effect = INTERLUDE_BAR_EFFECTS[(k + bar_j + bar_j // 4) % len(INTERLUDE_BAR_EFFECTS)]
                 frame = apply_interlude_effect(frame, effect, strength, t, bi, beat_amt,
                                                (pal[0][0], pal[0][3]) if k % 2 else (pal[1][0], pal[2][0]))
         if prev is not None:

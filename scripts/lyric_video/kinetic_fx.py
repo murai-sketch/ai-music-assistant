@@ -256,6 +256,7 @@ def assign_techniques(plan, profile):
                 and c["bg"] != "image" and dur >= 0.8 and hook_k % 2 == 1):
             c["texture"] = "long_shadow"
         c["koma"] = profile.get("koma", 0)
+        c["bpm"] = round(profile.get("bpm", 120), 1)
 
         if dur < 0.9 and c["decor"] not in (None, "radial"):
             c["decor"] = None
