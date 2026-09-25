@@ -307,7 +307,9 @@ def kaleidoscope(frame, t, strength):
 # ---------------------------------------------------------------------------
 # 複数の背景素材
 
-USES = ("quiet", "verse", "hook", "interlude", "any")
+# growl: グロウル・ブレイクダウンの行 / bridge: Bridge・Outro（曲の終盤の場面転換）。
+# 無ければ従来どおり強さで verse / hook / quiet から選ぶ
+USES = ("quiet", "verse", "hook", "interlude", "growl", "bridge", "any")
 
 
 # 背景素材を1つも持っていない人向けの案内。用意の仕方が決まっていないと、
@@ -348,10 +350,29 @@ def _pool(backgrounds, use):
     return pool or [i["file"] for i in items if i.get("use") == "any"]
 
 
+def _use_for(c, uses):
+    """カットに使う素材の用途。グロウル用・Bridge 用の素材があればそれを優先し、
+    無ければ強さ（囁き／中／サビ）で決める。"""
+    if c.get("growl") and "growl" in uses:
+        return "growl"
+    s = (c.get("section") or "").lower()
+    if "bridge" in uses and ("bridge" in s or "outro" in s):
+        return "bridge"
+    return {1: "quiet", 3: "hook"}.get(c["level"], "verse")
+
+
 def assign_bg_images(plan, backgrounds):
     """画像背景のショットごとに、強さに合う素材を順番に割り当てる。"""
     counters = {}
     shot_img = {}
+    uses = {i.get("use") for i in backgrounds or []}
+    # グロウル用・Bridge 用の素材は、その行では必ず見せる（単色の背景にしない）
+    for c in plan:
+        if _use_for(c, uses) in ("growl", "bridge") and not c.get("profile_kids"):
+            c["bg"] = "image"
+            c["bgfx"] = None
+            if c.get("under") == "card":
+                c["under"] = None
     # 囁き用・サビ用の素材があれば、単色のカットの一部を画像背景にして見せる
     if _pool(backgrounds, "quiet") and any(i.get("use") == "quiet" for i in backgrounds or []):
         for c in plan:
@@ -372,9 +393,9 @@ def assign_bg_images(plan, backgrounds):
         c["bg_image"] = None
         if c["bg"] != "image" or not backgrounds:
             continue
-        sh = c.get("shot", c["index"])
+        use = _use_for(c, uses)
+        sh = (c.get("shot", c["index"]), use)
         if sh not in shot_img:
-            use = {1: "quiet", 3: "hook"}.get(c["level"], "verse")
             pool = _pool(backgrounds, use)
             if pool:
                 k = counters.get(use, 0)

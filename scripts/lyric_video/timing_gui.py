@@ -725,7 +725,8 @@ fieldset.part legend { color:var(--dim); font-size:12px; }
       <div class="toolbar">
         <select id="bgUse">
           <option value="verse">Verse 用</option><option value="hook">サビ用</option>
-          <option value="quiet">囁き用</option><option value="interlude">間奏用</option><option value="any">どこでも</option>
+          <option value="quiet">囁き用</option><option value="interlude">間奏用</option>
+          <option value="growl">グロウル用</option><option value="bridge">Bridge・Outro 用</option><option value="any">どこでも</option>
         </select>
         <span class="drop" id="dropBg">＋ 画像・動画を追加</span>
         <input type="file" id="fileBg" class="hidden" accept="image/*,video/*" multiple>
@@ -1458,7 +1459,7 @@ $('stillsBtn').onclick = () => startRender(true);
 $('renderBtn').onclick = () => startRender(false);
 
 // ---------- 背景素材 ----------
-const USE_LABEL = {verse: 'Verse', hook: 'サビ', quiet: '囁き', interlude: '間奏', any: 'どこでも'};
+const USE_LABEL = {verse: 'Verse', hook: 'サビ', quiet: '囁き', interlude: '間奏', growl: 'グロウル', bridge: 'Bridge・Outro', any: 'どこでも'};
 let bgItems = [];
 async function loadBackgrounds() {
   const r = await fetch('/backgrounds'); if (!r.ok) return;
