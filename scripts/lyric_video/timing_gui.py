@@ -250,7 +250,7 @@ def _preview_jpeg(alignment, t, style_name):
             plan, rt = _plan_for(alignment, style_name)
             _PREVIEW["renderer"] = KineticRenderer(
                 STATE["image_path"], plan, _beats(), rt["style"],
-                duration=_get_audio_duration(STATE["audio_path"]), backgrounds=_backgrounds(),
+                duration=_get_audio_duration(STATE["audio_path"]), backgrounds=_backgrounds(), look=rt,
             )
             _PREVIEW["key"] = key
         frame = _PREVIEW["renderer"].frame_at(t)
@@ -307,7 +307,7 @@ def _run_render(style_name, stills_only, part=None, parts=None):
                 STATE["render_progress"] = (done + p) / of
 
             render_kinetic(STATE["image_path"], STATE["audio_path"], plan, _beats(), style, out,
-                           progress=progress, t_start=t0, t_end=t1, backgrounds=backgrounds)
+                           progress=progress, t_start=t0, t_end=t1, backgrounds=backgrounds, look=rt)
 
         if parts:
             STATE["render_outputs"] = []
@@ -319,7 +319,7 @@ def _run_render(style_name, stills_only, part=None, parts=None):
         elif stills_only:
             out_dir = cache_dir / f"gui_stills_{stamp}"
             STATE["stills"] = [str(p) for p in render_stills(STATE["image_path"], plan, _beats(), style, out_dir,
-                                                             backgrounds=backgrounds)]
+                                                             backgrounds=backgrounds, look=rt)]
         else:
             if part:
                 t0, t1 = part

@@ -641,17 +641,21 @@ def plan_to_markdown(plan, header=None):
     direction のあるプランには声・余韻の列を足す。既定のプランの出力は変えない。"""
     sung = any("sung_end" in c for c in plan)
     voiced = any("voice" in c for c in plan)
+    looked = any("font_role" in c for c in plan)
     head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     if voiced:
         head += " 声 | 余韻 |"
+        rule += "---|---|"
+    if looked:
+        head += " 役 | 差し色 |"
         rule += "---|---|"
     if sung:
         head += " W | D | E | 印 |"
         rule += "---|---|---|---|"
     out = list(header or []) + [head, rule]
     for c in plan:
-        bg = c["bg"] if c["bg"] == "image" else f"色{c['bg']}"
+        bg = c["bg"] if isinstance(c["bg"], str) else f"色{c['bg']}"
         row = (
             f"| {c['index']} | {c['start']:.2f}–{c['end']:.2f} | {c['level']} | {c['layout']} | "
             f"{c['motion']} | {bg} | {c.get('camera', '')} | {c.get('decor') or ''} | "
@@ -660,6 +664,8 @@ def plan_to_markdown(plan, header=None):
         )
         if voiced:
             row += f" {c.get('voice') or ''} | {_fmt(c.get('tail'))} |"
+        if looked:
+            row += f" {c.get('font_role') or ''} | {c.get('accent_mode') or ''} |"
         if sung:
             w, d = c.get("sung_w"), c.get("sung_d")
             mark = "W≠D" if (w is not None and d is not None and abs(w - d) >= SUNG_MISMATCH_SEC) else ""
@@ -856,8 +862,12 @@ class _Sprites:
 class _Cut:
     """1カット分の文字配置（基準サイズ・回転なしの状態）を持つ。"""
 
-    def __init__(self, cut, sprites, colors, palette_bg, beats=None):
+    def __init__(self, cut, sprites, colors, palette_bg, beats=None, look=None):
+        """look: テーマの役を当てるカットだけ渡す（_look_context の結果）。None なら従来どおり"""
         self.cut = cut
+        self.look_notes = []
+        if look is not None:
+            look = dict(look, tracking=float(cut.get("tracking", look["tracking"])))   # 行ごとの字間の上書き
         self._shared = sprites
         self.colors = colors
         self.beats = beats or []
@@ -868,6 +878,8 @@ class _Cut:
         font_path = FONT_QUIET if level == 1 else FONT_HEAVY
         if cut.get("profile_kids"):
             font_path = FONT_KIDS
+        if look is not None:
+            font_path = look["font"]   # look.FontRef（パスと TTC の番号）
         if cut.get("profile_kids"):
             accent = _readable(accent, palette_bg, text_color)
             colors = (text_color, stroke_color, accent)
@@ -908,7 +920,12 @@ class _Cut:
                     cap = 400 if n == 1 else 340 if n <= 2 else 300 if n <= 3 else 260
             return max(min(int(budget / n), cap), 60)
 
-        if vertical or cut.get("profile_kids"):
+        if look is not None:
+            # 役の書体：字間・行送り・上限下限 px。下限を割ったら改行を増やして組み直す（縮小で収めない）。
+            # 全段を同じ大きさにする（段ごとの大きさの差は使わない）
+            rows, size_each, self.look_notes = self._fit_look_rows(rows, look, cut, sprites)
+            sizes = [size_each] * len(rows)
+        elif vertical or cut.get("profile_kids"):
             # 段ごとに大きさが変わると、2文字の段だけ巨大になって落ち着かない
             sizes = [min(row_size(r) for r in rows)] * len(rows)
         else:
@@ -958,10 +975,11 @@ class _Cut:
             return sprites.glyph(draw_ch, fpath, gsize, fill, stroke, sw), (draw_ch, fpath, gsize, fill, stroke, sw)
 
         # 段ごとに、最後の段（またはHookの末尾2文字）をアクセント色にする
+        cut_accent_idx = set(cut.get("accent_idx") or [])
         glyphs = []
         order = 0
         flat_i = 0
-        row_hs = [sz * 1.1 for sz in sizes]
+        row_hs = [sz * (look["leading"] if look is not None else 1.1) for sz in sizes]
         total_h = sum(row_hs)
         y_cursor = -total_h / 2
         for ri, row in enumerate(rows):
@@ -978,6 +996,8 @@ class _Cut:
                         return int(rsize * 0.66)
                     return rsize
                 row_w = sum(sprites.fonts.get(font_path, csize(ch)).getlength(ch) for ch in row)
+                if look is not None:
+                    row_w += look["tracking"] * rsize * (len(row) - 1)
                 # 弧に沿わせるときの半径。段が長いほど緩い弧にして、端が落ちすぎないようにする
                 arc_r = max(row_w * 1.5, 700.0) if cut["layout"] == "arc" else 0.0
                 if cut["layout"] == "left":
@@ -989,7 +1009,11 @@ class _Cut:
                 y0 = y_cursor
                 y_cursor += row_hs[ri]
             for ci, ch in enumerate(row):
-                if emphasis:
+                if look is not None:
+                    # テーマの差し色の付け方（accent_mode）。段の最後・末尾2文字を差し色にする既存の規則は使わない
+                    mode = cut.get("accent_mode", "none")
+                    is_accent = mode == "fill" or (mode == "key_word" and flat_i in cut_accent_idx)
+                elif emphasis:
                     is_accent = flat_i in emph_idx
                 else:
                     if latin:
@@ -1005,6 +1029,8 @@ class _Cut:
                 draw_ch = VERTICAL_MAP.get(ch, ch) if vertical else ch
                 gsize = rsize if vertical else csize(ch)
                 gsw = max(gsize // 24, 3) if palette_bg is None else max(gsize // 40, 2)
+                if look is not None:
+                    stroke, gsw = self._look_stroke(look, cut, gsize, fill, accent, palette_bg)
                 g, key = make_glyph(draw_ch, font_path, gsize, fill, stroke, gsw)
                 img, l, t, adv = g
                 w, h = img.size
@@ -1016,7 +1042,7 @@ class _Cut:
                     drop = (rsize - gsize) * 0.78
                     cx = x + l + w / 2
                     cy = y0 + t + h / 2 + drop
-                    x += adv
+                    x += adv + (look["tracking"] * gsize if look is not None else 0)
                     angle = 0
                     if arc_r:
                         # 行の中心からの距離を角度に読み替え、円周上へ。文字も接線の向きに傾ける
@@ -1097,6 +1123,87 @@ class _Cut:
         echo_text = max(rows, key=len)
         echo_color = _hex(text_color) if palette_bg is not None else (255, 255, 255)
         self.echo = sprites.echo(echo_text, echo_color)
+
+    @staticmethod
+    def _look_stroke(look, cut, gsize, fill, accent, palette_bg):
+        """役の縁の指定から (縁の色, 縁の太さ px) を決める。
+        accent: outline（差し色の縁 3px）／層が重なるとき（cut["layered"]）は背景色の縁（layer_outline）／
+        thicken（below_px 以下の大きさで、文字と同じ色の縁で太らせる）／なし"""
+        if cut.get("accent_mode") == "outline":
+            return accent, 3
+        lo = look.get("layer_outline")
+        if lo and cut.get("layered"):
+            return palette_bg, int(lo["px"])
+        th = look.get("thicken")
+        if th and gsize <= th["below_px"]:
+            return fill, int(th["px"])
+        return fill, 0
+
+    @staticmethod
+    def _look_stroke_extra(look, cut):
+        """縁が字送りの外へ出る分（行の幅の見積もりに足す。片側 px）"""
+        extra = 0
+        if cut.get("accent_mode") == "outline":
+            extra = 3
+        if look.get("layer_outline") and cut.get("layered"):
+            extra = max(extra, int(look["layer_outline"]["px"]))
+        if look.get("thicken"):
+            extra = max(extra, int(look["thicken"]["px"]))
+        return extra
+
+    def _fit_look_rows(self, rows, look, cut, sprites):
+        """役の書体で、段ごとの大きさを揃えて決める。戻り値: (段, 大きさ px, 注記の一覧)。
+        大きさ = min(上限 px, 全段が幅に収まる最大)。下限 px を割るときは、長い段を _chunk で折って段を増やし、
+        下限以上で収まる最初の割り方を採る。それでも割るなら、その大きさで描いて注記を返す（止めない）"""
+        fonts = sprites.fonts
+        font = look["font"]
+        track = look["tracking"]
+        budget = look["text_width"] - 2 * self._look_stroke_extra(look, cut)
+        cap = int(cut.get("max_px") or look["max_px"])
+        min_px = int(look["min_px"])
+
+        def width(row, s):
+            f = fonts.get(font, s)
+            return sum(f.getlength(ch) for ch in row) + track * s * (len(row) - 1)
+
+        def fit_row(row):
+            lo, hi = 1, cap
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if width(row, mid) <= budget:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo
+
+        def fit(rs):
+            return min(fit_row(r) for r in rs)
+
+        notes = []
+        size = fit(rows)
+        if size < min_px:
+            max_len = max(len(r) for r in rows)
+            best = None
+            for limit in range(max_len - 1, 1, -1):
+                cand = []
+                for r in rows:
+                    cand.extend(_chunk(r, limit) if len(r) > limit else [r])
+                if len(cand) == len(rows):
+                    continue
+                s_c = fit(cand)
+                if len(cand) * s_c * look["leading"] > VIDEO_SIZE[1] - 140:
+                    break   # これ以上段を増やすと画面の高さに収まらない
+                if best is None or s_c > best[1]:
+                    best = (cand, s_c)
+                if s_c >= min_px:
+                    best = (cand, s_c)
+                    break
+            if best is not None and best[1] >= min_px:
+                notes.append(f"行{cut['index']}: 下限 {min_px}px を割るので段を {len(rows)}→{len(best[0])} に増やした（{best[1]}px）")
+                rows, size = best[0], best[1]
+            else:
+                notes.append(f"行{cut['index']}: 段を増やしても下限 {min_px}px を割る（{size}px で描く）【要確認】")
+        return rows, size, notes
 
     def _bounds(self):
         xs0 = [g["cx"] - g["img"].width / 2 for g in self.glyphs]
@@ -1978,8 +2085,16 @@ def camera_move(name, u, since_land, index):
 # ---------------------------------------------------------------------------
 
 class KineticRenderer:
-    def __init__(self, image_path, plan, beats, style, duration=None, backgrounds=None):
+    def __init__(self, image_path, plan, beats, style, duration=None, backgrounds=None, look=None):
+        """look: prepare_plan が返す runtime。テーマ（名前付きの配色・書体の役）を使う曲だけ渡す。
+        渡さない（または theme が None）なら、従来の経路（添字のパレット・背景画像）のまま。"""
         self.plan = plan
+        self.theme = (look or {}).get("theme")
+        self.themed = self.theme is not None
+        if self.themed and not all(c.get("font_role") for c in plan):
+            raise RuntimeError("テーマを使うのに、役（font_role）の無いカットがあります。kinetic_plan.json を作り直してください（--replan）")
+        self._theme_solid = {}
+        self.look_notes = []
         self.starts = [c["start"] for c in plan]
         # ショットごとの開始・終了（次のショットの開始まで動き続ける）
         self.shot_span = {}
@@ -2018,7 +2133,18 @@ class KineticRenderer:
             bar *= 2
         self.bar_sec = bar
         self.cuts = []
+        if self.themed:
+            self._setup_theme(look, plan)
         for c in plan:
+            if self.themed:
+                pal = self.theme["palettes"][c["bg"]]
+                bg = pal["bg"]
+                text = pal["text"]
+                colors = (text, pal.get("stroke", bg), pal.get("accent", text))
+                cut_obj = _Cut(c, self.sprites, colors, bg, beats, look=self._look_context(c))
+                self.look_notes.extend(cut_obj.look_notes)
+                self.cuts.append(cut_obj)
+                continue
             if c["bg"] == "image":
                 if self.kids:
                     colors = ("#3A2A5A", "#FFFFFF", "#FF4F9A")
@@ -2031,6 +2157,67 @@ class KineticRenderer:
                 palette_bg = bg
             self.cuts.append(_Cut(c, self.sprites, colors, palette_bg, beats))
         self.decor = _shared_decor()
+        for note in self.look_notes:
+            print(f"      [書体] {note}")
+
+    # --- テーマ（名前付きの配色・書体の役・背景色の時間軸） ---
+
+    def _setup_theme(self, look, plan):
+        theme = self.theme
+        self._fonts = look.get("fonts") or {}
+        self._paper = (theme.get("texture") or {}).get("paper", "plain") != "none"
+        self._text_width = (theme.get("layout") or {}).get("text_width", TEXT_WIDTH)
+        self._transitions = []
+        for tr in ((look.get("direction_data") or {}).get("bg_transitions") or []):
+            t0 = float(tr["start"]) if "start" in tr else float(plan[tr["after_line"] - 1]["end"])
+            t1 = t0 + float(tr["seconds"]) if "seconds" in tr else float(plan[tr["until_line"] - 1]["start"])
+            self._transitions.append((t0, max(t1, t0 + 1e-6), _hex(theme["palettes"][tr["from"]]["bg"]),
+                                      _hex(theme["palettes"][tr["to"]]["bg"])))
+        self._transitions.sort(key=lambda x: x[0])
+        self._tr_starts = [x[0] for x in self._transitions]
+
+    def _look_context(self, c):
+        import look as look_mod
+
+        spec = self.theme["fonts"][c["font_role"]]
+        ref = self._fonts.get(c["font_role"])
+        if ref is None:
+            raise RuntimeError(f"役 '{c['font_role']}' の書体が解決されていません")
+        return {"font": look_mod.FontRef(ref["path"], ref["index"]),
+                "tracking": float(spec.get("tracking", 0.0)), "leading": float(spec.get("leading", 1.2)),
+                "min_px": spec.get("min_px", 60), "max_px": spec.get("max_px", 150),
+                "thicken": spec.get("thicken"), "layer_outline": spec.get("layer_outline"),
+                "text_width": self._text_width}
+
+    def bg_color_at(self, t):
+        """テーマの背景色（時刻 → 色）。各カットの開始で、そのカットの配色の背景色へ硬く切り替える。
+        bg_transitions の区間は、2色の間を線形に補間する（区間が終わったら、次のカットが始まるまで終点の色のまま）。
+        背景画像には戻さない（カットの空き・間奏・アウトロも単色）。"""
+        k = max(bisect.bisect_right(self.starts, t) - 1, 0)
+        cut = self.plan[k]
+        color = _hex(self.theme["palettes"][cut["bg"]]["bg"])
+        j = bisect.bisect_right(self._tr_starts, t) - 1
+        if j >= 0:
+            t0, t1, ca, cb = self._transitions[j]
+            if cut["start"] <= t0:   # この区間より前に始まったカットの間だけ。次のカットの開始で硬く切り替わる
+                u = min(max((t - t0) / (t1 - t0), 0.0), 1.0)
+                color = tuple(a + (b - a) * u for a, b in zip(ca, cb))
+        return color
+
+    def _themed_background(self, t):
+        """単色（＋紙の微粒子だけ）。補間中の色はキャッシュしない（色の数だけ 6MB の画像が溜まるため）"""
+        color = tuple(int(round(v)) for v in self.bg_color_at(t))
+        im = self._theme_solid.get(color)
+        if im is not None:
+            return im.copy()
+        arr = np.empty((VIDEO_SIZE[1], VIDEO_SIZE[0], 3), dtype=np.int16)
+        arr[:, :] = color
+        if self._paper:
+            arr += kinetic_bg.paper_texture(False)
+        out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+        if len(self._theme_solid) < 12 and any(color == _hex(p["bg"]) for p in self.theme["palettes"].values()):
+            self._theme_solid[color] = out   # 配色そのものの色だけキャッシュする
+        return out.copy() if color in self._theme_solid else out
 
     def _active(self, t):
         k = bisect.bisect_right(self.starts, t + 0.2) - 1
@@ -2094,6 +2281,14 @@ class KineticRenderer:
 
     def frame_at(self, t):
         bg_cam, g_zoom, sx, sy = self.camera_at(t)
+        if self.themed:
+            frame = self._themed_background(t)
+        else:
+            frame = self._plain_background(t, bg_cam)
+        return self._foreground(frame, t, bg_cam, g_zoom, sx, sy)
+
+    def _plain_background(self, t, bg_cam):
+        """従来の背景（添字のパレット・背景画像・間奏の効果・ワイプ）"""
         mode, prev, p = self._bg_mode_at(t)
         kc = bisect.bisect_right(self.starts, t) - 1
         cur_cut = self.plan[kc] if 0 <= kc < len(self.plan) and mode == self.plan[kc]["bg"] else None
@@ -2138,6 +2333,9 @@ class KineticRenderer:
             kind = cur_cut.get("wipe", "straight") if cur_cut else "straight"
             mask = kinetic_bg.wipe_mask(kind, _ease_out(p), kc)
             frame = Image.composite(frame, old, mask)
+        return frame
+
+    def _foreground(self, frame, t, bg_cam, g_zoom, sx, sy):
         active = self._active(t)
         for j in active:
             text_color, _stroke, accent = self.cuts[j].colors
@@ -2167,14 +2365,14 @@ class KineticRenderer:
 
 
 def render_kinetic(image_path, audio_path, plan, beats, style, output_path, progress=None,
-                   t_start=None, t_end=None, backgrounds=None):
+                   t_start=None, t_end=None, backgrounds=None, look=None):
     """t_start / t_end を渡すと、その区間だけを書き出す（音声も同じ区間）。"""
     from moviepy import AudioFileClip, VideoClip
 
     audio = AudioFileClip(str(audio_path))
     # subclipped の後は audio.duration が切り出した長さになるので、曲全体の長さは先に控える
     song_duration = audio.duration
-    renderer = KineticRenderer(image_path, plan, beats, style, duration=song_duration, backgrounds=backgrounds)
+    renderer = KineticRenderer(image_path, plan, beats, style, duration=song_duration, backgrounds=backgrounds, look=look)
     t0 = max(float(t_start or 0.0), 0.0)
     t1 = min(float(t_end), song_duration) if t_end is not None else song_duration
     if t1 - t0 < 0.1:
@@ -2216,10 +2414,10 @@ def render_kinetic(image_path, audio_path, plan, beats, style, output_path, prog
     return output_path
 
 
-def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, backgrounds=None):
+def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, backgrounds=None, look=None):
     """各カットの 0/25/50/75/100% と入りの着地直後を静止画にし、
     一覧画像（コンタクトシート）にまとめる。書き出し前の目視確認用。"""
-    renderer = KineticRenderer(image_path, plan, beats, style, backgrounds=backgrounds)
+    renderer = KineticRenderer(image_path, plan, beats, style, backgrounds=backgrounds, look=look)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     thumb_w, thumb_h = 216, 384
@@ -2243,6 +2441,16 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
                 t = c["start"] + max(dur * fr, 0 if fr else 0) + (min(first_frame * 0.5, dur * 0.2) if fr == 0 else 0)
                 im = renderer.frame_at(t).resize((thumb_w, thumb_h), Image.BILINEAR)
                 sheet.paste(im, (80 + k * thumb_w, r * thumb_h))
+            if renderer.themed:
+                # 役・配色・背景色と文字色の色コード（コントラストの照合用）
+                pal = renderer.theme["palettes"][c["bg"]]
+                tiny = ImageFont.truetype(FONT_HEAVY, 13)
+                role_info = renderer._fonts.get(c["font_role"], {})
+                size_px = renderer.cuts[s + r].size
+                for k2, line in enumerate((f"{c['font_role']} {size_px}px", f"{c['bg']} {c.get('accent_mode', '')}",
+                                           f"bg {pal['bg']}", f"tx {pal['text']}",
+                                           f"{Path(str(role_info.get('path', ''))).name[:10]} i{role_info.get('index', '')}")):
+                    d.text((6, r * thumb_h + 204 + k2 * 17), line, font=tiny, fill=(190, 210, 255))
             if sung_col:
                 e = c.get("sung_end")
                 small = ImageFont.truetype(FONT_HEAVY, 15)
@@ -2336,6 +2544,74 @@ def apply_direction(plan, direction, vdefaults):
     return plan
 
 
+def extract_key_word(plan, spec):
+    """鍵語を、実行時に歌詞から取り出す。rule == first_bracket: from_line 行目の最初の「」の中の文字列。
+    歌詞の文字列は direction にもテーマにも書かない（ここで取り出すだけ）"""
+    import re
+    import look
+
+    n = spec["from_line"]
+    m = re.search(r"「([^」]+)」", plan[n - 1]["text"])
+    if not m:
+        raise look.LookError(f"direction: key_word の取り出し元の行{n}に「」がありません")
+    return m.group(1)
+
+
+def apply_look(plan, theme, direction, vdefaults):
+    """テーマ（書体の役・名前付きの配色）を、各カットに当てる。direction があれば行ごとの指定を使い、
+    無ければ（--look だけ）テーマの default_role・default_palette を全カットに当てる。
+    カットに入れるもの: font_role（役）、bg（配色の名前。添字ではない）、accent_mode（none・key_word・fill・outline）、
+    accent_idx（key_word のとき、行の文字を段の順に並べた中の差し色にする位置）、max_px・tracking（行ごとの上書き）。
+    背景画像は使わない（bg は常に配色の名前）。戻り値: 見つかった食い違いの一覧（表示用）"""
+    import look
+
+    items = _direction_items(direction, len(plan)) if direction is not None else [{} for _ in plan]
+    key_text = None
+    if direction is not None and direction.get("key_word"):
+        key_text = extract_key_word(plan, direction["key_word"])
+    notes = []
+    flagged, containing = set(), set()
+    for c, it in zip(plan, items):
+        vd = vdefaults.get(it.get("voice") or c.get("voice")) or {}
+        role = it.get("role") or vd.get("role") or theme.get("default_role")
+        palette = it.get("palette") or vd.get("palette") or theme.get("default_palette")
+        if role is None or palette is None:
+            raise look.LookError(
+                f"行{c['index']}: 書体の役か配色が決まりません（行の role・palette、声の role・palette、"
+                f"テーマの default_role・default_palette のどれかで指定してください）")
+        c["font_role"] = role
+        c["bg"] = palette
+        mode = it.get("accent", "none")
+        c["accent_mode"] = mode
+        for key in ("max_px", "tracking"):
+            if key in it:
+                c[key] = it[key]
+        if c["layout"] == "vertical":
+            c["layout"] = "center"   # 縦組みは使わない（PIL に raqm が無く、長音・括弧が縦用の字形に替わらない）
+        flat = "".join(c["rows"])
+        idx = []
+        if key_text:
+            pos = flat.find(key_text)
+            while pos >= 0:
+                idx.extend(range(pos, pos + len(key_text)))
+                pos = flat.find(key_text, pos + len(key_text))
+            if idx:
+                containing.add(c["index"])
+        if mode == "key_word":
+            flagged.add(c["index"])
+            if not key_text:
+                raise look.LookError(f"direction: 行{c['index']}は accent: key_word ですが、direction に key_word の規則がありません")
+            if idx:
+                c["accent_idx"] = idx
+            else:
+                notes.append(f"行{c['index']}: accent は key_word ですが、鍵語がこの行にありません（差し色なし）")
+        else:
+            c.pop("accent_idx", None)
+    for n in sorted(containing - flagged):
+        notes.append(f"行{n}: 鍵語を含みますが accent が key_word ではありません（差し色なし）")
+    return notes
+
+
 def _plan_variant(style, theme, direction, sung_ends, duration):
     """既定の経路（既定スタイル・テーマなし・direction なし）では None。それ以外は設計を決める入力の digest。
     kinetic_plan.json のキャッシュ判定に使う（PLAN_VERSION は上げない。上げると既存の曲のプランが全部作り直される）"""
@@ -2382,7 +2658,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
     sung_ends = tails = fixed = None
     vdefaults = look.voice_defaults(direction, theme)
     if direction is not None:
-        look.validate_direction(direction, len(alignment), vdefaults)
+        look.validate_direction(direction, len(alignment), vdefaults, theme)
     if eff_style.get("hold_mode") == "sung_end":
         cached = json.loads((cache_dir / "alignment.json").read_text(encoding="utf-8"))
         lines = lyric_lines if lyric_lines is not None else [a["line"] for a in alignment]
@@ -2399,6 +2675,10 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
             apply_direction(plan, direction, vdefaults)
             for c, tl in zip(plan, tails):
                 c["tail"] = eff_style.get("tail_sec", 0.6) if tl is None else tl
+        if theme is not None:
+            for note in apply_look(plan, theme, direction, vdefaults):
+                if not quiet:
+                    print(f"      [警告] {note}")
         return plan
 
     variant = _plan_variant(eff_style, theme, direction, sung_ends, duration)
@@ -2415,7 +2695,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
         plan = load_or_build_plan(plan_path, alignment, sections, beats, eff_style, replan=replan,
                                   variant=variant, md_header=header, **kwargs)
     runtime = {"style": eff_style, "look": theme_name, "theme": theme, "fonts": fonts,
-               "direction": direction is not None, "variant": variant,
+               "direction": direction is not None, "direction_data": direction, "variant": variant,
                "digest": {"look": None if theme is None else look.theme_digest(theme),
                           "direction": None if direction is None else look.direction_digest(direction)}}
     return plan, runtime

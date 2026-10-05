@@ -1,0 +1,49 @@
+{
+  "look": "cold-amber",
+  "fonts": {
+    "outer": {
+      "family": "BIZ UDGothic", "style": "Bold",
+      "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/42529d87b12845309dd4a57dea9e58446826e94c.asset/AssetData/BIZ_UDGothic.ttc",
+      "index": 1, "tracking": -0.02, "leading": 1.18, "min_px": 72, "max_px": 150,
+      "layer_outline": {"px": 4}
+    },
+    "outer_sub": {
+      "family": "BIZ UDGothic", "style": "Bold",
+      "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/42529d87b12845309dd4a57dea9e58446826e94c.asset/AssetData/BIZ_UDGothic.ttc",
+      "index": 1, "tracking": 0.0, "leading": 1.18, "min_px": 40, "max_px": 48
+    },
+    "outer_strike": {
+      "family": "Toppan Bunkyu Midashi Gothic", "style": "Extrabold",
+      "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/c6dd5dda81ed310c2248630a4e62f4fd71316d91.asset/AssetData/ToppanBunkyuMidashiGothicStdN-ExtraBold.otf",
+      "index": 0, "tracking": -0.06, "leading": 1.12, "min_px": 72, "max_px": 190,
+      "layer_outline": {"px": 8}
+    },
+    "pair": {
+      "family": "Toppan Bunkyu Mincho", "style": "Regular",
+      "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/a35803b18dea500ee1e426f403635efbe5a84bd4.asset/AssetData/ToppanBunkyuMinchoPr6N-Regular.otf",
+      "index": 0, "tracking": 0.06, "leading": 1.25, "min_px": 84, "max_px": 120,
+      "thicken": {"below_px": 109, "px": 1}
+    },
+    "pair_strong": {
+      "family": "Toppan Bunkyu Midashi Mincho", "style": "Extrabold",
+      "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/36a81f2dad2ef266c50802d85839e0201fcf4e57.asset/AssetData/ToppanBunkyuMidashiMinchoStdN-ExtraBold.otf",
+      "index": 0, "tracking": 0.04, "leading": 1.22, "min_px": 110, "max_px": 150
+    }
+  },
+  "palettes": {
+    "cool":       {"bg": "#0A0F1A", "text": "#C9D2DE", "sub": "#8C97A6", "stroke": "#0A0F1A", "accent": "#E6FF1A"},
+    "cool_hit":   {"bg": "#0A0F1A", "text": "#E3E8EE", "sub": "#8C97A6", "stroke": "#0A0F1A", "accent": "#E6FF1A"},
+    "dusk":       {"bg": "#14100E", "text": "#F3E9D8", "stroke": "#14100E", "accent": "#F2A93B"},
+    "warm":       {"bg": "#1E130C", "text": "#F3E9D8", "stroke": "#1E130C", "accent": "#F2A93B"},
+    "warm_quiet": {"bg": "#140E0A", "text": "#E9DFCD", "stroke": "#140E0A", "accent": "#F2A93B"},
+    "night":      {"bg": "#080605", "text": "#E9DFCD", "stroke": "#080605", "accent": "#F2A93B"}
+  },
+  "voices": {
+    "outer": {"role": "outer", "palette": "cool", "tail": 0.3},
+    "pair":  {"role": "pair", "palette": "warm", "tail": 0.8}
+  },
+  "default_role": "outer",
+  "default_palette": "cool",
+  "layout": {"text_width": 900},
+  "texture": {"paper": "plain", "bg_image": false}
+}

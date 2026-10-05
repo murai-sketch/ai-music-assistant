@@ -19,8 +19,11 @@ look.py
     "voices": {"<声>": {"role": "<役>", "tail": 0.3}},                     # 任意
     "texture": {...}                                                        # 任意
   }
-  役の中身（tracking・leading・px・太らせ・縁）と palettes の実際の描画への反映は、書体・配色の段（U2・U3）で行う。
-  この版では、読み込み・検査・書体の解決・キャッシュ判定への反映までを行う。
+  役の中身: tracking（字間 em）・leading（行送り ×サイズ）・min_px／max_px（下限を割ったら改行を増やす）・
+            thicken {below_px, px}（以下の大きさで同色の縁で太らせる）・layer_outline {px}（層が重なるときだけ背景色の縁）
+  palettes: bg・text（必須）、stroke・sub・accent（任意）。名前は自由（"image" は使えない）
+  voices.<声>: role・palette・tail。default_role／default_palette: direction 無し（--look だけ）のときの既定
+  layout.text_width: 文字を収める横幅 px。texture: paper（plain / none）・bg_image（false のみ。単色背景）
 
 演出（direction.json）の形:
   {
@@ -29,8 +32,10 @@ look.py
     "voices": {"<声>": {"tail": 0.3}},   # 任意。テーマの voices を上書き
     "lines": {"1": {...}, "5-8": {...}}  # 行番号（1始まり）または範囲。同じ行に複数当たれば後勝ち
   }
-  行の項目（この版で効くもの）: voice / tail（秒）/ end（絶対時刻で固定）/ exit（swap・fade・fade:<秒>・fall 等）/
-                              entrance / layout / hold / decor
+  行の項目: voice / tail（秒）/ end（絶対時刻で固定）/ exit（swap・fade・fade:<秒>・fall 等）/ entrance / layout / hold / decor /
+            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline）/ max_px / tracking（役の値の行ごとの上書き）
+  key_word: {"from_line": N, "rule": "first_bracket"}   N 行目の最初の「」の中の語を実行時に取り出す（歌詞は書かない）
+  bg_transitions: [{"from": 配色, "to": 配色, "start"|"after_line", "seconds"|"until_line"}]   背景色を時間で線形に補間する
 """
 
 import hashlib
@@ -90,10 +95,41 @@ def validate_theme(theme, where="テーマ"):
         for key, val in pal.items():
             if not (isinstance(val, str) and _HEX.match(val)):
                 raise LookError(f"{where}: palettes.{name}.{key} が #RRGGBB ではありません")
+    for role, spec in theme["fonts"].items():
+        for key in ("tracking", "leading", "min_px", "max_px"):
+            if key in spec and (isinstance(spec[key], bool) or not isinstance(spec[key], (int, float))):
+                raise LookError(f"{where}: fonts.{role}.{key} は数値で書いてください")
+        for key in ("thicken", "layer_outline"):
+            sub = spec.get(key)
+            if sub is not None and (not isinstance(sub, dict) or not isinstance(sub.get("px"), int)
+                                    or (key == "thicken" and not isinstance(sub.get("below_px"), (int, float)))):
+                raise LookError(f"{where}: fonts.{role}.{key} は {{px: 整数{', below_px: 数値' if key == 'thicken' else ''}}} で書いてください")
+        if "min_px" in spec and "max_px" in spec and spec["min_px"] > spec["max_px"]:
+            raise LookError(f"{where}: fonts.{role} の min_px が max_px より大きいです")
     for voice, spec in (theme.get("voices") or {}).items():
         role = (spec or {}).get("role")
         if role is not None and role not in theme["fonts"]:
             raise LookError(f"{where}: voices.{voice}.role '{role}' が fonts にありません")
+        pal = (spec or {}).get("palette")
+        if pal is not None and pal not in theme["palettes"]:
+            raise LookError(f"{where}: voices.{voice}.palette '{pal}' が palettes にありません")
+    if theme.get("default_role") is not None and theme["default_role"] not in theme["fonts"]:
+        raise LookError(f"{where}: default_role '{theme['default_role']}' が fonts にありません")
+    if theme.get("default_palette") is not None and theme["default_palette"] not in theme["palettes"]:
+        raise LookError(f"{where}: default_palette '{theme['default_palette']}' が palettes にありません")
+    tex = theme.get("texture") or {}
+    for key, val in tex.items():
+        if key == "paper" and val in ("plain", "none"):
+            continue
+        if key == "bg_image" and val is False:
+            continue
+        # 版ズレ・粒子とひっかき傷・長い影・模様・背景画像は、この版のテーマでは使えない（黙って無視しない）
+        if val in (False, None, [], "none", "off"):
+            continue
+        raise LookError(f"{where}: texture.{key}={val!r} は未対応です（paper: plain|none、bg_image: false のみ）")
+    width = (theme.get("layout") or {}).get("text_width")
+    if width is not None and (isinstance(width, bool) or not isinstance(width, (int, float)) or not 300 <= width <= 1080):
+        raise LookError(f"{where}: layout.text_width は 300〜1080 の数値で書いてください")
     return theme
 
 
@@ -174,10 +210,12 @@ def direction_path(cache_dir):
 
 
 # direction の行の項目（許可リスト）。別名は読み込み時に正式名へ直す（動き §2 R2 は余韻を tail_sec と書く）。
-LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor"}
+LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
+                  "role", "palette", "accent", "max_px", "tracking"}
+ACCENT_MODES = ("none", "key_word", "fill", "outline")
 ITEM_ALIASES = {"tail_sec": "tail"}
-VOICE_ITEM_KEYS = {"role", "tail"}
-DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look"}
+VOICE_ITEM_KEYS = {"role", "tail", "palette"}
+DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions"}
 
 
 def _normalize_item(item, allowed, where):
@@ -194,8 +232,13 @@ def _normalize_item(item, allowed, where):
             raise LookError(f"direction: {where} の項目 '{name}' が別名と重複しています")
         if name in ("tail", "end") and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
             raise LookError(f"direction: {where} の '{k}' は 0 以上の数値で書いてください")
-        if name in ("voice", "exit", "entrance", "layout", "hold", "decor", "role") and not isinstance(v, str):
+        if name in ("voice", "exit", "entrance", "layout", "hold", "decor", "role", "palette", "accent") and not isinstance(v, str):
             raise LookError(f"direction: {where} の '{k}' は文字列で書いてください")
+        if name in ("max_px", "tracking") and (isinstance(v, bool) or not isinstance(v, (int, float))
+                                               or (name == "max_px" and v <= 0)):
+            raise LookError(f"direction: {where} の '{k}' は数値で書いてください")
+        if name == "accent" and v not in ACCENT_MODES:
+            raise LookError(f"direction: {where} の accent '{v}' は {', '.join(ACCENT_MODES)} のどれかで書いてください")
         out[name] = v
     return out
 
@@ -219,7 +262,7 @@ def parse_line_keys(keys, n_lines):
     return out
 
 
-def validate_direction(direction, n_lines, vdefaults):
+def validate_direction(direction, n_lines, vdefaults, theme=None):
     """direction の中身の検査（書き間違いを黙って既定値に戻さない）。未知の項目・存在しない声は LookError で止める。
     vdefaults は voice_defaults の結果（テーマ・direction の voices の和）"""
     for k in direction:
@@ -230,6 +273,52 @@ def validate_direction(direction, n_lines, vdefaults):
         v = item.get("voice")
         if v is not None and v not in vdefaults:
             raise LookError(f"direction: 行{n} の声 '{v}' が voices にありません（{', '.join(sorted(vdefaults)) or 'なし'}）")
+        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking") if k in item]
+        if look_keys and theme is None:
+            raise LookError(f"direction: 行{n} に見た目の項目（{', '.join(look_keys)}）がありますが、テーマが指定されていません"
+                            f"（direction の look か --look）")
+        if theme is not None:
+            if item.get("role") is not None and item["role"] not in theme["fonts"]:
+                raise LookError(f"direction: 行{n} の role '{item['role']}' がテーマの fonts にありません")
+            if item.get("palette") is not None and item["palette"] not in theme["palettes"]:
+                raise LookError(f"direction: 行{n} の palette '{item['palette']}' がテーマの palettes にありません")
+            if item.get("layout") == "vertical":
+                raise LookError(f"direction: 行{n} の layout 'vertical'（縦組み）はテーマを使う曲では使えません")
+    if theme is not None:
+        for voice, spec in vdefaults.items():
+            if spec.get("role") is not None and spec["role"] not in theme["fonts"]:
+                raise LookError(f"direction: 声 '{voice}' の role '{spec['role']}' がテーマの fonts にありません")
+            if spec.get("palette") is not None and spec["palette"] not in theme["palettes"]:
+                raise LookError(f"direction: 声 '{voice}' の palette '{spec['palette']}' がテーマの palettes にありません")
+    elif any((spec or {}).get("role") or (spec or {}).get("palette") for spec in vdefaults.values()):
+        raise LookError("direction: 声に role・palette がありますが、テーマが指定されていません")
+    kw = direction.get("key_word")
+    if kw is not None:
+        if (not isinstance(kw, dict) or not isinstance(kw.get("from_line"), int)
+                or not 1 <= kw["from_line"] <= n_lines or kw.get("rule") != "first_bracket"):
+            raise LookError('direction: key_word は {"from_line": 行番号, "rule": "first_bracket"} の形で書いてください')
+    trs = direction.get("bg_transitions", [])
+    if not isinstance(trs, list):
+        raise LookError("direction: bg_transitions は配列で書いてください")
+    for i, tr in enumerate(trs):
+        where = f"bg_transitions[{i}]"
+        if not isinstance(tr, dict) or not (set(tr) <= {"from", "to", "start", "after_line", "seconds", "until_line"}):
+            raise LookError(f"direction: {where} に未知の項目があります（from・to・start|after_line・seconds|until_line）")
+        if theme is None:
+            raise LookError(f"direction: {where} がありますが、テーマが指定されていません")
+        for key in ("from", "to"):
+            if tr.get(key) not in theme["palettes"]:
+                raise LookError(f"direction: {where}.{key} '{tr.get(key)}' がテーマの palettes にありません")
+        if ("start" in tr) == ("after_line" in tr):
+            raise LookError(f"direction: {where} は start（秒）か after_line（行番号）のどちらか1つを書いてください")
+        if ("seconds" in tr) == ("until_line" in tr):
+            raise LookError(f"direction: {where} は seconds（秒）か until_line（行番号）のどちらか1つを書いてください")
+        for key in ("after_line", "until_line"):
+            if key in tr and not (isinstance(tr[key], int) and 1 <= tr[key] <= n_lines):
+                raise LookError(f"direction: {where}.{key} が行番号（1〜{n_lines}）ではありません")
+        for key in ("start", "seconds"):
+            if key in tr and (isinstance(tr[key], bool) or not isinstance(tr[key], (int, float)) or tr[key] < 0):
+                raise LookError(f"direction: {where}.{key} は 0 以上の数値で書いてください")
 
 
 def load_direction(cache_dir):
