@@ -302,13 +302,42 @@ def _split_rows(text, short=False, latin=False, growl=False):
     return [joined]
 
 
-def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
+SUNG_CHAIN_GAP_SEC = 1.5   # 単語どうしがこれ以上空いたら、そこで「歌い終わり」とみなす（間奏の誤認識を拾わない）
+
+
+def sung_ends_from_words(alignment, word_segments, chain_gap=SUNG_CHAIN_GAP_SEC):
+    """各行の歌い終わり（秒）を、whisperの単語終了時刻から求める。
+    alignment の end は「次の行の start」で埋められていて歌い終わりではないため使えない。
+    行の [start-0.3, 次の行のstart) に始まる単語を時刻順に辿り、直前の単語との間が chain_gap を
+    超えたところで打ち切る。単語が1つも見つからない行は None（呼び出し側で上限方式に戻す）。"""
+    words = sorted((w for seg in word_segments for w in seg.get("words", [])),
+                   key=lambda w: w["start"])
+    result = []
+    for i, item in enumerate(alignment):
+        lo = float(item["start"]) - 0.3
+        hi = float(alignment[i + 1]["start"]) if i + 1 < len(alignment) else float("inf")
+        last = None
+        for w in words:
+            if w["start"] < lo:
+                continue
+            if w["start"] >= hi:
+                break
+            if last is not None and w["start"] - last > chain_gap:
+                break
+            last = max(last or 0.0, float(w["end"]))
+        result.append(last)
+    return result
+
+
+def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, sung_ends=None):
     """alignment（[{line,start,end}]）と、行ごとの構成タグ名から、
     カットごとの設計を作る。meta（曲ノートの title/genre/tags/bpm）があれば、
     曲の性格に合わせて参考作品由来の技法（kinetic_fx）を割り当てる。"""
     max_hold = style.get("max_hold_sec", 2.8)
+    hold_mode = style.get("hold_mode", "cap")
+    tail_sec = style.get("tail_sec", 0.6)
     profile = kinetic_fx.song_profile(alignment, sections, beats, meta)
-    if profile.get("kids"):
+    if profile.get("kids") and hold_mode == "cap":
         # 子ども向けの曲は1行を4〜5秒かけてゆっくり歌う。既定の頭打ち（約3秒）だと
         # 歌い終わる前に文字が消えて「歌詞が抜けている」ように見えるので、長く残す。
         # 次の行が始まればどのみちそこで消える。
@@ -336,6 +365,13 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
         start = float(item["start"])
         next_start = float(alignment[i + 1]["start"]) if i + 1 < len(alignment) else float(item["end"])
         show_end = min(next_start, start + max_hold)
+        if hold_mode == "sung_end":
+            # 歌い終わり＋tail まで残す。tail には退場アニメ（最長0.55秒）が収まるので、
+            # 歌っている間は文字が完全に見えている。歌い終わりが取れない行は上限方式に戻す。
+            se = sung_ends[i] if sung_ends and i < len(sung_ends) else None
+            if se is not None:
+                show_end = min(next_start, max(se, start) + tail_sec)
+            show_end = max(show_end, min(start + 0.3, next_start))
         latin = profile.get("latin", False)
         growl = is_growl(section)
         rows = _split_rows(text, short=profile.get("kids", False), latin=latin, growl=growl)
@@ -380,6 +416,8 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None):
 
         # 背景: Hookは毎行切り替え、Verseは4行ごと、囁きは暗色固定、長い間の後は画像に戻す
         prev_gap = start - (float(alignment[i - 1]["start"]) + max_hold) if i > 0 else 99
+        if hold_mode == "sung_end" and i > 0:
+            prev_gap = start - plan[-1]["end"]
         want = bg_mode
         if level == 1:
             want = 0
@@ -2024,7 +2062,8 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
 PLAN_VERSION = 13
 
 
-def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None):
+def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None,
+                       sung_ends=None):
     plan_path = Path(plan_path)
     lines = [a["line"] for a in alignment]
     if plan_path.exists() and not replan:
@@ -2034,7 +2073,7 @@ def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=Fals
                 and saved.get("backgrounds") == (backgrounds or [])):
             return saved["plan"]
         print("      kinetic_plan.json は歌詞・タイミング・曲情報・設計の版のいずれかが変わったため作り直します")
-    plan = build_plan(alignment, sections, beats, style, meta, backgrounds)
+    plan = build_plan(alignment, sections, beats, style, meta, backgrounds, sung_ends=sung_ends)
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(
         json.dumps({"version": PLAN_VERSION, "meta": meta, "backgrounds": backgrounds or [],

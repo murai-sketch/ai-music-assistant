@@ -290,7 +290,7 @@ def _monotonic_blocks(a, b):
     return [tuple(x) for x in blocks]
 
 
-def _global_align(lyric_lines, word_segments, audio_duration, language=WHISPER_LANGUAGE):
+def _global_align(lyric_lines, word_segments, audio_duration, language=WHISPER_LANGUAGE, use_lcs=False):
     """歌詞全体とwhisper認識テキスト全体を文字単位で一括照合し、
     行ごとの{line, start, end}を返す。
 
@@ -298,6 +298,8 @@ def _global_align(lyric_lines, word_segments, audio_duration, language=WHISPER_L
     - 行の開始は、その行で最初に一致した文字の時刻（単語内は線形補間）から、
       それより前の不一致文字ぶんを平均文字長で差し引いて求める
     - 1文字も一致しなかった行は、前後の一致行の間に文字数比で配置する
+    - use_lcs=True なら日本語でも最長共通部分列（_monotonic_blocks）で照合する
+      （ボーカル分離時。同じブロックを繰り返す曲でも順番どおりに対応する。英語は常にLCS）
     """
     w_chars, w_start, w_end = [], [], []
     for seg in word_segments:
@@ -321,7 +323,7 @@ def _global_align(lyric_lines, word_segments, audio_duration, language=WHISPER_L
             l_chars.append(c)
             l_line.append(idx)
 
-    if language == "en":
+    if language == "en" or use_lcs:
         blocks = _monotonic_blocks(l_chars, w_chars)
     else:
         blocks = difflib.SequenceMatcher(None, l_chars, w_chars, autojunk=False).get_matching_blocks()
@@ -653,7 +655,7 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True, separate_vocals=False)
 
     alignment = None
     if word_segments:
-        alignment = _global_align(lyric_lines, word_segments, audio_duration, language)
+        alignment = _global_align(lyric_lines, word_segments, audio_duration, language, use_lcs=separate_vocals)
         if alignment is None:
             print("[WARN] 一括照合で1行も一致しませんでした。"
                   "セグメント単位の逐次照合にフォールバックします。")

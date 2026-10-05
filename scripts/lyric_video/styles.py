@@ -25,6 +25,11 @@ styles.py
                                align.py/timing_editor.pyが返すend（多くの場合
                                「次の行のstart」）をそのまま表示し続けない
                                ようにするための上限。
+    hold_mode               : "cap"（既定。上記 max_hold_sec で消える）／ "sung_end"（行の歌い終わり
+                               ＋ tail_sec まで残す。次の行の開始が先ならそこで消える。歌い終わりは
+                               whisperの単語終了時刻から求める。alignmentのendは次の行のstartなので使えない）
+    tail_sec                : sung_end のとき、歌い終わりのあと何秒残すか（既定0.6。退場アニメは最長0.55秒
+                               なので、これ以上にすると歌っている間は文字が完全に見える）
 """
 
 STYLES = {
@@ -67,6 +72,22 @@ STYLES = {
         "caption_color": "#FF3B70",
         "caption_stroke_color": "#1A0010",
         "max_hold_sec": 2.8,
+    },
+    # 既定スタイルの値のコピー＋歌い終わりまで残す。配色は既定のまま（演出設計書で上書きする想定）
+    "sung-hold": {
+        "beat_min_gap_sec": 0.17,
+        "beat_strength_percentile": 70,
+        "pulse_scale": 1.09,
+        "pulse_decay_sec": 0.14,
+        "entrance_overshoot": 0.12,
+        "entrance_duration_sec": 0.18,
+        "jitter_amplitude_px": 3,
+        "stagger_per_char_sec": 0.012,
+        "caption_color": "#FF3B70",
+        "caption_stroke_color": "#1A0010",
+        "max_hold_sec": 2.8,
+        "hold_mode": "sung_end",
+        "tail_sec": 0.6,
     },
 }
 

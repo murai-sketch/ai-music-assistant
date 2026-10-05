@@ -15,7 +15,7 @@ make_lyric_video.py
       --style kawaii-deathcore-wametal \\
       --out scripts/lyric_video/_work/<曲名>/output.mp4
 
-    --style は kawaii / deathcore / kawaii-deathcore-wametal から選択
+    --style は kawaii / deathcore / kawaii-deathcore-wametal / sung-hold（歌い終わりまで残す）から選択
     （省略時は kawaii-deathcore-wametal）。
 
     --separate-vocals を付けると、自動タイミングの文字起こしだけをボーカル分離音声
@@ -46,6 +46,7 @@ align.py/beats.py の結果は音声ファイルのハッシュでキャッシ�
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -204,8 +205,17 @@ def main():
         else:
             print(GENERATE_HINT)
         sections = sections_for_alignment(alignment, note.lyric_sections)
+        sung_ends = None
+        if style.get("hold_mode") == "sung_end":
+            from align import words_cache_path, words_source_of, detect_language
+            from kinetic import sung_ends_from_words
+            cached = json.loads((cache_dir / "alignment.json").read_text(encoding="utf-8"))
+            wpath = words_cache_path(cache_dir, detect_language(note.lyric_lines),
+                                     vocals=words_source_of(cached) == "vocals")
+            sung_ends = sung_ends_from_words(alignment, json.loads(wpath.read_text(encoding="utf-8")))
         plan = load_or_build_plan(plan_path, alignment, sections, beats, style,
-                                  replan=args.replan, meta=note.meta, backgrounds=backgrounds)
+                                  replan=args.replan, meta=note.meta, backgrounds=backgrounds,
+                                  sung_ends=sung_ends)
         print(f"      カット設計: {plan_path}（一覧は {plan_path.with_suffix('.md').name}）")
 
         if args.shorts or args.short:
