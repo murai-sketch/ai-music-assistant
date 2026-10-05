@@ -221,6 +221,20 @@ def main():
         sections = sections_for_alignment(alignment, note.lyric_sections)
         import look
         if args.direction_from:
+            # 置く前に検査する（direction の検査・プランの組み立て・描画側の検査）。止まったら direction.json は変えない
+            from kinetic import KineticRenderer
+            try:
+                chk_plan, chk_rt = prepare_plan(cache_dir, alignment, sections, beats, style,
+                                                meta=note.meta, backgrounds=backgrounds, plan_path=None,
+                                                duration=_get_audio_duration(audio_path), look_name=args.look,
+                                                lyric_lines=note.lyric_lines, quiet=True,
+                                                direction_data=look.load_direction_file(args.direction_from))
+                KineticRenderer(image_path, chk_plan, beats, chk_rt["style"], duration=_get_audio_duration(audio_path),
+                                backgrounds=backgrounds, look=chk_rt)
+            except look.LookError as e:
+                print(f"[ERROR] {e}")
+                print(f"      検査で止まったので、演出は登録していません（{look.direction_path(cache_dir)} は変わっていません）")
+                sys.exit(1)
             print(f"      演出を登録: {look.register_direction(cache_dir, args.direction_from)}")
         try:
             plan, rt = prepare_plan(cache_dir, alignment, sections, beats, style,
@@ -241,7 +255,7 @@ def main():
                 target=args.short_sec, min_sec=float(lo), max_sec=float(hi or shorts.SHORT_MAX),
                 limit=max(args.short_count, 1), max_hold=style.get("max_hold_sec", 2.8),
                 mode=args.short_mode,
-                spans=[(c["start"], c["end"]) for c in plan] if (rt["direction"] or style.get("hold_mode") == "sung_end") else None,
+                spans=shorts.plan_spans(plan, rt, style),
             )
             mode_ja = {"hook": "サビ頭から", "scene": "情景・心情の場面", "mix": "サビと情景の両方"}
             print(f"[4/4] ショート候補（{mode_ja[args.short_mode]} / 目安 {args.short_sec:.0f}秒 / {lo}〜{hi}秒）:")

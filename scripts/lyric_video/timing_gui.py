@@ -272,9 +272,9 @@ def _short_candidates(target=30.0, min_sec=None, max_sec=None, limit=5, mode="ho
     spans = None
     import look as look_mod
     if look_mod.direction_path(_cache_dir()).exists() or style.get("hold_mode") == "sung_end":
-        # 歌い終わりまで残す方式・direction のある曲は、行の終わりをプランの表示の終わりに合わせる
+        # 歌い終わりまで残す方式・direction のある曲は、行の終わりをプランの表示の終わりに合わせる（CLI と同じ shorts.plan_spans）
         plan, _rt = _plan_for(alignment, DEFAULT_STYLE)
-        spans = [(c["start"], c["end"]) for c in plan]
+        spans = shorts_mod.plan_spans(plan, _rt, style)
     cands = shorts_mod.find_shorts(
         alignment, sections, _beats(), duration=_get_audio_duration(Path(STATE["audio_path"])),
         target=float(target),

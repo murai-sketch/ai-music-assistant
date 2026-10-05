@@ -123,6 +123,15 @@ KIND_WEIGHT_SCENE = {"bridge": 2.8, "quiet": 2.6, "verse": 2.4, "pre": 1.8,
                      "outro": 1.4, "intro": 1.0, "hook": 0.5}
 
 
+def plan_spans(plan, rt, style=None):
+    """ショートの区間に渡す、行ごとの表示区間。歌い終わりまで残す方式（sung-hold）の曲と、direction のある曲は
+    プランの [開始, 終了) を返し、それ以外は None（None なら find_shorts は従来の max_hold の見積もり）。
+    CLI・GUI の両方がここを通す。判定の条件はこの関数が持つ"""
+    if (rt or {}).get("direction") or (style or {}).get("hold_mode") == "sung_end":
+        return [(c["start"], c["end"]) for c in plan]
+    return None
+
+
 def find_shorts(alignment, sections=None, beats=None, duration=None,
                 target=DEFAULT_TARGET, min_sec=SHORT_MIN, max_sec=SHORT_MAX,
                 limit=5, max_hold=2.8, mode="hook", spans=None):

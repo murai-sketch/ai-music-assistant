@@ -279,6 +279,8 @@ INTERLUDE_KEYS = {"start", "after_line", "end", "until_line", "until", "kind", "
 INTERLUDE_KINDS = ("duotone",)
 COUNTER_MIN_CONTRAST = 4.5   # カウンター（副要素）の下限。最悪の背景（背景+10）に対して（設計書 §4）
 IMPACT_KEYS = ("overshoot", "land_frames", "undershoot", "glyph_shake_px", "zoom", "screen_shake_px")
+IMPACT_OPTIONAL_KEYS = ("ease",)    # 任意。縮み方（linear が既定／quad）
+IMPACT_EASES = ("linear", "quad")
 KARAOKE_KEYS = {"unlit_opacity", "light_frames", "keyword_unlit", "min_match", "min_cover"}
 SLAM_MAX_LINES = 8         # slam の行数の上限（動き §9-7 ③）
 UNLIT_MIN_CONTRAST = 5.0   # karaoke の未点灯（bg+10 の最悪の背景）の下限（書体配色 §11.4）
@@ -453,9 +455,14 @@ def _validate_stage3(direction, by_line, theme):
         if not isinstance(impacts, dict) or not impacts:
             raise LookError("direction: impacts は {名前: {...}} の形で書いてください")
         for name, spec in impacts.items():
-            if not isinstance(spec, dict) or set(spec) != set(IMPACT_KEYS):
-                raise LookError(f"direction: impacts.{name} は {', '.join(IMPACT_KEYS)} の全部を書いてください（足りない・余分な項目があります）")
+            if not isinstance(spec, dict) or not set(IMPACT_KEYS) <= set(spec) <= set(IMPACT_KEYS) | set(IMPACT_OPTIONAL_KEYS):
+                raise LookError(f"direction: impacts.{name} は {', '.join(IMPACT_KEYS)} の全部（と任意の {', '.join(IMPACT_OPTIONAL_KEYS)}）を書いてください"
+                                f"（足りない・余分な項目があります）")
+            if spec.get("ease", "linear") not in IMPACT_EASES:
+                raise LookError(f"direction: impacts.{name}.ease は {', '.join(IMPACT_EASES)} のどちらかで書いてください")
             for key, val in spec.items():
+                if key in IMPACT_OPTIONAL_KEYS:
+                    continue
                 if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
                     raise LookError(f"direction: impacts.{name}.{key} は 0 以上の数値で書いてください")
             if not isinstance(spec["land_frames"], int) or not 1 <= spec["land_frames"] <= 5:
@@ -536,6 +543,8 @@ def _validate_counter_top(direction, by_line):
             for key in ("after_line", "until_line"):
                 if not (isinstance(ap[key], int) and not isinstance(ap[key], bool) and 1 <= ap[key] <= n):
                     raise LookError(f"direction: {where}.{key} が行番号（1〜{n}）ではありません")
+            if ap["until_line"] <= ap["after_line"]:
+                raise LookError(f"direction: {where} は until_line が after_line より後の行でなければなりません（空の区間）")
         if "at_fraction" in ap and (not _num(ap["at_fraction"]) or not 0 <= ap["at_fraction"] <= 1):
             raise LookError(f"direction: {where}.at_fraction は 0〜1 で書いてください")
         if isinstance(ap.get("count"), bool) or not isinstance(ap.get("count"), int) or ap["count"] < 1:
@@ -627,6 +636,12 @@ def load_direction(cache_dir):
     path = direction_path(cache_dir)
     if not path.exists():
         return None
+    return load_direction_file(path)
+
+
+def load_direction_file(path):
+    """direction の JSON を読み、形（n_lines・lines）を確かめる。--direction-from が、置く前に検査するために使う。"""
+    path = Path(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not isinstance(data.get("n_lines"), int):
         raise LookError(f"direction: {path.name} に整数の n_lines がありません")

@@ -553,13 +553,14 @@ class Counter:
       "off"     行の開始で全部取り除く
       辞書      count（バッジの個数にそろえる。足りない分は 0 から行の開始で出る）／ enter: push（1個、行の開始で押し入る）／
                 rate（per_word | per_word_x2。以後の行にも続く）／ state（run | dim。以後の行にも続く）／
-                break（全バッジを割る。割れ始め ＝ max(行の最初の単語の開始, 行の開始)）
+                break（全バッジを割る。割れ始め ＝ 切り替えのフレーム（その行が実際に描かれる最初のフレーム））
       指定なし  直前の状態のまま（出ていれば、この行の単語でも増える）
     最上位 counter.appear は、新しいバッジを 0 から出す（それまでのバッジは取り除く）。単語の無い区間なので、
     次の行の開始までは beats のオンセットごとに +1。"""
 
-    def __init__(self, plan, spec, beats, cfg):
+    def __init__(self, plan, spec, beats, cfg, switch=None):
         self.plan = plan
+        self.switch = switch or {}   # 行番号 → 切り替えのフレーム（次の行が実際に描かれる最初のフレーム。割れの始まり）
         self.spec = spec or {}
         self.beats = sorted(float(b) for b in (beats or []))
         self.cfg = cfg
@@ -583,8 +584,12 @@ class Counter:
             if "at" in ap:
                 t = float(ap["at"])
             else:
-                a = float(self.plan[ap["after_line"] - 1]["end"])
-                b = float(self.plan[ap["until_line"] - 1]["start"])
+                from kinetic import resolve_span
+
+                a, b = resolve_span(self.plan, ap)
+                if b <= a:
+                    from look import LookError
+                    raise LookError(f"counter.appear: 行{ap['after_line']}の終わり {a:.2f} 秒から行{ap['until_line']}の開始 {b:.2f} 秒までが空の区間です")
                 t = a + (b - a) * float(ap.get("at_fraction", 0.5))
             out.append({"t": t, "count": int(ap["count"])})
         return sorted(out, key=lambda e: e["t"])
@@ -661,8 +666,8 @@ class Counter:
                         new_badge(t0)
                 brk = spec.get("break")
                 if brk:
-                    words = c.get("counter_words") or []
-                    tb = max(float(words[0]) if words else t0, t0)
+                    # 割れの始まり ＝ 切り替えのフレーム（背景の配色が替わるのと同じフレーム。動き §10-8 ①）。無ければ行の開始
+                    tb = float(self.switch.get(c["index"], t0))
                     for b in alive:
                         b["break"] = (tb, int(brk["crack_f"]), int(brk["fall_f"]))
                         b["t_end"] = tb + (int(brk["crack_f"]) + int(brk["fall_f"])) / COUNTER_FPS
@@ -675,6 +680,10 @@ class Counter:
                 for tw in c.get("counter_words") or []:
                     for b in alive:
                         b["incs"].append((float(tw), step))
+        if ai < len(appear):
+            # 出現は行の開始ごとに処理する。最後の行の開始より後の時刻は誰にも処理されず、黙って無視されるので止める
+            raise LookError(f"counter.appear: 時刻 {appear[ai]['t']:.2f} 秒が最後の行の開始 {float(self.plan[-1]['start']):.2f} 秒より後です"
+                            f"（出現は行の開始で処理するため、このままでは無視されます）。止めました")
         dims.sort(key=lambda x: x[0])
         most = 0
         for b in badges:
