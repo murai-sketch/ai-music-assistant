@@ -277,6 +277,10 @@ def key_kanji(text):
 # ---------------------------------------------------------------------------
 # 背景の装飾
 
+# direction の decor で名指しできる名前（Decor の _<名前> メソッドと一致させる。look.validate_direction が検査する）
+DECOR_NAMES = ("wall", "tunnel", "rings", "tape", "radial", "sparkle", "kanji")
+
+
 class Decor:
     def __init__(self, fonts):
         self.fonts = fonts
