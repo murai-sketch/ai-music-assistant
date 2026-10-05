@@ -1,0 +1,63 @@
+{
+ "look": "ink-white",
+ "fonts": {
+  "tsubu": {
+   "family": "Hiragino Sans",
+   "style": "W3",
+   "index": 0,
+   "fallback_path": "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+   "tracking": 0.0,
+   "leading": 1.12,
+   "min_px": 60,
+   "max_px": 220
+  },
+  "read_v": {
+   "family": "YuMincho",
+   "style": "Demibold",
+   "index": 1,
+   "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/99517f5220d46dff05d0dbb2a22d0036afefb089.asset/AssetData/YuMincho.ttc",
+   "tracking": 0.0,
+   "leading": 1.2,
+   "min_px": 60,
+   "max_px": 220
+  },
+  "quiet": {
+   "family": "Hiragino Mincho ProN",
+   "style": "W3",
+   "index": 0,
+   "fallback_path": "/System/Library/Fonts/ヒラギノ明朝 ProN.ttc",
+   "tracking": 0.0,
+   "leading": 1.12,
+   "min_px": 60,
+   "max_px": 220
+  },
+  "bunkyu": {
+   "family": "Toppan Bunkyu Mincho",
+   "style": "Regular",
+   "index": 0,
+   "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/a35803b18dea500ee1e426f403635efbe5a84bd4.asset/AssetData/ToppanBunkyuMinchoPr6N-Regular.otf",
+   "tracking": 0.06,
+   "leading": 1.25,
+   "min_px": 96,
+   "max_px": 220
+  }
+ },
+ "palettes": {
+  "ink_white": {
+   "bg": "#FCFBF8",
+   "text": "#111111",
+   "stroke": "#FCFBF8",
+   "sub": "#5C5C5C",
+   "accent": "#111111"
+  }
+ },
+ "default_role": "tsubu",
+ "default_palette": "ink_white",
+ "layout": {
+  "text_width": 896
+ },
+ "texture": {
+  "paper": "plain",
+  "bg_image": false
+ }
+}

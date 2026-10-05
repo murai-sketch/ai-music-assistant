@@ -1,0 +1,42 @@
+{
+ "look": "demo-dark",
+ "fonts": {
+  "heavy": {
+   "family": "Hiragino Sans",
+   "style": "W9",
+   "index": 0,
+   "fallback_path": "/System/Library/Fonts/ヒラギノ角ゴシック W9.ttc",
+   "tracking": 0.0,
+   "leading": 1.12,
+   "min_px": 60,
+   "max_px": 220
+  },
+  "quiet": {
+   "family": "Hiragino Mincho ProN",
+   "style": "W3",
+   "index": 0,
+   "fallback_path": "/System/Library/Fonts/ヒラギノ明朝 ProN.ttc",
+   "tracking": 0.0,
+   "leading": 1.12,
+   "min_px": 60,
+   "max_px": 220
+  }
+ },
+ "palettes": {
+  "dark": {
+   "bg": "#0B0B0F",
+   "text": "#FFFFFF",
+   "stroke": "#0B0B0F",
+   "accent": "#FF3B70"
+  }
+ },
+ "default_role": "heavy",
+ "default_palette": "dark",
+ "layout": {
+  "text_width": 896
+ },
+ "texture": {
+  "paper": "plain",
+  "bg_image": false
+ }
+}

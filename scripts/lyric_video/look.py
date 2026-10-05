@@ -264,12 +264,20 @@ def direction_path(cache_dir):
 # direction の行の項目（許可リスト）。別名は読み込み時に正式名へ直す（動き §2 R2 は余韻を tail_sec と書く）。
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
-                  "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px"}
+                  "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow")
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
-                      "impacts", "slam_voice", "karaoke", "counter", "interludes"}
+                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical"}
+VERTICAL_KEYS = {"height", "top", "kana_shift"}   # kana_shift: 小書きの仮名を右上へ寄せる量（字の大きさの割合。既定 0＝寄せない）
+import kinetic_vertical as _kv   # noqa: E402（定数だけ。kinetic_vertical は look を遅延 import するので循環しない）
+
+VERTICAL_ENTRANCES = _kv.ENTRANCES   # 縦組みの行で使える入り（字ごとに動くもの。描画側 _Cut も同じ定数を見る）
+LIGHT_BAD_ENTRANCES = ("neon",)                 # 明るい地で合わない部品（光が見えない）
+LIGHT_BAD_DECOR = ("tape",)                     # 字が暗い色で固定
+LIGHT_BAD_TEXTURES = ("misregister", "long_shadow")   # 色が要る
+MAX_COL_CHARS_RANGE = (2, 16)
 LAND_MODES = ("first_word", "start")
 COUNTER_STATES = ("hide", "resume", "off")
 COUNTER_KEYS = {"count", "state", "rate", "enter", "break"}
@@ -277,13 +285,13 @@ COUNTER_TOP_KEYS = {"appear", "voices"}
 APPEAR_KEYS = {"at", "after_line", "until_line", "at_fraction", "count", "rate"}
 INTERLUDE_KEYS = {"start", "after_line", "end", "until_line", "until", "kind", "zoom_peak", "zoom_ramp"}
 INTERLUDE_KINDS = ("duotone",)
-COUNTER_MIN_CONTRAST = 4.5   # カウンター（副要素）の下限。最悪の背景（背景+10）に対して（設計書 §4）
+COUNTER_MIN_CONTRAST = 4.5   # カウンター（副要素）の下限。最悪の背景（背景+10。明るい地は −10）に対して（設計書 §4）
 IMPACT_KEYS = ("overshoot", "land_frames", "undershoot", "glyph_shake_px", "zoom", "screen_shake_px")
 IMPACT_OPTIONAL_KEYS = ("ease",)    # 任意。縮み方（linear が既定／quad）
 IMPACT_EASES = ("linear", "quad")
 KARAOKE_KEYS = {"unlit_opacity", "light_frames", "keyword_unlit", "min_match", "min_cover"}
 SLAM_MAX_LINES = 8         # slam の行数の上限（動き §9-7 ③）
-UNLIT_MIN_CONTRAST = 5.0   # karaoke の未点灯（bg+10 の最悪の背景）の下限（書体配色 §11.4）
+UNLIT_MIN_CONTRAST = 5.0   # karaoke の未点灯（bg+10 の最悪の背景。明るい地は −10）の下限（書体配色 §11.4）
 GLOW_MIN_CONTRAST = 7.0    # glow を重ねた背景に対する文字の下限（書体配色 §11.3）
 
 
@@ -303,6 +311,9 @@ def _normalize_item(item, allowed, where):
             raise LookError(f"direction: {where} の '{k}' は 0 以上の数値で書いてください")
         if name in ("voice", "exit", "entrance", "layout", "hold", "decor", "role", "palette", "accent", "impact") and not isinstance(v, str):
             raise LookError(f"direction: {where} の '{k}' は文字列で書いてください")
+        if name == "max_col_chars" and (isinstance(v, bool) or not isinstance(v, int)
+                                        or not MAX_COL_CHARS_RANGE[0] <= v <= MAX_COL_CHARS_RANGE[1]):
+            raise LookError(f"direction: {where} の max_col_chars は {MAX_COL_CHARS_RANGE[0]}〜{MAX_COL_CHARS_RANGE[1]} の整数で書いてください")
         if name in ("max_px", "tracking", "min_px") and (isinstance(v, bool) or not isinstance(v, (int, float))
                                                          or (name in ("max_px", "min_px") and v <= 0)):
             raise LookError(f"direction: {where} の '{k}' は数値で書いてください")
@@ -395,10 +406,19 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} の role '{item['role']}' がテーマの fonts にありません")
             if item.get("palette") is not None and item["palette"] not in theme["palettes"]:
                 raise LookError(f"direction: 行{n} の palette '{item['palette']}' がテーマの palettes にありません")
-            if item.get("layout") == "vertical":
-                raise LookError(f"direction: 行{n} の layout 'vertical'（縦組み）はテーマを使う曲では使えません")
             if item.get("accent") == "glow" and "glow" not in (theme.get("parts") or {}):
                 raise LookError(f"direction: 行{n} は accent: glow ですが、テーマに parts.glow がありません")
+        if item.get("decor") is not None:
+            import kinetic_fx   # 遅延 import（kinetic_fx → look の向きを作らない）
+
+            if item["decor"] not in kinetic_fx.DECOR_NAMES:
+                raise LookError(f"direction: 行{n} の decor '{item['decor']}' は未対応です（{', '.join(kinetic_fx.DECOR_NAMES)}）")
+        if item.get("max_col_chars") is not None and item.get("layout") != "vertical":
+            raise LookError(f"direction: 行{n} の max_col_chars は layout: vertical の行だけに書けます")
+        if item.get("layout") == "vertical":
+            if item.get("entrance", "cut") not in VERTICAL_ENTRANCES:
+                raise LookError(f"direction: 行{n} は縦組みですが、入り '{item.get('entrance')}' は縦組みでは使えません"
+                                f"（使える入り: {', '.join(VERTICAL_ENTRANCES)}）。横向きの動き・slam は止めました")
         if item.get("entrance") == "karaoke":
             if theme is None:
                 raise LookError(f"direction: 行{n} の entrance karaoke はテーマを使う曲でだけ使えます（未点灯の色をテーマの配色から決めます）")
@@ -411,6 +431,21 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} の impact '{item['impact']}' が impacts にありません"
                                 f"（{', '.join(sorted(direction.get('impacts') or {})) or 'impacts なし'}）")
     _validate_stage3(direction, by_line, theme)
+    vt = direction.get("vertical")
+    if vt is not None:
+        if not isinstance(vt, dict) or not vt or not set(vt) <= VERTICAL_KEYS:
+            raise LookError(f'direction: vertical は {{"height": px, "top": px, "kana_shift": 割合}} の形で書いてください（使える項目: {", ".join(sorted(VERTICAL_KEYS))}）')
+        for k, v in vt.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise LookError(f"direction: vertical.{k} は数値で書いてください")
+        ks = vt.get("kana_shift", 0)
+        if not 0 <= ks <= 0.3:
+            raise LookError("direction: vertical.kana_shift は 0〜0.3（字の大きさの割合）で書いてください")
+        import kinetic_vertical   # 遅延 import（組版の既定値と同じ1か所を使う）
+
+        top, height = vt.get("top", kinetic_vertical.DEFAULT_TOP), vt.get("height", kinetic_vertical.DEFAULT_H)
+        if height < 300 or top < 70 or top + height > 1850:
+            raise LookError(f"direction: vertical の範囲（top {top}・height {height}）が画面に収まりません（height 300 以上、top 70 以上、top+height 1850 以下）")
     if theme is not None:
         for voice, spec in vdefaults.items():
             if spec.get("role") is not None and spec["role"] not in theme["fonts"]:
@@ -620,15 +655,31 @@ def over(fg, bg, a):
     return tuple(int(round(b[i] + (f[i] - b[i]) * a)) for i in range(3))
 
 
+def worst_sign(fg, bg):
+    """紙の微粒子（各チャンネル ±n）のうち、比が下がる側の向き。文字（fg）のほうへ背景が寄る側。
+    文字が背景より明るい（暗い地）なら +1、暗い（明るい地）なら −1。同じ明るさなら +1（今までの値）"""
+    return 1 if _rel_lum(fg) >= _rel_lum(bg) else -1
+
+
+def worst_bg(fg, bg, a=1.0, n=10):
+    """最悪の背景の色：紙の微粒子で比が下がる側（worst_sign）に ±n ずらした背景。暗い地では今までと同じ bg+n"""
+    return lift(bg, n * worst_sign(fg, bg))
+
+
 def worst_contrast(fg, bg, a):
-    """最悪の背景に対する比の定義：contrast(over(fg, bg, a), bg+10)。
-    文字（バッジ）は名目の背景 bg の上で重ね、比べる背景は紙の微粒子で各チャンネル +10 明るくなった背景"""
-    return contrast(over(fg, bg, a), lift(bg))
+    """最悪の背景に対する比の定義：contrast(over(fg, bg, a), worst_bg(fg, bg, a))。
+    文字（バッジ）は名目の背景 bg の上で重ね、比べる背景は紙の微粒子で比が下がる側（暗い地は +10、明るい地は −10）にずれた背景"""
+    return contrast(over(fg, bg, a), worst_bg(fg, bg, a))
 
 
 def lift(bg, n=10):
-    """紙の微粒子の最悪側の背景（各チャンネル +n）"""
-    return tuple(min(c + n, 255) for c in _rgb(bg))
+    """紙の微粒子で各チャンネルを n ずらした背景（n が負なら暗くなる側。0〜255 に収める）"""
+    return tuple(min(max(c + n, 0), 255) for c in _rgb(bg))
+
+
+def is_light_palette(pal):
+    """明るい地（背景が文字より明るい）の配色の組か"""
+    return _rel_lum(pal["bg"]) > _rel_lum(pal["text"])
 
 
 def load_direction(cache_dir):

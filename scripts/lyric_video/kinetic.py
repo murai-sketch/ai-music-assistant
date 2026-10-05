@@ -43,6 +43,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 import kinetic_bg
 import kinetic_fx
+import kinetic_vertical
 
 VIDEO_SIZE = (1080, 1920)
 FPS = 30
@@ -703,7 +704,7 @@ def plan_to_markdown(plan, header=None):
     sung = any("sung_end" in c for c in plan)
     voiced = any("voice" in c for c in plan)
     looked = any("font_role" in c for c in plan)
-    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo"))
+    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset"))
     head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     if voiced:
@@ -750,6 +751,8 @@ def plan_to_markdown(plan, header=None):
                         f"{k}={'割れ' if k == 'break' else v}" for k, v in sp.items()))
             if c.get("solo"):
                 bits.append("solo")
+            if c.get("vertical_typeset"):
+                bits.append(f"縦組み(vert) {len(c['rows'])}段 {c.get('vertical_size')}px")
             bits.extend(c.get("marks") or [])
             row += " " + "；".join(bits) + " |"
         if sung:
@@ -848,6 +851,76 @@ class _Sprites:
             )
             g = (img, l, t, font.getlength(ch))
             self.base[key] = g
+        return g
+
+    def glyph_v(self, unit, font_path, size, fill, stroke, stroke_w, kana_shift=0.0):
+        """縦組み用の1マス（direction で layout: vertical を指定した行だけ）。返り値は glyph と同じ形 (画像, l, t, 送り) だが、
+        l・t は字の枠（size × size のマス）の左上からのインクの位置（負もありうる）。ttb の getbbox は字のインクでなく枠を返すので、
+        枠の大きさの画面に描いてからインクで切り抜き、枠の中の位置を控える。字形は OpenType の vert（raqm）。
+        unit: 1字、または縦中横の2字。—（U+2014）は vert で替わらないので横に描いて90°回す。
+        kana_shift: 小書きの仮名を右上へ寄せる量（字の大きさの割合。既定 0）"""
+        key = ("v", unit, font_path, size, fill, stroke, stroke_w, kana_shift)
+        g = self.base.get(key)
+        if g is not None:
+            return g
+        kinetic_vertical.need_raqm()
+        font = self.fonts.get(font_path, size)
+        fillc, strokec = _hex(fill) + (255,), _hex(stroke) + (255,)
+        cw = size * 3
+        canvas = Image.new("RGBA", (cw, 5 * size + size // 2), (0, 0, 0, 0))
+        d = ImageDraw.Draw(canvas)
+        ox = oy = None     # インクを置く枠の中の位置（None なら縦に描いた画の位置から求める）
+        if len(unit) == 2:
+            # 縦中横：横に描いて、枠の幅に合わせて横だけ縮める。枠の中央に置く
+            d.text((size, size), unit, font=font, fill=fillc, stroke_width=stroke_w, stroke_fill=strokec)
+            bb = canvas.getchannel("A").getbbox()
+            im = canvas.crop(bb) if bb else Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            if im.width > size:
+                im = im.resize((size, im.height), Image.LANCZOS)
+            ox, oy = (size - im.width) / 2, (size - im.height) / 2
+        elif unit == "\u2014":
+            d.text((size, size), unit, font=font, fill=fillc, stroke_width=stroke_w, stroke_fill=strokec)
+            bb = canvas.getchannel("A").getbbox()
+            im = canvas.crop(bb).rotate(-90, expand=True) if bb else Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            ox, oy = (size - im.width) / 2, (size - im.height) / 2
+        else:
+            # PIL の ttb は、列に含まれる字の横の箱を合わせた範囲の中心を軸にする。1字だけで描くと、字形が右へ寄った約物（、。っ）が
+            # 中央に戻り、基準字と組むと「基準字ごと」列が左へずれる。そこで 基準字（国）・全角空白・描く字 の列を描き、
+            # 基準字だけで描いたときの位置との差 dx（＝列のずれ）を測って引く（基準字の位置で合わせる）。
+            # 基準字と字は全角空白の1マスで離れるので、字の縁が基準字に重ならず、引き算も切り取りも要らない（縁は枠の外へ出てよい）。
+            ref = kinetic_vertical.REF_CHAR
+            sep = kinetic_vertical.SEP_CHAR
+            split = int(size * 2.5)                      # 基準字（〜2.5マス）と字（3マス〜）の境の行
+            rk = ("vref", font_path, size, stroke_w)
+            rb = self.base.get(rk)
+            if rb is None:
+                refcv = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+                ImageDraw.Draw(refcv).text((cw / 2, size), ref, font=font, fill=fillc, stroke_width=stroke_w, stroke_fill=strokec,
+                                           direction="ttb", features=["vert"], anchor="mt")
+                spcv = Image.new("L", canvas.size, 0)
+                ImageDraw.Draw(spcv).text((cw / 2, size), sep, font=font, fill=255, direction="ttb", features=["vert"], anchor="mt")
+                if spcv.getbbox() or not refcv.getchannel("A").getbbox():
+                    from look import LookError
+                    raise LookError(f"縦組み: この書体には全角空白（U+3000）か基準字「{ref}」の字形がありません。字の位置を測れないので止めました")
+                rb = self.base[rk] = refcv.getchannel("A").getbbox()[0]
+            d.text((cw / 2, size), ref + sep + unit, font=font, fill=fillc, stroke_width=stroke_w, stroke_fill=strokec,
+                   direction="ttb", features=["vert"], anchor="mt")
+            alpha = canvas.getchannel("A")
+            top = alpha.crop((0, 0, cw, split)).getbbox()
+            dx = (top[0] - rb) if top else 0            # 列が基準字だけのときより右へずれた量
+            low = canvas.crop((0, split, cw, canvas.height))
+            bb = low.getchannel("A").getbbox()
+            if bb:
+                im = low.crop(bb)
+                ox, oy = bb[0] - dx - (cw / 2 - size / 2), split + bb[1] - 3 * size
+                if unit in kinetic_vertical.SMALL_KANA and kana_shift:
+                    ox += kana_shift * size
+                    oy -= kana_shift * size
+            else:
+                im = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+                ox = oy = size / 2
+        g = (im, ox, oy, size * kinetic_vertical.PITCH)
+        self.base[key] = g
         return g
 
     def outlined(self, ch, font_path, size, fill, outline):
@@ -983,6 +1056,13 @@ class _Cut:
         level = cut["level"]
         rows = cut["rows"]
         vertical = cut["layout"] == "vertical"
+        vt = vertical and bool(cut.get("vertical_typeset"))   # direction で指定した縦組み（新しい組版。従来の縦組みは vt=False のまま）
+        if vt and (cut.get("profile_kids") or cut.get("entrance") == "neon"):
+            raise RuntimeError(f"行{cut['index']}: 縦組み（vert）は子ども向けの書体・neon の入りには使えません")
+        if vt and cut.get("entrance", "cut") not in kinetic_vertical.ENTRANCES:
+            raise RuntimeError(f"行{cut['index']}: 縦組み（vert）では入り '{cut.get('entrance')}' は使えません"
+                               f"（使える入り: {', '.join(kinetic_vertical.ENTRANCES)}）")
+        kana_shift = float(cut.get("vertical_kana_shift", 0.0))
         font_path = FONT_QUIET if level == 1 else FONT_HEAVY
         if cut.get("profile_kids"):
             font_path = FONT_KIDS
@@ -1036,7 +1116,10 @@ class _Cut:
                     cap = 400 if n == 1 else 340 if n <= 2 else 300 if n <= 3 else 260
             return max(min(int(budget / n), cap), 60)
 
-        if look is not None:
+        if vt:
+            # 縦組み（vert）：段の切り方と大きさはプランを作るときに決めてある（kinetic_vertical.arrange）。全段を同じ大きさに
+            sizes = [int(cut["vertical_size"])] * len(rows)
+        elif look is not None:
             # 役の書体：字間・行送り・上限下限 px。下限を割ったら改行を増やして組み直す（縮小で収めない）。
             # 全段を同じ大きさにする（段ごとの大きさの差は使わない）
             rows, size_each, self.look_notes = self._fit_look_rows(rows, look, cut, sprites)
@@ -1088,6 +1171,9 @@ class _Cut:
                 return sprites.outlined(draw_ch, fpath, gsize, fill, "#FFFFFF"), ("outlined", draw_ch, fpath, gsize, fill)
             if neon:
                 return sprites.neon(draw_ch, fpath, gsize, accent if fill == accent else "#FF5FA2"), ("neon", draw_ch, fpath, gsize, fill)
+            if vt:
+                return (sprites.glyph_v(draw_ch, fpath, gsize, fill, stroke, sw, kana_shift),
+                        ("v", draw_ch, fpath, gsize, fill, stroke, sw, kana_shift))
             return sprites.glyph(draw_ch, fpath, gsize, fill, stroke, sw), (draw_ch, fpath, gsize, fill, stroke, sw)
 
         # 段ごとに、最後の段（またはHookの末尾2文字）をアクセント色にする
@@ -1098,12 +1184,16 @@ class _Cut:
         row_hs = [sz * (look["leading"] if look is not None else 1.1) for sz in sizes]
         total_h = sum(row_hs)
         y_cursor = -total_h / 2
+        if vt:
+            vt_top = -max(kinetic_vertical.row_extent(r) for r in rows) * sizes[0] * kinetic_vertical.PITCH / 2   # 段の頭をそろえる
         for ri, row in enumerate(rows):
             rsize = sizes[ri]
             stroke_w = max(rsize // 24, 3) if palette_bg is None else max(rsize // 40, 2)
             row_h = rsize * 1.12
             accent_row = len(rows) >= 2 and ri == len(rows) - 1
-            if vertical:
+            if vt:
+                pass
+            elif vertical:
                 x0 = -(len(rows) - 1) * row_h / 2 + (len(rows) - 1 - ri) * row_h - rsize / 2
                 y = -len(row) * rsize * 1.02 / 2
             else:
@@ -1124,25 +1214,27 @@ class _Cut:
                     x = -row_w / 2
                 y0 = y_cursor
                 y_cursor += row_hs[ri]
-            for ci, ch in enumerate(row):
+            cells = kinetic_vertical.units_of(row) if vt else [(c_, i_) for i_, c_ in enumerate(row)]
+            for ci, (ch, ci0) in enumerate(cells):
+                unit_first = flat_i
                 if look is not None:
                     # テーマの差し色の付け方（accent_mode）。段の最後・末尾2文字を差し色にする既存の規則は使わない
                     mode = cut.get("accent_mode", "none")
-                    is_accent = mode == "fill" or (mode == "key_word" and flat_i in cut_accent_idx)
+                    is_accent = mode == "fill" or (mode == "key_word" and any((flat_i + d) in cut_accent_idx for d in range(len(ch))))
                 elif emphasis:
                     is_accent = flat_i in emph_idx
                 else:
                     if latin:
                         # 欧文は末尾2文字ではなく最後の1語を差し色に
-                        is_accent = accent_row or (level == 3 and len(rows) == 1 and " " in row and ci > row.rfind(" "))
+                        is_accent = accent_row or (level == 3 and len(rows) == 1 and " " in row and ci0 > row.rfind(" "))
                     else:
-                        is_accent = accent_row or (level == 3 and len(rows) == 1 and len(row) >= 4 and ci >= len(row) - 2)
-                flat_i += 1
+                        is_accent = accent_row or (level == 3 and len(rows) == 1 and len(row) >= 4 and ci0 >= len(row) - 2)
+                flat_i += len(ch)
                 fill = accent if is_accent else text_color
                 stroke = stroke_color
                 if is_accent and palette_bg is not None and _hex(accent) == _hex(stroke_color):
                     stroke = text_color
-                draw_ch = VERTICAL_MAP.get(ch, ch) if vertical else ch
+                draw_ch = ch if vt else VERTICAL_MAP.get(ch, ch) if vertical else ch
                 gsize = rsize if vertical else csize(ch)
                 gsw = max(gsize // 24, 3) if palette_bg is None else max(gsize // 40, 2)
                 if look is not None:
@@ -1156,7 +1248,12 @@ class _Cut:
                     alt = (alt_key, alt_g[0])
                 img, l, t, adv = g
                 w, h = img.size
-                if vertical:
+                if vt:
+                    # 字の枠（マス）で揃える。マスの中心から、枠の中のインクの位置（l・t）の分だけずらした画像の中心
+                    cx = ((len(rows) - 1) / 2 - ri) * rsize * kinetic_vertical.COL_PITCH + (l + w / 2 - rsize / 2)
+                    cy = vt_top + (ci + 0.5) * rsize * kinetic_vertical.PITCH + (t + h / 2 - rsize / 2)
+                    angle = 0
+                elif vertical:
                     cx = x0 + rsize / 2
                     cy = y + rsize * 1.02 * ci + rsize / 2
                     angle = 0
@@ -1174,13 +1271,15 @@ class _Cut:
                         cy = cy - arc_r * (1 - math.cos(theta)) * (1 if ri % 2 == 0 else -1)
                         angle = -math.degrees(theta) * (1 if ri % 2 == 0 else -1)
                 mis = []
-                for mc in mis_colors:
+                for mc in ([] if vt else mis_colors):
                     mg = sprites.glyph(draw_ch, font_path, gsize, mc, mc, gsw)
                     mis.append(((draw_ch, font_path, gsize, mc, mc, gsw), mg[0]))
                 glyphs.append({
                     "key": key, "img": img, "cx": cx, "cy": cy, "order": order, "row": ri,
                     "angle": angle, "mis": mis,
                 })
+                if vt:
+                    glyphs[-1]["ct"] = unit_first + len(ch) - 1   # karaoke の点灯は、縦中横の2字のうち遅いほうの時刻
                 if alt is not None:
                     glyphs[-1]["alt"] = alt
                 if look is not None and cut.get("accent_mode") == "glow":
@@ -1227,6 +1326,9 @@ class _Cut:
             self.anchor = (VIDEO_SIZE[0] * ANCHOR_X["left"], VIDEO_SIZE[1] * (ty - ANCHOR_DY))
         elif cut["layout"] == "right":
             self.anchor = (VIDEO_SIZE[0] * ANCHOR_X["right"], VIDEO_SIZE[1] * (ty + ANCHOR_DY))
+        elif vt:
+            self.anchor = (VIDEO_SIZE[0] / 2, float(cut.get("vertical_top", kinetic_vertical.DEFAULT_TOP))
+                           + float(cut.get("vertical_h", kinetic_vertical.DEFAULT_H)) / 2)
         elif cut["layout"] == "vertical":
             self.anchor = (VIDEO_SIZE[0] * (0.68 if cut["index"] % 2 else 0.32), VIDEO_SIZE[1] * (ty - 0.04))
         else:
@@ -1424,7 +1526,7 @@ class _Cut:
         if ct is None:
             q = 1.0
         else:
-            q = min(max((cut["start"] + tl - ct[g["order"]]) * FPS / self.light_frames, 0.0), 1.0)
+            q = min(max((cut["start"] + tl - ct[g.get("ct", g["order"])]) * FPS / self.light_frames, 0.0), 1.0)
         u = self.unlit
         if "alt" in g:
             return f_in * u * (1.0 - q), f_in * q
@@ -2745,7 +2847,7 @@ class KineticRenderer:
         return max(c["end"], self._shown_by_row.get(c["index"], c["end"]))
 
     def counter_contrast(self):
-        """カウンターの比（最悪の背景：背景+10。間奏の duotone をかけた後の色で）。{行: (最小の比, そのときの不透明度)}
+        """カウンターの比（最悪の背景：背景+10。明るい地は −10。間奏の duotone をかけた後の色で）。{行: (最小の比, そのときの不透明度)}
         消えていく途中・割れの落下は装飾として除く（読ませる対象ではない）"""
         import look as look_mod
 
@@ -2762,14 +2864,15 @@ class KineticRenderer:
             for st in self.counter.states(t):
                 if st["phase"] == "fall":
                     continue
-                r = look_mod.contrast(look_mod.over(accent, self.effective_bg(t, 0), st["alpha"]), self.effective_bg(t, 10))
+                r = look_mod.contrast(look_mod.over(accent, self.effective_bg(t, 0), st["alpha"]),
+                                      self.effective_bg(t, 10 * look_mod.worst_sign(accent, self.effective_bg(t, 0))))
                 row = self.plan[max(bisect.bisect_right(self.starts, t) - 1, 0)]["index"]
                 if row not in out or r < out[row][0]:
                     out[row] = (r, st["alpha"])
         return out
 
     def extended_contrast(self):
-        """延ばす間（次の行の開始から切り替えのフレームまで）の、前の行の文字と、そのときの背景（bg+10。切り替えの前なので前の行の
+        """延ばす間（次の行の開始から切り替えのフレームまで）の、前の行の文字と、そのときの背景（bg+10。明るい地は −10。切り替えの前なので前の行の
         配色のまま）のコントラスト比。{前の行の番号: (最小の比, 延ばしたフレーム数)}。延ばしたフレームが無い行は入らない（動き §10-8 ①）"""
         import look as look_mod
 
@@ -2783,7 +2886,8 @@ class KineticRenderer:
             cols = [self.cuts[j].colors[0]]
             if c.get("accent_mode") in ("fill", "key_word"):
                 cols.append(self.cuts[j].colors[2])
-            ratios = [look_mod.contrast(col, self.effective_bg(k / FPS, 10)) for k in range(k0, k1) for col in cols]
+            ratios = [look_mod.contrast(col, self.effective_bg(k / FPS, 10 * look_mod.worst_sign(col, self.effective_bg(k / FPS, 0))))
+                      for k in range(k0, k1) for col in cols]
             if ratios:
                 out[c["index"]] = (min(ratios), k1 - k0)
         return out
@@ -2886,6 +2990,10 @@ class KineticRenderer:
                "比は WCAG 2.x（look.contrast）。最悪の背景 ＝ 背景色の各チャンネル +10（紙の微粒子）。歌詞は書かない。", "",
                "| 行 | 役 | 配色 | 背景色 | 文字色 | 主文字の比（点灯） | 未点灯の比（bg+10） | glow の比 | カウンターの比（最小） | 寄り 段階/上限 | 黄緑の出る区間 | 琥珀の出る区間 | 同時 | 延ばす間の文字比（最小・フレーム数） |",
                "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        if any(look_mod.is_light_palette(self.theme["palettes"][c["bg"]]) for c in self.plan):
+            # 明るい地の組があるときだけ注記（暗い地だけの曲の出力は変えない）
+            out[4:4] = ["**明るい地の組（背景が文字より明るい）では、最悪の背景は各チャンネル −10 側**（見出しの「+10」は暗い地の向き）。"
+                        "値は向きに合わせて計算してある。", ""]
         for c in self.plan:
             pal = self.theme["palettes"][c["bg"]]
             main = look_mod.worst_contrast(pal["text"], pal["bg"], 1.0)
@@ -3098,8 +3206,8 @@ class KineticRenderer:
         return apply_interlude_effect(frame, sp["kind"], st, t, 0, 0.0, self._duotone_colors(t), scanlines=False)
 
     def effective_bg(self, t, lift=0):
-        """間奏の duotone をかけた後の、背景の1画素の色（lift ＝ 紙の微粒子で明るくなった分）。効果の外では背景色（＋lift）そのまま"""
-        px = np.array([min(int(round(v)) + lift, 255) for v in self.bg_color_at(t)], dtype=np.float32)
+        """間奏の duotone をかけた後の、背景の1画素の色（lift ＝ 紙の微粒子でずれた分。比が下がる側へ ±10。暗い地は +10、明るい地は −10）。効果の外では背景色（＋lift）そのまま"""
+        px = np.array([min(max(int(round(v)) + lift, 0), 255) for v in self.bg_color_at(t)], dtype=np.float32)
         sp, st = self._interlude_at(t)
         if sp is None or st <= 0.01:
             return tuple(int(v) for v in px)
@@ -3354,7 +3462,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
         for r, c in enumerate(chunk):
             d.text((6, r * thumb_h + 8), f"#{c['index']}", font=label_font, fill=(255, 255, 255))
             d.text((6, r * thumb_h + 40), c["motion"][:7], font=label_font, fill=(200, 200, 200))
-            d.text((6, r * thumb_h + 70), c["layout"][:7], font=label_font, fill=(200, 200, 200))
+            d.text((6, r * thumb_h + 70), (c["layout"][:7] + ("+vt" if c.get("vertical_typeset") else "")), font=label_font, fill=(200, 200, 200))
             dur = c["end"] - c["start"]
             first_frame = ENTRANCE_FRAMES.get(c["entrance"], 6) / FPS
             for k, fr in enumerate(fractions):
@@ -3618,6 +3726,11 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             if it["layout"] not in LAYOUTS:
                 raise RuntimeError(f"direction 行{c['index']}: 構図 '{it['layout']}' は未対応です")
             c["layout"] = it["layout"]
+            if it["layout"] == "vertical":
+                # direction で縦組みを指定した行だけ新しい組版（vert）。自動の構図選びで vertical になった行は従来の描き方のまま
+                c["vertical_typeset"] = "vert"
+                if it.get("max_col_chars") is not None:
+                    c["max_col_chars"] = it["max_col_chars"]
         if it.get("hold") is not None:
             if it["hold"] not in HOLD_MOTIONS + ("heartbeat",):
                 raise RuntimeError(f"direction 行{c['index']}: 保持 '{it['hold']}' は未対応です")
@@ -3724,6 +3837,65 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
     return plan
 
 
+def arrange_vertical(plan, direction, theme, vdefaults, words=None, use_lcs=False, notes=None):
+    """direction で縦組みを指定した行（vertical_typeset）の、段の切り方と字の大きさを決めてプランに書く（rows・vertical_size・
+    vertical_top・vertical_h・vertical_kana_shift）。段の切れ目は break_after があればそれ、無ければ単語の切れ目
+    （単語時刻が無ければ字種の変わり目）。禁則・ぶら下げ・縦中横は kinetic_vertical。下限を割るなら段を増やし、それでも割るなら止める"""
+    import re
+    import look
+
+    marked = [c for c in plan if c.get("vertical_typeset")]
+    if not marked:
+        return
+    kinetic_vertical.need_raqm()
+    items = _direction_items(direction, len(plan)) if direction is not None else [{} for _ in plan]
+    vspec = (direction or {}).get("vertical") or {}
+    top = float(vspec.get("top", kinetic_vertical.DEFAULT_TOP))
+    height = float(vspec.get("height", kinetic_vertical.DEFAULT_H))
+    for i, (c, it) in enumerate(zip(plan, items)):
+        if not c.get("vertical_typeset"):
+            continue
+        flat = "".join(c["rows"])
+        if re.search(r"[A-Za-z]{3,}", flat):
+            raise look.LookError(f"direction: 行{c['index']} は縦組みですが、3字以上の欧文の語を含みます（縦組みにしません）。止めました")
+        if c.get("profile_kids"):
+            raise look.LookError(f"direction: 行{c['index']}: 縦組み（vert）は子ども向けの書体には使えません")
+        # 上限・下限：テーマあり＝役（行の max_px・min_px が先）、無し＝従来の上限（強さ1＝320・他＝220）と下限 60
+        if theme is not None:
+            vd = vdefaults.get(c.get("voice")) or {}
+            role = c.get("font_role") or it.get("role") or vd.get("role") or theme.get("default_role")
+            spec = theme["fonts"][role]
+            cap = int(c.get("max_px") or spec.get("max_px", 150))
+            min_px = int(c.get("min_px") or spec.get("min_px", 60))
+        else:
+            cap, min_px = (320 if c["tier"] == 1 else 220), 60
+        forced = None
+        if it.get("break_after"):
+            split = split_rows_after(c["rows"], it["break_after"], c["index"])
+            forced = [len(r) for r in split]
+            c["break_after"] = it["break_after"]
+        word_of = {}
+        if words is not None:
+            _t, word_of, _n = _match_line(flat, _window_words(words, plan, i), use_lcs)
+        mid = kinetic_vertical.mid_word_flags(flat, word_of)
+        rows, size = kinetic_vertical.arrange(flat, mid, int(c.get("max_col_chars", kinetic_vertical.DEFAULT_MAX_COL)),
+                                              height, cap, min_px, forced=forced)
+        if notes is not None and not word_of and len(rows) > 1:
+            # 単語の時刻が照合できない行は、字種の変わり目で切る（助詞が段の頭に来ることがある）。黙らず知らせる
+            heads = [r[0] for r in rows[1:] if r[0] in kinetic_vertical.PARTICLES]
+            if heads:
+                msg = (f"縦組み: 単語の時刻が照合できないため、段の切れ目を字種の変わり目で決めました。"
+                       f"助詞（{''.join(heads)}）が段の頭に来ています。break_after で切れ目を指定してください")
+                c.setdefault("marks", []).append(msg)
+                notes.append(f"行{c['index']}: {msg}")
+        c["rows"] = rows
+        c["vertical_size"] = size
+        c["vertical_top"] = top
+        c["vertical_h"] = height
+        if vspec.get("kana_shift"):
+            c["vertical_kana_shift"] = float(vspec["kana_shift"])
+
+
 def extract_key_word(plan, spec):
     """鍵語を、実行時に歌詞から取り出す。rule == first_bracket: from_line 行目の最初の「」の中の文字列。
     歌詞の文字列は direction にもテーマにも書かない（ここで取り出すだけ）"""
@@ -3766,10 +3938,19 @@ def apply_look(plan, theme, direction, vdefaults):
         for key in ("max_px", "tracking", "min_px"):
             if key in it:
                 c[key] = it[key]
-        if it.get("break_after"):
+        if it.get("break_after") and not c.get("vertical_typeset"):   # 縦組み（vert）の段は arrange_vertical が切る
             c["rows"] = split_rows_after(c["rows"], it["break_after"], c["index"])
             c["break_after"] = it["break_after"]
         pal = theme["palettes"][palette]
+        if direction is not None and look.is_light_palette(pal):
+            bad = [name for name, hit in (
+                (f"入り {c.get('entrance')}", c.get("entrance") in look.LIGHT_BAD_ENTRANCES),
+                (f"decor {c.get('decor')}", c.get("decor") in look.LIGHT_BAD_DECOR),
+                (f"質感 {c.get('texture')}", c.get("texture") in look.LIGHT_BAD_TEXTURES),
+                ("flash", bool(c.get("flash")))) if hit]
+            if bad:
+                raise look.LookError(f"行{c['index']}: 配色 '{palette}' は明るい地（背景が文字より明るい）ですが、白地で合わない部品"
+                                     f"（{', '.join(bad)}）が指定されています。止めました（neon・tape・misregister・long_shadow・flash は暗い地用）")
         if mode == "glow":
             gspec = (theme.get("parts") or {}).get("glow")
             if gspec is None:
@@ -3782,10 +3963,12 @@ def apply_look(plan, theme, direction, vdefaults):
             u = pal.get("unlit_opacity", (c.get("karaoke") or {}).get("unlit_opacity", 0.65))
             ratio = look.worst_contrast(pal["text"], pal["bg"], u)
             if ratio < look.UNLIT_MIN_CONTRAST:
-                raise look.LookError(f"行{c['index']}: 配色 '{palette}' の未点灯（不透明度 {u}、最悪の背景＝背景+10）の比が {ratio:.2f} で、"
+                raise look.LookError(f"行{c['index']}: 配色 '{palette}' の未点灯（不透明度 {u}、最悪の背景＝背景±10。暗い地は +10・明るい地は −10）の比が {ratio:.2f} で、"
                                      f"{look.UNLIT_MIN_CONTRAST} を割ります。この組だけ unlit_opacity を上げてください。止めました")
-        if c["layout"] == "vertical":
-            c["layout"] = "center"   # 縦組みは使わない（PIL に raqm が無く、長音・括弧が縦用の字形に替わらない）
+        if c["layout"] == "vertical" and not c.get("vertical_typeset"):
+            # 自動の構図選びで vertical になった行は center に戻す（従来どおり。出力を変えない）。
+            # direction で縦組みを指定した行（vertical_typeset）は通す（raqm の vert で縦用の字形を取る）
+            c["layout"] = "center"
         flat = "".join(c["rows"])
         idx = []
         if key_text:
@@ -3887,6 +4070,12 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
         if theme is not None:
             for note in apply_look(plan, theme, direction, vdefaults):
                 if not quiet:
+                    print(f"      [警告] {note}")
+        if direction is not None:
+            vnotes = []
+            arrange_vertical(plan, direction, theme, vdefaults, words=words, use_lcs=use_lcs, notes=vnotes)
+            if not quiet:
+                for note in vnotes:
                     print(f"      [警告] {note}")
         return plan
 
