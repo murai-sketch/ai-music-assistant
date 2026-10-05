@@ -63,8 +63,9 @@ HASH_DIR_RE = re.compile(r"^[0-9a-f]{8}$")          # 音源ハッシュのフ�
 MEDIA_EXT = {".mp4", ".mov", ".m4v", ".png", ".jpg", ".jpeg", ".webp"}
 # 作り直すために要るもの。日付に関わらず残す
 KEEP_NAMES = {"alignment.json", "beats.json", "whisper_words.json",
-              "backgrounds.json", "kinetic_plan.json", "kinetic_plan.md"}
-KEEP_PREFIX = ("alignment.",)                        # alignment.bak-*.json など
+              "backgrounds.json", "kinetic_plan.json", "kinetic_plan.md",
+              "direction.json", "vocal_ends.json"}
+KEEP_PREFIX = ("alignment.", "direction.", "kinetic_plan.bak-")   # alignment.bak-*.json、direction.bak-*.json、kinetic_plan.bak-*.json など
 
 
 def _age_days(path):

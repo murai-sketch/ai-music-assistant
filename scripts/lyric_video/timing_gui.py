@@ -194,25 +194,62 @@ def _backgrounds():
     return load_backgrounds(_cache_dir())
 
 
+def _direction_info():
+    """曲の演出（direction.json）の有無と、テーマ名。状態欄用"""
+    import look
+
+    path = look.direction_path(_cache_dir())
+    if not path.exists():
+        return None
+    try:
+        return {"look": json.loads(path.read_text(encoding="utf-8")).get("look")}
+    except ValueError:
+        return {"look": None, "error": "direction.json が読めません"}
+
+
+def _look_key():
+    """プレビューのキャッシュキーに入れる、direction とテーマの中身（直したらプレビューも変わるように）"""
+    import look
+
+    path = look.direction_path(_cache_dir())
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8")
+    key = [text]
+    try:
+        name = json.loads(text).get("look")
+        if name:
+            tp = look._theme_path(name)
+            key.append(tp.read_text(encoding="utf-8") if tp.exists() else "")
+    except ValueError:
+        pass
+    return key
+
+
 def _plan_for(alignment, style_name):
-    from kinetic import build_plan
+    """プレビュー用のプラン（保存しない）。CLI・書き出しと同じ prepare_plan を通す。(plan, runtime)"""
+    from kinetic import prepare_plan
 
     note = _note()
     sections = sections_for_alignment(alignment, note.lyric_sections)
-    return build_plan(alignment, sections, _beats(), STYLES[style_name], note.meta, _backgrounds())
+    return prepare_plan(_cache_dir(), alignment, sections, _beats(), STYLES[style_name], meta=note.meta,
+                        backgrounds=_backgrounds(), plan_path=None,
+                        duration=_get_audio_duration(Path(STATE["audio_path"])),
+                        lyric_lines=note.lyric_lines, quiet=True)
 
 
 def _preview_jpeg(alignment, t, style_name):
     from kinetic import KineticRenderer
 
     key = hashlib.sha1(
-        json.dumps([alignment, style_name, STATE["image_path"], _backgrounds()], ensure_ascii=False, sort_keys=True).encode()
+        json.dumps([alignment, style_name, STATE["image_path"], _backgrounds(), _look_key()],
+                   ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()
     with _LOCK:
         if _PREVIEW["key"] != key:
-            plan = _plan_for(alignment, style_name)
+            plan, rt = _plan_for(alignment, style_name)
             _PREVIEW["renderer"] = KineticRenderer(
-                STATE["image_path"], plan, _beats(), STYLES[style_name],
+                STATE["image_path"], plan, _beats(), rt["style"],
                 duration=_get_audio_duration(STATE["audio_path"]), backgrounds=_backgrounds(),
             )
             _PREVIEW["key"] = key
@@ -245,7 +282,7 @@ def _short_candidates(target=30.0, min_sec=None, max_sec=None, limit=5, mode="ho
 
 
 def _run_render(style_name, stills_only, part=None, parts=None):
-    from kinetic import load_or_build_plan, render_kinetic, render_stills
+    from kinetic import prepare_plan, render_kinetic, render_stills
 
     STATE["render_status"] = "running"
     STATE["render_error"] = None
@@ -258,8 +295,11 @@ def _run_render(style_name, stills_only, part=None, parts=None):
         style = STYLES[style_name]
         sections = sections_for_alignment(alignment, note.lyric_sections)
         backgrounds = _backgrounds()
-        plan = load_or_build_plan(cache_dir / "kinetic_plan.json", alignment, sections, _beats(), style,
-                                  meta=note.meta, backgrounds=backgrounds)
+        plan, rt = prepare_plan(cache_dir, alignment, sections, _beats(), style, meta=note.meta,
+                                backgrounds=backgrounds, plan_path=cache_dir / "kinetic_plan.json",
+                                duration=_get_audio_duration(Path(STATE["audio_path"])),
+                                lyric_lines=note.lyric_lines)
+        style = rt["style"]   # direction のある曲は歌い終わり方式
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
         def render_range(out, t0, t1, done=0, of=1):
@@ -418,6 +458,7 @@ class Handler(BaseHTTPRequestHandler):
                 "words_source": words_source_of(cache),
                 "separate_vocals_default": bool(STATE["separate_vocals_default"]),
                 "backups": sorted(p.name for p in _cache_dir().glob("alignment.bak-*.json"))[-8:],
+                "direction": _direction_info(),
             })
         elif path == "/backgrounds":
             if not self._need("audio_path"):
@@ -903,7 +944,8 @@ async function loadProject(fresh = false) {
     $('sepVocals').checked = wordsSource === 'vocals' || (sepFirstLoad && !!p.separate_vocals_default);
     sepFirstLoad = false;
   } else if (wordsSource === 'vocals') $('sepVocals').checked = true;
-  $('wordsSourceLabel').textContent = '文字起こし：' + (wordsSource === 'vocals' ? 'ボーカル分離' : '元音源');
+  $('wordsSourceLabel').textContent = '文字起こし：' + (wordsSource === 'vocals' ? 'ボーカル分離' : '元音源')
+    + (p.direction ? '　演出：あり' + (p.direction.look ? '（' + p.direction.look + '）' : '') : '');
   const bs = $('backupSelect');
   bs.length = 1; p.backups.slice().reverse().forEach(n => bs.add(new Option(n.replace('alignment.bak-', '').replace('.json', ''), n)));
   undoStack = []; redoStack = []; lastSnap = snapshot(); setDirty(false);

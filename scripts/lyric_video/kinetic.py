@@ -34,6 +34,8 @@ _work/<hash>/kinetic_plan.json を手で書き換えれば、その内容で描�
 import bisect
 import json
 import math
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -101,6 +103,7 @@ ENTRANCE_FRAMES = {
     "dash": 6, "mask": 9, "spread": 12, "converge": 10, "rotate": 8, "fall": 8,
     "grow": 10, "float": 14, "erase": 9,
     "stamp": 6, "scatter": 5, "pop": 6, "neon": 6, "bounce": 12,
+    "cut": 0,   # 動かない入り。開始の瞬間に全文が出る（開始より前は出ない）
 }
 EXIT_FRAMES = 3
 # 間のある退場（fall / drift）の長さ。カットの3割、0.14〜0.55秒（JIZURA の目安）
@@ -329,10 +332,126 @@ def sung_ends_from_words(alignment, word_segments, chain_gap=SUNG_CHAIN_GAP_SEC)
     return result
 
 
-def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, sung_ends=None):
+SUNG_MISMATCH_SEC = 1.0   # 単語の終わり W と音量の終わり D がこれ以上食い違う行は、一覧に印を付ける
+VOCAL_WINDOW_SEC, VOCAL_HOP_SEC, VOCAL_RATIO = 0.05, 0.01, 0.04
+VOCAL_GAP_SEC = 1.0       # D の探索は、W 以降で最初にこの秒数以上の無音（最大の ratio 未満）が続く手前で打ち切る
+
+
+def vocal_ends(alignment, vocals_path, cache_dir=None, window=VOCAL_WINDOW_SEC, hop=VOCAL_HOP_SEC,
+               ratio=VOCAL_RATIO, w_ends=None, gap=VOCAL_GAP_SEC):
+    """各行の歌い終わり D（秒）を、分離音声の音量から求める。
+    窓 window 秒・刻み hop 秒の RMS が、曲全体の RMS の最大値 × ratio を超えた最後の刻みの終わり。
+    探す区間は [行の開始, 次の行の開始)（最後の行は曲の終わりまで）。ただし w_ends（行ごとの単語の終わり W）があれば、
+    W 以降で最初に gap 秒以上の無音が続く手前で探索を打ち切る（間奏・アウトロの歌詞外の声を拾わない）。
+    W が None の行は、行の開始から数える。区間内に1つも無ければ None。
+    結果は cache_dir/vocal_ends.json にキャッシュする（分離音声のサイズと更新時刻・窓・刻み・閾値・gap・W・行の開始の並びがキー）。"""
+    vocals_path = Path(vocals_path)
+    starts = [round(float(a["start"]), 3) for a in alignment]
+    ws = [None if (w_ends is None or i >= len(w_ends) or w_ends[i] is None) else round(float(w_ends[i]), 3)
+          for i in range(len(starts))]
+    st = vocals_path.stat()
+    key = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "window": window, "hop": hop,
+           "ratio": ratio, "gap": gap, "starts": starts, "w": ws}
+    cache_path = Path(cache_dir) / "vocal_ends.json" if cache_dir else None
+    if cache_path and cache_path.exists():
+        try:
+            saved = json.loads(cache_path.read_text(encoding="utf-8"))
+            if saved.get("key") == key:
+                return saved["ends"]
+        except (ValueError, KeyError):
+            pass
+    import librosa
+
+    y, sr = librosa.load(str(vocals_path), sr=None, mono=True)
+    hop_n = max(int(round(sr * hop)), 1)
+    rms = librosa.feature.rms(y=y, frame_length=max(int(round(sr * window)), 2), hop_length=hop_n)[0]
+    thr = float(rms.max()) * ratio
+    step = hop_n / sr
+    gap_n = max(int(math.ceil(gap / step)), 1)
+    ends = []
+    for i, s in enumerate(starts):
+        hi = starts[i + 1] if i + 1 < len(starts) else float("inf")
+        lo_k = max(int(math.floor(s / step)), 0)
+        hi_k = len(rms) - 1 if hi == float("inf") else min(int(math.ceil(hi / step)) - 1, len(rms) - 1)
+        if ws[i] is not None:
+            # W 以降で、gap 秒以上 thr 以下が続く最初の位置の手前までに絞る
+            run_start, run = None, 0
+            for k in range(min(max(int(math.floor(ws[i] / step)), lo_k), hi_k + 1), hi_k + 1):
+                if rms[k] > thr:
+                    run_start, run = None, 0
+                else:
+                    if run_start is None:
+                        run_start = k
+                    run += 1
+                    if run >= gap_n:
+                        hi_k = run_start - 1
+                        break
+        last = None
+        for k in range(hi_k, lo_k - 1, -1):
+            if rms[k] > thr:
+                last = k
+                break
+        ends.append(None if last is None else round((last + 1) * step, 3))
+    if cache_path:
+        cache_path.write_text(json.dumps({"key": key, "threshold": thr, "ends": ends}, ensure_ascii=False) + "\n",
+                              encoding="utf-8")
+    return ends
+
+
+def combine_sung_ends(w_ends, d_ends):
+    """W（単語）と D（音量）の配列を、build_plan に渡す [{"w":..,"d":..}] にする（D が無ければ W だけ）"""
+    n = len(w_ends)
+    d_ends = d_ends or [None] * n
+    return [{"w": w, "d": d_ends[i] if i < len(d_ends) else None} for i, w in enumerate(w_ends)]
+
+
+def _sung_end_of(entry):
+    """sung_ends の1要素から (E, W, D)。float / None（従来の形）も受ける。E = max(W, D)。"""
+    if isinstance(entry, dict):
+        w, d = entry.get("w"), entry.get("d")
+    else:
+        w, d = entry, None
+    vals = [v for v in (w, d) if v is not None]
+    return (max(vals) if vals else None), w, d
+
+
+def _exit_frames_of(name, dur):
+    """退場にかける長さ（フレーム）。退場の長さの唯一の定義（描画の _Cut._exit_frames と、余韻に収まるかの判定が使う）。
+    fall / drift はカットの長さ dur（秒）に応じて伸縮する"""
+    if name == "swap":
+        return 0
+    sec = _exit_fade_sec(name)
+    if sec is not None:
+        return sec * FPS
+    if name in ("fall", "drift"):
+        return max(min(dur * EXIT_RATIO, EXIT_MAX_SEC), EXIT_MIN_SEC) * FPS
+    return {"fly": 7, "split": 8, "shatter": 10}.get(name, EXIT_FRAMES)
+
+
+def _exit_len_sec(cut):
+    """退場の長さ（秒）"""
+    return _exit_frames_of(cut.get("exit"), cut["end"] - cut["start"]) / FPS
+
+
+def _fit_exit_to_tail(cut):
+    """退場の長さ ≦ 余韻（歌い終わりから消えるまでの空き）。判定はここだけ。
+    収まらない退場（swap と既定の fade 以外）は、既定の短い退場 fade に落とす（長い退場は歌い終わる前に崩れ始める）。
+    既定の fade（3フレーム）も余韻より長いときは落とし先が無いので、そのまま（余韻を 0.1 秒未満にした指定の側の問題）"""
+    if cut.get("sung_end") is None or cut.get("exit") in (None, "swap", "fade"):
+        return
+    if _exit_len_sec(cut) > cut["end"] - cut["sung_end"] + 1e-9:
+        cut["exit"] = "fade"
+
+
+def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, sung_ends=None,
+               tails=None, fixed_ends=None, duration=None):
     """alignment（[{line,start,end}]）と、行ごとの構成タグ名から、
     カットごとの設計を作る。meta（曲ノートの title/genre/tags/bpm）があれば、
-    曲の性格に合わせて参考作品由来の技法（kinetic_fx）を割り当てる。"""
+    曲の性格に合わせて参考作品由来の技法（kinetic_fx）を割り当てる。
+
+    sung_end のとき: sung_ends は 行ごとの歌い終わり（float / None、または {"w","d"}）。E = max(W, D)。
+    tails は行ごとの余韻（秒、None なら style の tail_sec）、fixed_ends は行ごとの絶対時刻の終わり（None なら E＋余韻）。
+    duration は曲の長さ（最後の行の上限。無ければ alignment の end）。"""
     max_hold = style.get("max_hold_sec", 2.8)
     hold_mode = style.get("hold_mode", "cap")
     tail_sec = style.get("tail_sec", 0.6)
@@ -364,14 +483,21 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
             level = 3
         start = float(item["start"])
         next_start = float(alignment[i + 1]["start"]) if i + 1 < len(alignment) else float(item["end"])
+        if hold_mode == "sung_end" and i + 1 >= len(alignment) and duration is not None and duration > next_start:
+            next_start = float(duration)   # 最後の行は曲の終わりまで残せる（alignment の end で切らない）
         show_end = min(next_start, start + max_hold)
+        sung_e = sung_w = sung_d = None
         if hold_mode == "sung_end":
-            # 歌い終わり＋tail まで残す。tail には退場アニメ（最長0.55秒）が収まるので、
-            # 歌っている間は文字が完全に見えている。歌い終わりが取れない行は上限方式に戻す。
+            # 歌い終わり E ＋ 余韻まで残す（E = max(W, D)）。余韻は 行の指定 → style の tail_sec の順。
+            # 歌っている間は文字が完全に見える。歌い終わりが取れない行は上限方式に戻す。
             se = sung_ends[i] if sung_ends and i < len(sung_ends) else None
-            if se is not None:
-                show_end = min(next_start, max(se, start) + tail_sec)
+            sung_e, sung_w, sung_d = _sung_end_of(se)
+            tail = tails[i] if tails and i < len(tails) and tails[i] is not None else tail_sec
+            if sung_e is not None:
+                show_end = min(next_start, max(sung_e, start) + tail)
             show_end = max(show_end, min(start + 0.3, next_start))
+            if fixed_ends and i < len(fixed_ends) and fixed_ends[i] is not None:
+                show_end = max(min(next_start, float(fixed_ends[i])), min(start + 0.3, next_start))
         latin = profile.get("latin", False)
         growl = is_growl(section)
         rows = _split_rows(text, short=profile.get("kids", False), latin=latin, growl=growl)
@@ -472,6 +598,10 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
             "flash": level == 3 and entrance in ("slam", "slash")
                      and (i == 0 or plan[-1]["level"] != 3),
         })
+        if hold_mode == "sung_end":
+            plan[-1]["sung_end"] = None if sung_e is None else round(sung_e, 3)
+            plan[-1]["sung_w"] = None if sung_w is None else round(sung_w, 3)
+            plan[-1]["sung_d"] = None if sung_d is None else round(sung_d, 3)
 
     kinetic_fx.assign_techniques(plan, profile)
     kinetic_bg.assign_backgrounds(plan, profile)
@@ -495,20 +625,46 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
                 cut["flash"] = False
             else:
                 last_flash = cut["land"]
+    if hold_mode == "sung_end":
+        # 退場の長さ ≦ 余韻（判定は _fit_exit_to_tail の1か所）。cap モード（既存の曲）は何もしない
+        for cut in plan:
+            _fit_exit_to_tail(cut)
     return plan
 
 
-def plan_to_markdown(plan):
-    out = ["| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+def _fmt(v):
+    return "" if v is None else f"{v:.2f}"
+
+
+def plan_to_markdown(plan, header=None):
+    """カット一覧。歌い終わりまで残す方式（sung_end）のプランには W・D・E と食い違い印の列を、
+    direction のあるプランには声・余韻の列を足す。既定のプランの出力は変えない。"""
+    sung = any("sung_end" in c for c in plan)
+    voiced = any("voice" in c for c in plan)
+    head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
+    rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+    if voiced:
+        head += " 声 | 余韻 |"
+        rule += "---|---|"
+    if sung:
+        head += " W | D | E | 印 |"
+        rule += "---|---|---|---|"
+    out = list(header or []) + [head, rule]
     for c in plan:
         bg = c["bg"] if c["bg"] == "image" else f"色{c['bg']}"
-        out.append(
+        row = (
             f"| {c['index']} | {c['start']:.2f}–{c['end']:.2f} | {c['level']} | {c['layout']} | "
             f"{c['motion']} | {bg} | {c.get('camera', '')} | {c.get('decor') or ''} | "
             f"{c.get('texture') or ''} | {c.get('hold') or ''} | {c.get('exit') or ''} | {'●' if c['flash'] else ''} | "
             f"{c.get('bgfx') or ''} | {c.get('under') or ''} | {c.get('wipe') or ''} |"
         )
+        if voiced:
+            row += f" {c.get('voice') or ''} | {_fmt(c.get('tail'))} |"
+        if sung:
+            w, d = c.get("sung_w"), c.get("sung_d")
+            mark = "W≠D" if (w is not None and d is not None and abs(w - d) >= SUNG_MISMATCH_SEC) else ""
+            row += f" {_fmt(w)} | {_fmt(d)} | {_fmt(c.get('sung_end'))} | {mark} |"
+        out.append(row)
     return "\n".join(out) + "\n"
 
 
@@ -555,14 +711,25 @@ def _lerp(a, b, p):
     return a + (b - a) * p
 
 
+def _exit_fade_sec(name):
+    """exit が "fade:<秒>" なら、その秒数。それ以外は None（"fade" 単体は既定の退場）"""
+    if isinstance(name, str) and name.startswith("fade:"):
+        return max(float(name.split(":", 1)[1]), 1.0 / FPS)
+    return None
+
+
 class _Fonts:
     def __init__(self):
         self._cache = {}
 
     def get(self, path, size):
+        # 文字列のパスは従来どおり（キーも読み方も変えない）。look.FontRef は TTC の番号を渡す
         key = (path, size)
         if key not in self._cache:
-            self._cache[key] = ImageFont.truetype(path, size)
+            if isinstance(path, tuple):
+                self._cache[key] = ImageFont.truetype(path[0], size, index=path[1])
+            else:
+                self._cache[key] = ImageFont.truetype(path, size)
         return self._cache[key]
 
 
@@ -1137,6 +1304,9 @@ class _Cut:
                 crop_right = 1 - _ease_out(p / E)
                 flicker = (0.35, 1.0, 0.5, 1.0)
                 alpha = flicker[int(p)] if p < len(flicker) else 1.0
+        elif motion == "cut":
+            # 開始の 0.2 秒前から draw が呼ばれるので、開始前は出さない（分岐が無いと全文が先に出る）
+            alpha = 0.0 if tl < 0 else 1.0
 
         if cut.get("hold") == "heartbeat" and f > E:
             scale *= 1 + 0.08 * self._beat_pulse(cut["start"] + tl)
@@ -1150,7 +1320,15 @@ class _Cut:
 
         # 退場
         remain = (dur - tl) * FPS
-        if cut.get("exit") == "fly" and remain < 7:
+        exit_name = cut.get("exit")
+        exit_sec = _exit_fade_sec(exit_name)
+        if exit_name == "swap":
+            pass   # 退場なし。次の行の入りと同じフレームで差し替わる
+        elif exit_sec is not None:
+            n = exit_sec * FPS
+            if remain < n:
+                alpha *= max(remain, 0) / n
+        elif cut.get("exit") == "fly" and remain < 7:
             q = 1 - max(remain, 0) / 7
             scale *= 1 + 3.0 * q * q
             alpha *= 1 - q * q
@@ -1174,11 +1352,21 @@ class _Cut:
             scale *= _lerp(0.9, 1.0, q)
         return dx, dy, scale, angle, alpha, crop_top, crop_right
 
+    def _plain_exit_alpha(self, remain):
+        """下敷き・重ね物の、既定の退場の不透明度。swap（退場なし）と fade:<秒> は glyph_state と同じ扱い"""
+        name = self.cut.get("exit")
+        if name == "swap":
+            return 1.0
+        sec = _exit_fade_sec(name)
+        if sec is not None:
+            return min(max(remain, 0) / (sec * FPS), 1.0)
+        if remain < EXIT_FRAMES:
+            return max(remain, 0) / EXIT_FRAMES
+        return 1.0
+
     def _exit_frames(self, dur):
-        """退場にかける長さ（フレーム）。fall / drift はカットの長さに応じて伸縮する"""
-        if self.cut.get("exit") in ("fall", "drift"):
-            return max(min(dur * EXIT_RATIO, EXIT_MAX_SEC), EXIT_MIN_SEC) * FPS
-        return {"fly": 7, "split": 8, "shatter": 10}.get(self.cut.get("exit"), EXIT_FRAMES)
+        """退場にかける長さ（フレーム）。定義は _exit_frames_of（判定側と同じ値）"""
+        return _exit_frames_of(self.cut.get("exit"), dur)
 
     def _noise(self, g, *keys):
         """この文字・このカットで決まる -1〜1 の乱数（フレームごとに変えたいときは keys に刻みを入れる）"""
@@ -1287,7 +1475,7 @@ class _Cut:
         # 背景の巨大文字: ゆっくり流れ、背景カメラと逆向きに大きく動く（単色背景でもカメラが感じられる）
         _zoom, px, py, _angle = cam
         show_echo = (cut.get("decor") not in ("wall", "tunnel", "kanji", "rings")
-                     and not cut.get("profile_kids"))
+                     and not cut.get("profile_kids") and cut.get("echo", True))
         ex = int(VIDEO_SIZE[0] / 2 - self.echo.size[0] / 2
                  + (40 - 80 * tl / max(dur, 0.1)) * (1 if cut["index"] % 2 else -1) - px * 260)
         ey = int(VIDEO_SIZE[1] * (0.22 if cut["index"] % 2 else 0.78) - self.echo.size[1] / 2 - py * 360)
@@ -1411,9 +1599,7 @@ class _Cut:
             angle = -2
         else:
             angle = self.base_angle
-        a = 1.0
-        if remain < EXIT_FRAMES:
-            a = max(remain, 0) / EXIT_FRAMES
+        a = self._plain_exit_alpha(remain)
         if cut.get("exit") == "fly" and remain < 7:
             a *= (max(remain, 0) / 7)
         a *= self._exit_fade(tl, dur)
@@ -1442,8 +1628,7 @@ class _Cut:
                 return
             a = 1.0
             scale = 1.0 if p >= ENTRANCE_FRAMES["stamp"] else _lerp(0.9, 1.0, (p - 3) / 3)
-        if remain < EXIT_FRAMES:
-            a *= max(remain, 0) / EXIT_FRAMES
+        a *= self._plain_exit_alpha(remain)
         if cut.get("exit") == "fly" and remain < 7:
             q = 1 - max(remain, 0) / 7
             scale *= 1 + 3.0 * q * q
@@ -1777,6 +1962,8 @@ def camera_move(name, u, since_land, index):
         return (1.22, -0.3 * side, _lerp(-0.8, 0.8, s), 0.0)
     if name == "dutch":
         return (1.15, _lerp(0.4, -0.4, s) * side, 0.0, _lerp(-2.5, 2.5, s) * side)
+    if name == "still":
+        return (1.05, 0.0, 0.0, 0.0)
     if name == "punch":
         base = _lerp(1.18, 1.26, s)
         if since_land >= 0:
@@ -1893,16 +2080,16 @@ class KineticRenderer:
         span_c = max((self.plan[k + 1]["start"] if k + 1 < len(self.plan) else c["end"]) - c["start"], 0.1)
         uc = min(max((t - c["start"]) / span_c, 0.0), 1.0)
         # 単色背景では背景カメラが見えないので、画面全体の寄りを強める
-        g_zoom = 1.0 + (0.02 if c["bg"] == "image" else 0.06) * uc
+        g_zoom = 1.0 + c.get("creep", 0.02 if c["bg"] == "image" else 0.06) * uc
         sx = sy = 0.0
         if c["level"] == 3 and since_land >= 0:
-            g_zoom += 0.07 * math.exp(-since_land / 0.12)
-            amp = (4 if self.kids else 14) * math.exp(-since_land / 0.08)
+            g_zoom += c.get("land_zoom", 0.07) * math.exp(-since_land / 0.12)
+            amp = c.get("shake", 4 if self.kids else 14) * math.exp(-since_land / 0.08)
             sx = amp * math.sin(t * 90)
             sy = amp * math.cos(t * 77)
-            g_zoom += 0.012 * (self.bg.pulse(t) - 1.0) / max(self.bg.pulse_scale - 1.0, 1e-3)
+            g_zoom += c.get("beat_zoom", 0.012) * (self.bg.pulse(t) - 1.0) / max(self.bg.pulse_scale - 1.0, 1e-3)
         elif c["level"] == 1:
-            g_zoom = 1.0 + 0.015 * uc
+            g_zoom = 1.0 + c.get("creep", 0.015) * uc
         return bg_cam, g_zoom, sx, sy
 
     def frame_at(self, t):
@@ -2037,10 +2224,13 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
     out_dir.mkdir(parents=True, exist_ok=True)
     thumb_w, thumb_h = 216, 384
     fractions = [0.0, 0.25, 0.5, 0.75, 0.97]
+    # 歌い終わりまで残す方式のプランは、「歌い終わりの 0.2 秒前」の列を足す（歌っている最中に消えていないかの確認用）
+    sung_col = any(c.get("sung_end") is not None for c in plan)
+    ncols = len(fractions) + (1 if sung_col else 0)
     sheets = []
     for s in range(0, len(plan), cuts_per_sheet):
         chunk = plan[s:s + cuts_per_sheet]
-        sheet = Image.new("RGB", (thumb_w * len(fractions) + 80, thumb_h * len(chunk)), (40, 40, 40))
+        sheet = Image.new("RGB", (thumb_w * ncols + 80, thumb_h * len(chunk)), (40, 40, 40))
         d = ImageDraw.Draw(sheet)
         label_font = ImageFont.truetype(FONT_HEAVY, 22)
         for r, c in enumerate(chunk):
@@ -2053,6 +2243,26 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
                 t = c["start"] + max(dur * fr, 0 if fr else 0) + (min(first_frame * 0.5, dur * 0.2) if fr == 0 else 0)
                 im = renderer.frame_at(t).resize((thumb_w, thumb_h), Image.BILINEAR)
                 sheet.paste(im, (80 + k * thumb_w, r * thumb_h))
+            if sung_col:
+                e = c.get("sung_end")
+                small = ImageFont.truetype(FONT_HEAVY, 15)
+                if e is None:
+                    d.text((6, r * thumb_h + 100), "E なし", font=small, fill=(255, 160, 160))
+                else:
+                    t = max(e - 0.2, c["start"])
+                    nxt = plan[s + r + 1] if s + r + 1 < len(plan) else None
+                    switched = nxt is not None and t >= nxt["start"]   # この列は次の行を写している
+                    im = renderer.frame_at(t).resize((thumb_w, thumb_h), Image.BILINEAR)
+                    sheet.paste(im, (80 + len(fractions) * thumb_w, r * thumb_h))
+                    d.text((6, r * thumb_h + 100), f"E {e:.2f}", font=small, fill=(255, 220, 120))
+                    if switched:
+                        # 次の行が E−0.2 秒より前に始まる。この列の絵は次の行で、「歌っている最中に消えた」ではない
+                        d.text((80 + len(fractions) * thumb_w + 4, r * thumb_h + 4), "次の行に切替済",
+                               font=small, fill=(255, 120, 120))
+                    d.text((6, r * thumb_h + 120), f"W {_fmt(c.get('sung_w'))}", font=small, fill=(200, 200, 200))
+                    d.text((6, r * thumb_h + 140), f"D {_fmt(c.get('sung_d'))}", font=small, fill=(200, 200, 200))
+                    d.text((6, r * thumb_h + 160), f"余韻 {_fmt(c.get('tail'))}", font=small, fill=(200, 200, 200))
+                    d.text((6, r * thumb_h + 180), f"終 {c['end']:.2f}", font=small, fill=(200, 200, 200))
         path = out_dir / f"sheet_{s // cuts_per_sheet + 1:02d}.png"
         sheet.save(path)
         sheets.append(path)
@@ -2062,24 +2272,187 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
 PLAN_VERSION = 13
 
 
+def _direction_items(direction, n_lines):
+    """行ごとの項目（行番号 0 始まりの配列）。direction の lines を展開する"""
+    import look
+
+    by_line = look.parse_line_keys(direction.get("lines", {}), n_lines)
+    return [by_line.get(i + 1, {}) for i in range(n_lines)]
+
+
+def direction_line_options(direction, n_lines, vdefaults, voice_key="voice"):
+    """build_plan に渡す行ごとの余韻（tails）と固定の終わり（fixed_ends）。
+    余韻は 行の tail → 声の既定 → None（style の tail_sec）の順"""
+    items = _direction_items(direction, n_lines)
+    tails, fixed = [], []
+    for it in items:
+        tail = it.get("tail")
+        if tail is None:
+            tail = (vdefaults.get(it.get(voice_key)) or {}).get("tail")
+        tails.append(None if tail is None else float(tail))
+        fixed.append(None if it.get("end") is None else float(it["end"]))
+    return tails, fixed
+
+
+_DIRECTION_EXITS = ("swap", "fade", "fall", "drift", "fly", "split", "shatter")
+
+
+def apply_direction(plan, direction, vdefaults):
+    """build_plan の後に、曲の演出（direction）を当てる。
+    direction のある曲は、自動割り当て（装飾・質感・保持・退場・背景処理・下敷き・切替・強調・コマ打ち・フラッシュ・
+    巨大文字・カメラ・寄りの漸増・強さ3の揺れ）を全カットでいったん切り、指定のある項目だけ当てる。
+    指定の無い行の入りは cut（動かない入り）。退場は、次の行まで残る行は swap（退場なし）、空きがある行は fade。"""
+    items = _direction_items(direction, len(plan))
+    for c, it in zip(plan, items):
+        c.update({"decor": None, "texture": None, "hold": None, "exit": None, "under": None, "bgfx": None,
+                  "wipe": "straight", "emphasis": False, "koma": 0, "flash": False,
+                  "echo": False, "camera": "still", "creep": 0.0, "shake": 0, "land_zoom": 0.0,
+                  "beat_zoom": 0.0})
+        entrance = it.get("entrance", "cut")
+        if entrance not in ENTRANCE_FRAMES:
+            raise RuntimeError(f"direction 行{c['index']}: 入り '{entrance}' は未対応です（{', '.join(ENTRANCE_FRAMES)}）")
+        c["entrance"] = c["motion"] = entrance
+        if it.get("layout") is not None:
+            if it["layout"] not in LAYOUTS:
+                raise RuntimeError(f"direction 行{c['index']}: 構図 '{it['layout']}' は未対応です")
+            c["layout"] = it["layout"]
+        if it.get("hold") is not None:
+            if it["hold"] not in HOLD_MOTIONS + ("heartbeat",):
+                raise RuntimeError(f"direction 行{c['index']}: 保持 '{it['hold']}' は未対応です")
+            c["hold"] = it["hold"]
+        if it.get("decor") is not None:
+            c["decor"] = it["decor"]
+        if it.get("voice") is not None:
+            c["voice"] = it["voice"]
+    for i, (c, it) in enumerate(zip(plan, items)):
+        nxt = plan[i + 1] if i + 1 < len(plan) else None
+        name = it.get("exit")
+        if name is None:
+            name = "swap" if nxt is not None and c["end"] >= nxt["start"] - 0.0015 else "fade"
+        elif not (name in _DIRECTION_EXITS or _exit_fade_sec(name) is not None):
+            raise RuntimeError(f"direction 行{c['index']}: 消え方 '{name}' は未対応です")
+        c["exit"] = name
+        _fit_exit_to_tail(c)
+    return plan
+
+
+def _plan_variant(style, theme, direction, sung_ends, duration):
+    """既定の経路（既定スタイル・テーマなし・direction なし）では None。それ以外は設計を決める入力の digest。
+    kinetic_plan.json のキャッシュ判定に使う（PLAN_VERSION は上げない。上げると既存の曲のプランが全部作り直される）"""
+    import look
+
+    if style.get("hold_mode", "cap") == "cap" and theme is None and direction is None:
+        return None
+    return look._digest({
+        "hold_mode": style.get("hold_mode", "cap"), "tail_sec": style.get("tail_sec"),
+        "theme": None if theme is None else look.theme_digest(theme),
+        "direction": None if direction is None else look.direction_digest(direction),
+        "sung_ends": sung_ends,
+        "duration": None if duration is None else round(float(duration), 2),
+    })
+
+
+def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, backgrounds=None,
+                 plan_path=None, replan=False, duration=None, look_name=None, use_direction=True,
+                 lyric_lines=None, quiet=False):
+    """カット設計を作る入口。CLI と GUI（プレビュー・書き出し・静止画）はここを通る。
+    cache_dir/direction.json があれば（use_direction のとき）曲の演出を当てる。--look / direction の look でテーマを読む。
+    plan_path があればキャッシュ（kinetic_plan.json）を使う。無ければ毎回作る（GUI のプレビュー用）。
+    戻り値: (plan, runtime)。runtime["style"] は描画に渡す style（direction のある曲は歌い終わり方式）。"""
+    import look
+    from align import VOCALS_NAME, detect_language, words_cache_path, words_source_of
+
+    cache_dir = Path(cache_dir)
+    direction = look.load_direction(cache_dir) if use_direction else None
+    if direction is not None:
+        look.check_direction(direction, len(alignment))
+    theme_name = look_name or (direction or {}).get("look")
+    theme = look.load_theme(theme_name) if theme_name else None
+    fonts = look.resolve_theme_fonts(theme) if theme else {}
+    if theme and not quiet:
+        print(f"      見た目: {theme_name}（{look.theme_digest(theme)}）")
+        for role, f in fonts.items():
+            print(f"        役 {role}: {f['family']} {f['style']} index {f['index']}  {f['path']}")
+    if direction is not None and not quiet:
+        print(f"      演出: {look.direction_path(cache_dir)}（{len(direction.get('lines', {}))}件の行指定）")
+
+    eff_style = dict(style)
+    if direction is not None:
+        eff_style["hold_mode"] = "sung_end"   # 歌い終わり E ＋ 余韻。余韻は direction の声・行で決まる
+    sung_ends = tails = fixed = None
+    vdefaults = look.voice_defaults(direction, theme)
+    if direction is not None:
+        look.validate_direction(direction, len(alignment), vdefaults)
+    if eff_style.get("hold_mode") == "sung_end":
+        cached = json.loads((cache_dir / "alignment.json").read_text(encoding="utf-8"))
+        lines = lyric_lines if lyric_lines is not None else [a["line"] for a in alignment]
+        wpath = words_cache_path(cache_dir, detect_language(lines), vocals=words_source_of(cached) == "vocals")
+        w_ends = sung_ends_from_words(alignment, json.loads(wpath.read_text(encoding="utf-8")))
+        vpath = cache_dir / VOCALS_NAME
+        d_ends = vocal_ends(alignment, vpath, cache_dir, w_ends=w_ends) if vpath.exists() else None
+        sung_ends = combine_sung_ends(w_ends, d_ends)
+        if direction is not None:
+            tails, fixed = direction_line_options(direction, len(alignment), vdefaults)
+
+    def post(plan):
+        if direction is not None:
+            apply_direction(plan, direction, vdefaults)
+            for c, tl in zip(plan, tails):
+                c["tail"] = eff_style.get("tail_sec", 0.6) if tl is None else tl
+        return plan
+
+    variant = _plan_variant(eff_style, theme, direction, sung_ends, duration)
+    header = None
+    if theme:
+        header = [f"<!-- 見た目: {theme_name}（{look.theme_digest(theme)}） -->"] + [
+            f"<!-- 役 {r}: {f['family']} {f['style']} index {f['index']} {f['path']} -->" for r, f in fonts.items()]
+    kwargs = dict(meta=meta, backgrounds=backgrounds, sung_ends=sung_ends, tails=tails, fixed_ends=fixed,
+                  duration=duration, post=post)
+    if plan_path is None:
+        plan = post(build_plan(alignment, sections, beats, eff_style, meta, backgrounds, sung_ends=sung_ends,
+                               tails=tails, fixed_ends=fixed, duration=duration))
+    else:
+        plan = load_or_build_plan(plan_path, alignment, sections, beats, eff_style, replan=replan,
+                                  variant=variant, md_header=header, **kwargs)
+    runtime = {"style": eff_style, "look": theme_name, "theme": theme, "fonts": fonts,
+               "direction": direction is not None, "variant": variant,
+               "digest": {"look": None if theme is None else look.theme_digest(theme),
+                          "direction": None if direction is None else look.direction_digest(direction)}}
+    return plan, runtime
+
+
 def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None,
-                       sung_ends=None):
+                       sung_ends=None, tails=None, fixed_ends=None, duration=None, variant=None, post=None,
+                       md_header=None):
+    """variant: 既定の経路では None。それ以外（歌い終わり方式・テーマ・direction）は設計を決める入力の digest。
+    保存する JSON には variant を既定の経路以外のときだけ書く（既存の曲のファイルは1バイトも変わらない）。"""
     plan_path = Path(plan_path)
     lines = [a["line"] for a in alignment]
+    only_variant = False
     if plan_path.exists() and not replan:
         saved = json.loads(plan_path.read_text(encoding="utf-8"))
-        if ([c["text"] for c in saved.get("plan", [])] == lines and saved.get("alignment") == alignment
-                and saved.get("version") == PLAN_VERSION and saved.get("meta") == meta
-                and saved.get("backgrounds") == (backgrounds or [])):
+        same_base = ([c["text"] for c in saved.get("plan", [])] == lines and saved.get("alignment") == alignment
+                     and saved.get("version") == PLAN_VERSION and saved.get("meta") == meta
+                     and saved.get("backgrounds") == (backgrounds or []))
+        if same_base and saved.get("variant") == variant:
             return saved["plan"]
+        only_variant = same_base
         print("      kinetic_plan.json は歌詞・タイミング・曲情報・設計の版のいずれかが変わったため作り直します")
-    plan = build_plan(alignment, sections, beats, style, meta, backgrounds, sung_ends=sung_ends)
+    if only_variant:
+        # 設計の入力（--look・--no-direction・direction・スタイルの違い）だけが変わった作り直し。
+        # 手で直したプランを消さないよう、alignment.bak-* と同じ形で退避してから上書きする
+        bak = plan_path.with_name(f"{plan_path.stem}.bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
+        shutil.copy2(plan_path, bak)
+        print(f"      既存の {plan_path.name} を退避: {bak.name}")
+    plan = build_plan(alignment, sections, beats, style, meta, backgrounds, sung_ends=sung_ends,
+                      tails=tails, fixed_ends=fixed_ends, duration=duration)
+    if post is not None:
+        plan = post(plan)
     plan_path.parent.mkdir(parents=True, exist_ok=True)
-    plan_path.write_text(
-        json.dumps({"version": PLAN_VERSION, "meta": meta, "backgrounds": backgrounds or [],
-                    "alignment": alignment, "plan": plan},
-                   ensure_ascii=False, indent=1),
-        encoding="utf-8",
-    )
-    plan_path.with_suffix(".md").write_text(plan_to_markdown(plan), encoding="utf-8")
+    saved = {"version": PLAN_VERSION, "meta": meta, "backgrounds": backgrounds or [],
+             "alignment": alignment, "plan": plan}
+    if variant is not None:
+        saved["variant"] = variant
+    plan_path.write_text(json.dumps(saved, ensure_ascii=False, indent=1), encoding="utf-8")
+    plan_path.with_suffix(".md").write_text(plan_to_markdown(plan, md_header), encoding="utf-8")
     return plan

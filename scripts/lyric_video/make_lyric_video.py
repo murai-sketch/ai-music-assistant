@@ -97,6 +97,20 @@ def parse_args():
              "素材が無いときは、生成して用意する方法を書き出しの前に案内する",
     )
     parser.add_argument(
+        "--look", metavar="NAME",
+        help="kinetic: 見た目のテーマ（scripts/lyric_video/looks/<NAME>.json またはパス）を読む。"
+             "direction.json に look が書いてあれば省略できる",
+    )
+    parser.add_argument(
+        "--direction-from", metavar="FILE",
+        help="kinetic: 曲の演出ファイルを _work/<hash>/direction.json に登録する。"
+             "既にあれば direction.bak-<日時>.json に退避してから置き換える",
+    )
+    parser.add_argument(
+        "--no-direction", action="store_true",
+        help="kinetic: direction.json があっても使わない（既定の経路との比較用）",
+    )
+    parser.add_argument(
         "--shorts", action="store_true",
         help="kinetic: ショート動画（TikTok / YouTube ショート）の切り抜き候補を出して終わる",
     )
@@ -188,7 +202,7 @@ def main():
             output_path=args.out,
         )
     else:
-        from kinetic import load_or_build_plan, render_kinetic, render_stills
+        from kinetic import prepare_plan, render_kinetic, render_stills
         from kinetic_bg import GENERATE_HINT, load_backgrounds, save_backgrounds
 
         cache_dir = WORK_DIR / _audio_hash(audio_path)
@@ -205,17 +219,19 @@ def main():
         else:
             print(GENERATE_HINT)
         sections = sections_for_alignment(alignment, note.lyric_sections)
-        sung_ends = None
-        if style.get("hold_mode") == "sung_end":
-            from align import words_cache_path, words_source_of, detect_language
-            from kinetic import sung_ends_from_words
-            cached = json.loads((cache_dir / "alignment.json").read_text(encoding="utf-8"))
-            wpath = words_cache_path(cache_dir, detect_language(note.lyric_lines),
-                                     vocals=words_source_of(cached) == "vocals")
-            sung_ends = sung_ends_from_words(alignment, json.loads(wpath.read_text(encoding="utf-8")))
-        plan = load_or_build_plan(plan_path, alignment, sections, beats, style,
-                                  replan=args.replan, meta=note.meta, backgrounds=backgrounds,
-                                  sung_ends=sung_ends)
+        import look
+        if args.direction_from:
+            print(f"      演出を登録: {look.register_direction(cache_dir, args.direction_from)}")
+        try:
+            plan, rt = prepare_plan(cache_dir, alignment, sections, beats, style,
+                                    meta=note.meta, backgrounds=backgrounds, plan_path=plan_path,
+                                    replan=args.replan, duration=_get_audio_duration(audio_path),
+                                    look_name=args.look, use_direction=not args.no_direction,
+                                    lyric_lines=note.lyric_lines)
+        except look.LookError as e:
+            print(f"[ERROR] {e}")
+            sys.exit(1)
+        style = rt["style"]   # direction のある曲は歌い終わり方式
         print(f"      カット設計: {plan_path}（一覧は {plan_path.with_suffix('.md').name}）")
 
         if args.shorts or args.short:

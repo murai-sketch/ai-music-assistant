@@ -30,6 +30,8 @@ styles.py
                                whisperの単語終了時刻から求める。alignmentのendは次の行のstartなので使えない）
     tail_sec                : sung_end のとき、歌い終わりのあと何秒残すか（既定0.6。退場アニメは最長0.55秒
                                なので、これ以上にすると歌っている間は文字が完全に見える）
+    （歌い終わり E は、単語の終了 W と分離音声の音量 D の遅いほうの max(W, D)。
+     _work/<hash>/direction.json のある曲は、余韻・消え方を direction（声・行の指定）で決める）
 """
 
 STYLES = {
