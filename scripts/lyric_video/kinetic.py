@@ -104,6 +104,7 @@ ENTRANCE_FRAMES = {
     "grow": 10, "float": 14, "erase": 9,
     "stamp": 6, "scatter": 5, "pop": 6, "neon": 6, "bounce": 12,
     "cut": 0,   # 動かない入り。開始の瞬間に全文が出る（開始より前は出ない）
+    "karaoke": 4.5,   # 全文が 0.15 秒で未点灯の濃さまで出る。以後は字ごとの時刻で点灯（direction の曲だけ）
 }
 EXIT_FRAMES = 3
 # 間のある退場（fall / drift）の長さ。カットの3割、0.14〜0.55秒（JIZURA の目安）
@@ -129,6 +130,7 @@ INTERLUDE_BAR_BRIGHTEN = 1.7  # 背景は文字のために暗く保持してい
 # 文字を収める横幅。画面の端はプラットフォームのUI（TikTok の右の操作ボタン、
 # 下のユーザー名やキャプション、YouTube ショートの操作列）に隠れる可能性があるので、
 # 1080px の画面に対して左右に余白を残す。
+SIDE_MARGIN = 92          # テーマを使う曲の左右の余白の下限（px。direction のある曲の検査）
 TEXT_WIDTH = 860          # center / diagonal（左右それぞれ約110px の余白）
 TEXT_WIDTH_NARROW = 790   # 左右に寄せたレイアウト（寄せた側がより端に近づくため）
 
@@ -642,6 +644,7 @@ def plan_to_markdown(plan, header=None):
     sung = any("sung_end" in c for c in plan)
     voiced = any("voice" in c for c in plan)
     looked = any("font_role" in c for c in plan)
+    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks"))
     head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     if voiced:
@@ -650,6 +653,9 @@ def plan_to_markdown(plan, header=None):
     if looked:
         head += " 役 | 差し色 |"
         rule += "---|---|"
+    if staged:
+        head += " 段3 |"
+        rule += "---|"
     if sung:
         head += " W | D | E | 印 |"
         rule += "---|---|---|---|"
@@ -666,6 +672,18 @@ def plan_to_markdown(plan, header=None):
             row += f" {c.get('voice') or ''} | {_fmt(c.get('tail'))} |"
         if looked:
             row += f" {c.get('font_role') or ''} | {c.get('accent_mode') or ''} |"
+        if staged:
+            bits = []
+            if c.get("impact"):
+                bits.append(f"衝撃 {c['impact']} 着地 {c['land']:.2f}")
+            if c.get("karaoke_all_lit"):
+                bits.append("全文点灯")
+            elif c.get("char_times"):
+                bits.append(f"点灯 対応{c.get('karaoke_cover', 0):.0%}")
+            if c.get("break_after"):
+                bits.append("改行 " + ",".join(f"{k}:{v}" for k, v in sorted(c["break_after"].items())))
+            bits.extend(c.get("marks") or [])
+            row += " " + "；".join(bits) + " |"
         if sung:
             w, d = c.get("sung_w"), c.get("sung_d")
             mark = "W≠D" if (w is not None and d is not None and abs(w - d) >= SUNG_MISMATCH_SEC) else ""
@@ -823,10 +841,12 @@ class _Sprites:
             self.echoes[key] = im
         return im
 
-    def transformed(self, key, img, scale, angle, alpha, crop_top, crop_right):
+    def transformed(self, key, img, scale, angle, alpha, crop_top, crop_right, alpha_step=10):
+        """alpha_step: 不透明度の刻み（既定 10 ＝ 0.1 刻み）。karaoke だけ 20（0.05 刻み）。
+        0.65 は 0.1 刻みだと 0.6 に丸められる（round(6.5) == 6）ので、細かい刻みを渡す"""
         sq = round(scale / 0.02) * 0.02
         aq = round(angle)
-        alq = round(alpha * 10) / 10
+        alq = round(alpha * alpha_step) / alpha_step
         ctq = round(crop_top * 20) / 20
         crq = round(crop_right * 20) / 20
         k = (key, sq, aq, alq, ctq, crq)
@@ -859,6 +879,26 @@ class _Sprites:
         return im
 
 
+def shatter_pieces(im, q, seed):
+    """1枚の画像を4片に割り、片ごとに違う向きへ飛ばして落とす。q は 0〜1 の進み。
+    戻り値: [(片の画像, 片の左上の x, 片の左上の y, x のずれ, y のずれ)]。貼る位置は int(基準 x + x0 + ox)（足す順を変えない）。
+    seed は 乱数の種（文字の退場では 字の順×4＋カット番号。片 k は seed + k）。文字の退場とカウンターの割れの両方が使う"""
+    w_, h_ = im.size
+    mx, my = w_ // 2, h_ // 2
+    out = []
+    for k, (x0, y0, x1, y1, sx, sy) in enumerate((
+            (0, 0, mx, my, -1, -1), (mx, 0, w_, my, 1, -1),
+            (0, my, mx, h_, -1, 1), (mx, my, w_, h_, 1, 1))):
+        if x1 <= x0 or y1 <= y0:
+            continue
+        piece = im.crop((x0, y0, x1, y1))
+        j = kinetic_fx._hash01(seed + k)
+        ox = sx * (30 + 150 * j) * q * q
+        oy = sy * (20 + 90 * (1 - j)) * q * q + 150 * q * q * q
+        out.append((piece, x0, y0, ox, oy))
+    return out
+
+
 class _Cut:
     """1カット分の文字配置（基準サイズ・回転なしの状態）を持つ。"""
 
@@ -886,6 +926,12 @@ class _Cut:
         emphasis = bool(cut.get("emphasis"))
         neon = cut.get("entrance") == "neon"
         self.overlay = None
+        # karaoke（歌い進みの点灯）。未点灯の濃さは配色の組の指定が先、無ければ direction の karaoke
+        self.karaoke = cut.get("entrance") == "karaoke" and look is not None
+        kcfg = cut.get("karaoke") or {}
+        self.unlit = float((look or {}).get("unlit_opacity") or kcfg.get("unlit_opacity", 0.65))
+        self.light_frames = int(kcfg.get("light_frames", 3))
+        self.glow = None
         # 長い影（texture == long_shadow）用。文字の形をアクセント色の暗い版で塗った画像を1字ずつ持つ
         self._shadows = {}
         self.shadow_color = _darken(accent, 0.55)
@@ -1032,6 +1078,12 @@ class _Cut:
                 if look is not None:
                     stroke, gsw = self._look_stroke(look, cut, gsize, fill, accent, palette_bg)
                 g, key = make_glyph(draw_ch, font_path, gsize, fill, stroke, gsw)
+                alt = None
+                if self.karaoke and is_accent:
+                    # 差し色の字は、未点灯のあいだ本文色で描くので、本文色のスプライトも持つ（点灯の 3 フレームで入れ替える）
+                    st2, gsw2 = self._look_stroke(look, cut, gsize, text_color, accent, palette_bg)
+                    alt_g, alt_key = make_glyph(draw_ch, font_path, gsize, text_color, st2, gsw2)
+                    alt = (alt_key, alt_g[0])
                 img, l, t, adv = g
                 w, h = img.size
                 if vertical:
@@ -1059,6 +1111,10 @@ class _Cut:
                     "key": key, "img": img, "cx": cx, "cy": cy, "order": order, "row": ri,
                     "angle": angle, "mis": mis,
                 })
+                if alt is not None:
+                    glyphs[-1]["alt"] = alt
+                if look is not None and cut.get("accent_mode") == "glow":
+                    glyphs[-1]["glow_src"] = (draw_ch, gsize)
                 order += 1
         if cut["layout"] == "grid":
             glyphs = self._grid_glyphs(sprites, "".join(rows), font_path, text_color, stroke_color, accent, palette_bg)
@@ -1072,6 +1128,8 @@ class _Cut:
         self.glyphs = glyphs
         self.count = max(order, 1)
         self.n_rows = len(rows)
+        if look is not None and cut.get("accent_mode") == "glow" and glyphs:
+            self._build_glow(look, font_path, accent)
         if cut.get("entrance") == "stamp":
             self.overlay = self._stamp_overlay(accent)
         self.under = None
@@ -1153,31 +1211,58 @@ class _Cut:
 
     def _fit_look_rows(self, rows, look, cut, sprites):
         """役の書体で、段ごとの大きさを揃えて決める。戻り値: (段, 大きさ px, 注記の一覧)。
-        大きさ = min(上限 px, 全段が幅に収まる最大)。下限 px を割るときは、長い段を _chunk で折って段を増やし、
-        下限以上で収まる最初の割り方を採る。それでも割るなら、その大きさで描いて注記を返す（止めない）"""
+        大きさ = min(上限 px, 全段が幅に収まる最大)。下限 px（行の min_px が先、無ければ役の min_px）を割るときは、
+        長い段を _chunk で折って段を増やし、下限以上で収まる最初の割り方を採る（break_after は plan 時に当て済み）。
+        それでも割るなら、direction のある曲（look["strict"]）は止める。無い曲（--look だけ）は今までどおり注記して描く。
+        幅：left / right の構図は、段ごとのずらしと中心のずれの分だけ使える幅が狭い（余白 92px を割らない）。
+        diagonal は回転後の外接矩形の幅で確かめる。center は今までどおり"""
+        from look import LookError
+
         fonts = sprites.fonts
         font = look["font"]
         track = look["tracking"]
         budget = look["text_width"] - 2 * self._look_stroke_extra(look, cut)
         cap = int(cut.get("max_px") or look["max_px"])
-        min_px = int(look["min_px"])
+        min_px = int(cut.get("min_px") or look["min_px"])
+        layout = cut["layout"]
+        strict = bool(look.get("strict"))
+        SIDE = SIDE_MARGIN
 
         def width(row, s):
             f = fonts.get(font, s)
             return sum(f.getlength(ch) for ch in row) + track * s * (len(row) - 1)
 
-        def fit_row(row):
+        def row_budget(ri):
+            if layout not in ("left", "right"):
+                return budget
+            # 段 ri の中心の画面中央からのずれ。left は x = -w/2 - 60 + ri*40、アンカーは 0.47（right は逆）
+            off = (VIDEO_SIZE[0] * (0.47 if layout == "left" else 0.53) - VIDEO_SIZE[0] / 2) \
+                + (-60 + ri * 40 if layout == "left" else 60 - ri * 40)
+            return min(budget, VIDEO_SIZE[0] - 2 * SIDE - 2 * abs(off))
+
+        def fit_row(row, ri):
+            bud = row_budget(ri)
             lo, hi = 1, cap
             while lo < hi:
                 mid = (lo + hi + 1) // 2
-                if width(row, mid) <= budget:
+                if width(row, mid) <= bud:
                     lo = mid
                 else:
                     hi = mid - 1
             return lo
 
         def fit(rs):
-            return min(fit_row(r) for r in rs)
+            size = min(fit_row(r, i) for i, r in enumerate(rs))
+            if layout == "diagonal":
+                # 回転（-8°）後の外接矩形の幅が収まるまで下げる
+                rad = math.radians(8)
+                while size > 1:
+                    w_max = max(width(r, size) for r in rs)
+                    h_all = len(rs) * size * look["leading"]
+                    if w_max * math.cos(rad) + h_all * math.sin(rad) <= VIDEO_SIZE[0] - 2 * SIDE:
+                        break
+                    size -= 1
+            return size
 
         notes = []
         size = fit(rows)
@@ -1199,11 +1284,76 @@ class _Cut:
                     best = (cand, s_c)
                     break
             if best is not None and best[1] >= min_px:
-                notes.append(f"行{cut['index']}: 下限 {min_px}px を割るので段を {len(rows)}→{len(best[0])} に増やした（{best[1]}px）")
+                notes.append(f"行{cut['index']}: 下限 {min_px}px を割るので段を {len(rows)}→{len(best[0])} に増やした（{best[1]}px）"
+                             f"【break_after に書き写す】")
                 rows, size = best[0], best[1]
+            elif strict:
+                raise LookError(f"行{cut['index']}: 役 {cut.get('font_role')} の下限 {min_px}px を割ります"
+                                f"（必要 {min_px}px、今 {size}px。段を増やしても収まりません）。"
+                                f"break_after・max_px・min_px を見直してください。黙って縮めず止めました")
             else:
                 notes.append(f"行{cut['index']}: 段を増やしても下限 {min_px}px を割る（{size}px で描く）【要確認】")
+        if strict and len(rows) * size * look["leading"] > VIDEO_SIZE[1] - 140:
+            raise LookError(f"行{cut['index']}: {len(rows)}段 × {size}px で、画面の高さ（上下の余白 70px を除く）に収まりません。"
+                            f"break_after を見直してください")
         return rows, size, notes
+
+    def _build_glow(self, look, font_path, accent):
+        """accent: glow の行。文字の形を dilate_px 太らせ、ガウスぼかし（半径＝字の大きさ × blur_ratio）をかけ、
+        最大値が max_alpha になるよう正規化して、差し色で塗った画像を1枚作る（カットごとに1回。毎フレーム作らない）。
+        文字の塗りは本文色のまま、縁なし。光は文字の後ろに描く（_draw_glow）"""
+        spec = look.get("glow")
+        if spec is None:
+            raise RuntimeError("accent: glow の行がありますが、テーマに parts.glow がありません")
+        dil = int(spec["dilate_px"])
+        blur = max(self.size * float(spec["blur_ratio"]), 1.0)
+        x0, y0, x1, y1 = self._bounds()
+        pad = int(dil + 3 * blur + 4)
+        W, H = int(math.ceil(x1 - x0)) + 2 * pad, int(math.ceil(y1 - y0)) + 2 * pad
+        mask = Image.new("L", (W, H), 0)
+        for g in self.glyphs:
+            ch, gsize = g["glow_src"]
+            # 太らせは PIL の縁（円形）で行う。縁つきの画像は字より両側へ dil だけ広がるので、中心を合わせて置く
+            gi = self._shared.glyph(ch, font_path, gsize, "#FFFFFF", "#FFFFFF", dil)[0]
+            px = int(round(g["cx"] - x0 + pad - gi.width / 2))
+            py = int(round(g["cy"] - y0 + pad - gi.height / 2))
+            mask.paste(255, (px, py), gi.getchannel("A"))
+        arr = np.asarray(mask.filter(ImageFilter.GaussianBlur(blur)), dtype=np.float32)
+        peak = float(arr.max())
+        a = np.rint(arr / peak * float(spec["max_alpha"]) * 255.0).astype(np.uint8) if peak > 0 else np.zeros_like(arr, dtype=np.uint8)
+        col = _hex(accent)
+        im = Image.new("RGBA", (W, H), col + (0,))
+        im.putalpha(Image.fromarray(a))
+        self.glow = im
+        self.glow_center = ((x0 + x1) / 2, (y0 + y1) / 2)
+
+    def karaoke_parts(self, g, tl):
+        """karaoke の1字の不透明度 (本文色のスプライト, 差し色のスプライト)。退場の掛け率は含まない。
+        入り：全文が 0.15 秒で未点灯の濃さまで。点灯：その字の時刻から light_frames で未点灯 → 1.0。
+        差し色の字は、未点灯のあいだ本文色のスプライト（未点灯の濃さ）、点灯の間に本文色を薄くしながら差し色を濃くする。
+        char_times が無い行（対応が足りず、全文点灯に落とした行）は、入りから点灯済み"""
+        if tl < 0:
+            return 0.0, 0.0
+        cut = self.cut
+        f_in = min(tl * FPS / ENTRANCE_FRAMES["karaoke"], 1.0)
+        ct = cut.get("char_times")
+        if ct is None:
+            q = 1.0
+        else:
+            q = min(max((cut["start"] + tl - ct[g["order"]]) * FPS / self.light_frames, 0.0), 1.0)
+        u = self.unlit
+        if "alt" in g:
+            return f_in * u * (1.0 - q), f_in * q
+        return f_in * (u + (1.0 - u) * q), 0.0
+
+    def lit_count(self, tl):
+        """点灯済みの字数と全字数（静止画のラベル用）"""
+        ct = self.cut.get("char_times")
+        n = len(self.glyphs)
+        if ct is None:
+            return n, n
+        t = self.cut["start"] + tl
+        return sum(1 for x in ct if (t - x) * FPS >= self.light_frames), n
 
     def _bounds(self):
         xs0 = [g["cx"] - g["img"].width / 2 for g in self.glyphs]
@@ -1291,19 +1441,22 @@ class _Cut:
         o = g["order"]
 
         if motion in ("slam", "slash", "shake"):
-            lead = (cut["land"] - cut["start"]) * FPS - 3
+            # 衝撃の段階（direction の impacts）を持つカットだけ値を差し替える。無いカットは今までの値（1.8・0.92・3f・5px）
+            iv = cut.get("impact_vals") if motion == "slam" else None
+            LF = iv["land_frames"] if iv else 3
+            lead = (cut["land"] - cut["start"]) * FPS - LF
             p = f - lead
             if p < 0:
                 alpha = 0.0
-            elif p < 3:
-                scale = _lerp(1.8, 0.92, p / 3)
+            elif p < LF:
+                scale = _lerp(iv["overshoot"] if iv else 1.8, iv["undershoot"] if iv else 0.92, p / LF)
                 alpha = min(p / 2, 1.0)
             elif p < E:
-                scale = _lerp(0.92, 1.0, (p - 3) / (E - 3))
+                scale = _lerp(iv["undershoot"] if iv else 0.92, 1.0, (p - LF) / (E - LF))
             if motion == "slash":
                 angle = -6
-            if motion == "shake" or (3 <= p < 7):
-                amp = 7 if motion == "shake" else 5 * (1 - (p - 3) / 4)
+            if motion == "shake" or (LF <= p < LF + 4):
+                amp = 7 if motion == "shake" else (iv["glyph_shake_px"] if iv else 5) * (1 - (p - LF) / 4)
                 dx += amp * math.sin(tl * 71 + o)
                 dy += amp * math.cos(tl * 53 + o)
         elif motion == "stagger":
@@ -1414,6 +1567,14 @@ class _Cut:
         elif motion == "cut":
             # 開始の 0.2 秒前から draw が呼ばれるので、開始前は出さない（分岐が無いと全文が先に出る）
             alpha = 0.0 if tl < 0 else 1.0
+        elif motion == "karaoke":
+            # 不透明度は karaoke_parts（未点灯・点灯の段階）が決める。ここは退場の掛け率の土台（開始前だけ 0）
+            alpha = 0.0 if tl < 0 else 1.0
+            ct = cut.get("char_times")
+            if cut.get("karaoke_land") and ct:
+                p = (cut["start"] + tl - ct[0]) * FPS
+                if 0 <= p < 3:
+                    scale = _lerp(1.06, 1.0, p / 3)
 
         if cut.get("hold") == "heartbeat" and f > E:
             scale *= 1 + 0.08 * self._beat_pulse(cut["start"] + tl)
@@ -1608,9 +1769,33 @@ class _Cut:
             self._draw_long_shadow(frame, tl, dur, sprites, cos_a, sin_a,
                                    lambda g, angle: base_angle + angle + g["angle"])
 
+        if self.glow is not None and self.glyphs:
+            # 文字の後ろの光。入りと同時に出て行の間は保持（明滅なし）。退場は文字と同じ掛け率
+            ga = self.glyph_state(self.glyphs[0], tl, dur)[4]
+            if ga > 0.02:
+                gim = sprites.transformed(("glow", cut["index"]), self.glow, 1.0, 0, ga, 0.0, 0.0)
+                if gim is not None:
+                    gcx, gcy = self.glow_center
+                    frame.paste(gim, (int(ax + gcx - gim.size[0] / 2), int(ay + gcy - gim.size[1] / 2)), gim)
+
         for g in self.glyphs:
             dx, dy, scale, angle, alpha, crop_top, crop_right = self.glyph_state(g, tl, dur)
             if alpha <= 0.02:
+                continue
+            if self.karaoke:
+                a_main, a_acc = self.karaoke_parts(g, tl)
+                gx, gy = g["cx"] * scale, g["cy"] * scale
+                rx, ry = gx * cos_a - gy * sin_a, gx * sin_a + gy * cos_a
+                total_angle = base_angle + angle + g["angle"]
+                layers = [(g["alt"][0], g["alt"][1], a_main), (g["key"], g["img"], a_acc)] if "alt" in g \
+                    else [(g["key"], g["img"], a_main)]
+                for lkey, limg, la in layers:
+                    if la * alpha <= 0.02:
+                        continue
+                    im = sprites.transformed(lkey, limg, scale, total_angle, la * alpha, crop_top, crop_right, alpha_step=20)
+                    if im is None:
+                        continue
+                    frame.paste(im, (int(ax + rx + dx - im.size[0] / 2), int(ay + ry + dy - im.size[1] / 2)), im)
                 continue
             reveal_clip = None
             if motion == "mask":
@@ -1667,17 +1852,7 @@ class _Cut:
                 if cut.get("exit") == "shatter" and remain < 10:
                     # 1字を4片に割り、片ごとに違う向きへ飛ばして落とす
                     q = 1 - max(remain, 0) / 10
-                    w_, h_ = im.size
-                    mx, my = w_ // 2, h_ // 2
-                    for k, (x0, y0, x1, y1, sx, sy) in enumerate((
-                            (0, 0, mx, my, -1, -1), (mx, 0, w_, my, 1, -1),
-                            (0, my, mx, h_, -1, 1), (mx, my, w_, h_, 1, 1))):
-                        if x1 <= x0 or y1 <= y0:
-                            continue
-                        piece = im.crop((x0, y0, x1, y1))
-                        j = kinetic_fx._hash01(g["order"] * 4 + k + cut["index"])
-                        ox = sx * (30 + 150 * j) * q * q
-                        oy = sy * (20 + 90 * (1 - j)) * q * q + 150 * q * q * q
+                    for piece, x0, y0, ox, oy in shatter_pieces(im, q, g["order"] * 4 + cut["index"]):
                         frame.paste(piece, (int(px + x0 + ox), int(py + y0 + oy)), piece)
                     continue
                 frame.paste(im, (int(px), int(py)), im)
@@ -2157,8 +2332,57 @@ class KineticRenderer:
                 palette_bg = bg
             self.cuts.append(_Cut(c, self.sprites, colors, palette_bg, beats))
         self.decor = _shared_decor()
-        for note in self.look_notes:
+        self.impact_zoom = {}
+        self.impact_notes = []
+        self._resolve_impact_zoom()
+        for note in self.look_notes + self.impact_notes:
             print(f"      [書体] {note}")
+
+    def _resolve_impact_zoom(self):
+        """slam（impact のあるカット）の画面の寄りを、着地後の外接矩形で頭打ちにする（動き §9-0 #3・§9-6）。
+        上限 ＝ min(段階の値, 896 ÷ 外接矩形の幅 − 1)。そのうえで、
+        ①最大の段階の寄りの最小値 < 最小の段階の寄り × 2 なら、最小の段階の寄りを 最大の最小値 ÷ 2 に下げる
+        ②中間の段階が最大の最小値を超えたら、最大の最小値に揃える（小 ≦ 中 ≦ 大）。
+        外接矩形はプランの時点では分からないので、ここ（描画の準備時）で決める。結果は self.impact_zoom[カット番号]"""
+        items = [(c, o) for c, o in zip(self.plan, self.cuts) if c.get("impact_vals") and o.glyphs]
+        if not items:
+            return
+        usable = VIDEO_SIZE[0] - 2 * SIDE_MARGIN
+        zoom = {}
+        for c, o in items:
+            x0, y0, x1, y1 = o._bounds()
+            w, h = x1 - x0, y1 - y0
+            if o.base_angle:
+                rad = math.radians(abs(o.base_angle))
+                w = w * math.cos(rad) + h * math.sin(rad)
+            cap = max(usable / max(w, 1.0) - 1.0, 0.0)
+            z = min(float(c["impact_vals"]["zoom"]), cap)
+            zoom[c["index"]] = z
+            if z < float(c["impact_vals"]["zoom"]) - 1e-9:
+                self.impact_notes.append(
+                    f"行{c['index']}: 衝撃 {c['impact']} の寄りを {c['impact_vals']['zoom']} → {z:.4f} に頭打ち（外接矩形の幅 {w:.0f}px、余白 {SIDE_MARGIN}px を守る）")
+        nominal = {}
+        for c, _o in items:
+            nominal.setdefault(c["impact"], float(c["impact_vals"]["zoom"]))
+        names = sorted(nominal, key=lambda n: nominal[n])
+        if len(names) >= 2:
+            small, large = names[0], names[-1]
+            idx_of = {n: [c["index"] for c, _o in items if c["impact"] == n] for n in names}
+            l_min = min(zoom[i] for i in idx_of[large])
+            for n in names[1:-1]:
+                for i in idx_of[n]:
+                    if zoom[i] > l_min:
+                        self.impact_notes.append(f"行{i}: 衝撃 {n} の寄り {zoom[i]:.4f} が 最大の段階（{large}）の最小 {l_min:.4f} を超えるので揃える")
+                        zoom[i] = l_min
+            s_max = max(zoom[i] for i in idx_of[small])
+            if l_min < s_max * 2:
+                for i in idx_of[small]:
+                    new = min(zoom[i], l_min / 2)
+                    if new < zoom[i] - 1e-9:
+                        self.impact_notes.append(
+                            f"行{i}: 衝撃 {small} の寄り {zoom[i]:.4f} → {new:.4f}（最大の段階 {large} の最小 {l_min:.4f} の 1/2。2倍の差を保つ）")
+                    zoom[i] = new
+        self.impact_zoom = zoom
 
     # --- テーマ（名前付きの配色・書体の役・背景色の時間軸） ---
 
@@ -2167,6 +2391,7 @@ class KineticRenderer:
         self._fonts = look.get("fonts") or {}
         self._paper = (theme.get("texture") or {}).get("paper", "plain") != "none"
         self._text_width = (theme.get("layout") or {}).get("text_width", TEXT_WIDTH)
+        self._strict = bool(look.get("direction"))   # direction のある曲は、下限割れ・高さ超過で止める
         self._transitions = []
         for tr in ((look.get("direction_data") or {}).get("bg_transitions") or []):
             t0 = float(tr["start"]) if "start" in tr else float(plan[tr["after_line"] - 1]["end"])
@@ -2187,7 +2412,9 @@ class KineticRenderer:
                 "tracking": float(spec.get("tracking", 0.0)), "leading": float(spec.get("leading", 1.2)),
                 "min_px": spec.get("min_px", 60), "max_px": spec.get("max_px", 150),
                 "thicken": spec.get("thicken"), "layer_outline": spec.get("layer_outline"),
-                "text_width": self._text_width}
+                "text_width": self._text_width, "strict": self._strict,
+                "glow": (self.theme.get("parts") or {}).get("glow"),
+                "unlit_opacity": self.theme["palettes"][c["bg"]].get("unlit_opacity")}
 
     def bg_color_at(self, t):
         """テーマの背景色（時刻 → 色）。各カットの開始で、そのカットの配色の背景色へ硬く切り替える。
@@ -2269,7 +2496,15 @@ class KineticRenderer:
         # 単色背景では背景カメラが見えないので、画面全体の寄りを強める
         g_zoom = 1.0 + c.get("creep", 0.02 if c["bg"] == "image" else 0.06) * uc
         sx = sy = 0.0
-        if c["level"] == 3 and since_land >= 0:
+        iv = c.get("impact_vals")
+        if iv:
+            # 衝撃の段階をもつカット（slam）は、level に関係なく着地で寄りと揺れが効く（寄りは外接矩形で頭打ち済み）
+            if since_land >= 0:
+                g_zoom += self.impact_zoom.get(c["index"], float(iv["zoom"])) * math.exp(-since_land / 0.12)
+                amp = float(iv["screen_shake_px"]) * math.exp(-since_land / 0.08)
+                sx = amp * math.sin(t * 90)
+                sy = amp * math.cos(t * 77)
+        elif c["level"] == 3 and since_land >= 0:
             g_zoom += c.get("land_zoom", 0.07) * math.exp(-since_land / 0.12)
             amp = c.get("shake", 4 if self.kids else 14) * math.exp(-since_land / 0.08)
             sx = amp * math.sin(t * 90)
@@ -2441,6 +2676,10 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
                 t = c["start"] + max(dur * fr, 0 if fr else 0) + (min(first_frame * 0.5, dur * 0.2) if fr == 0 else 0)
                 im = renderer.frame_at(t).resize((thumb_w, thumb_h), Image.BILINEAR)
                 sheet.paste(im, (80 + k * thumb_w, r * thumb_h))
+                if renderer.themed and renderer.cuts[s + r].karaoke:
+                    n_lit, n_all = renderer.cuts[s + r].lit_count(t - c["start"])   # 点灯済み字数／全字数
+                    d.text((80 + k * thumb_w + 4, r * thumb_h + 4), f"点灯 {n_lit}/{n_all}",
+                           font=ImageFont.truetype(FONT_HEAVY, 13), fill=(255, 230, 120))
             if renderer.themed:
                 # 役・配色・背景色と文字色の色コード（コントラストの照合用）
                 pal = renderer.theme["palettes"][c["bg"]]
@@ -2451,6 +2690,11 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
                                            f"bg {pal['bg']}", f"tx {pal['text']}",
                                            f"{Path(str(role_info.get('path', ''))).name[:10]} i{role_info.get('index', '')}")):
                     d.text((6, r * thumb_h + 204 + k2 * 17), line, font=tiny, fill=(190, 210, 255))
+                if c.get("impact"):
+                    # 衝撃の段階と、寄りの値（外接矩形で頭打ちにした後）
+                    d.text((6, r * thumb_h + 204 + 5 * 17),
+                           f"衝撃 {c['impact']} 寄り{renderer.impact_zoom.get(c['index'], 0):.3f}",
+                           font=tiny, fill=(190, 210, 255))
             if sung_col:
                 e = c.get("sung_end")
                 small = ImageFont.truetype(FONT_HEAVY, 15)
@@ -2505,13 +2749,120 @@ def direction_line_options(direction, n_lines, vdefaults, voice_key="voice"):
 _DIRECTION_EXITS = ("swap", "fade", "fall", "drift", "fly", "split", "shatter")
 
 
-def apply_direction(plan, direction, vdefaults):
+def _is_chorus_or_bridge(section):
+    """Chorus・Bridge の区分か。Pre-Chorus は含まない（slam は Pre-Chorus には使える。動き §9-7 ②）"""
+    t = (section or "").lower()
+    for pre in ("pre-chorus", "pre chorus", "prechorus"):
+        t = t.replace(pre, "")
+    return "chorus" in t or "bridge" in t
+
+
+def _window_words(words, plan, i):
+    """行 i の区間 [開始 − 0.3, 次の行の開始) に始まる単語（開始順。sung_ends_from_words と同じ区間）"""
+    lo = plan[i]["start"] - 0.3
+    hi = plan[i + 1]["start"] if i + 1 < len(plan) else float("inf")
+    return [w for w in words if lo <= w["start"] < hi]
+
+
+def _match_line(flat, words, use_lcs):
+    """行の字（段を連結した並び）と、区間の単語の字を、align と同じ取り方で対応させる（別の照合を作らない）。
+    戻り値: (time_of {字の位置: 単語の開始}, word_of {字の位置: 単語の番号}, 照合の対象になる字数)。
+    照合の対象は _normalize_char が None にしない字（空白・記号は対象外）。連続一致が MIN_MATCH_BLOCK 未満の字は対応させない"""
+    import difflib
+
+    from align import MIN_MATCH_BLOCK, _monotonic_blocks, _normalize_char
+
+    units = [(i, n) for i, n in ((i, _normalize_char(ch)) for i, ch in enumerate(flat)) if n]
+    w_chars, w_idx = [], []
+    for wi, w in enumerate(words):
+        for ch in w["word"]:
+            n = _normalize_char(ch)
+            if n:
+                w_chars.append(n)
+                w_idx.append(wi)
+    a_chars = [u[1] for u in units]
+    if use_lcs:
+        blocks = _monotonic_blocks(a_chars, w_chars)
+    else:
+        blocks = difflib.SequenceMatcher(None, a_chars, w_chars, autojunk=False).get_matching_blocks()
+    time_of, word_of = {}, {}
+    for ia, ib, size in blocks:
+        if size < MIN_MATCH_BLOCK:
+            continue
+        for k in range(size):
+            time_of[units[ia + k][0]] = float(words[w_idx[ib + k]]["start"])
+            word_of[units[ia + k][0]] = w_idx[ib + k]
+    return time_of, word_of, len(units)
+
+
+def _karaoke_times(n, time_of, start, cap):
+    """n 字の点灯の時刻。対応した字 ＝ 単語の開始。対応しない字は、前後の対応した字の時刻の間を字数で均等割り
+    （先頭側で前が無い字は行の開始、末尾側で後ろが無い字は cap（歌い終わり）に向けて割る。cap の字自体は作らない）。
+    先頭は開始以上、末尾は cap 以下、単調増加に直す。対応が1字も無ければ None"""
+    if not time_of:
+        return None
+    t = [None] * n
+    for i, v in time_of.items():
+        t[i] = v
+    matched = sorted(time_of)
+    for i in range(matched[0]):
+        t[i] = start
+    for a, b in zip(matched, matched[1:]):
+        for i in range(a + 1, b):
+            t[i] = t[a] + (t[b] - t[a]) * (i - a) / (b - a)
+    last = matched[-1]
+    for i in range(last + 1, n):
+        t[i] = t[last] + (max(cap, t[last]) - t[last]) * (i - last) / (n - last)
+    out, prev = [], start
+    hi = max(cap, start)
+    for x in t:
+        x = max(min(max(x, start), hi), prev)
+        out.append(round(x, 3))
+        prev = x
+    return out
+
+
+def split_rows_after(rows, break_after, index):
+    """break_after（{"<段番号>": <字の位置>}）を段に当てて、段を増やす。段番号は rows（全角スペースで分けた段）を 0 から数え、
+    字の位置はその段の頭からの字数（その字の後で切る）。字は増減しない（鍵語の位置はずれない）。範囲外は止める"""
+    import look
+
+    out = []
+    for ri, row in enumerate(rows):
+        pos = break_after.get(str(ri))
+        if pos is None:
+            out.append(row)
+            continue
+        if not 0 < pos < len(row):
+            raise look.LookError(f"direction: 行{index} の break_after[{ri}]＝{pos} は、段 {ri}（{len(row)}字）の中で切れる位置ではありません"
+                                 f"（1〜{len(row) - 1} で書いてください）")
+        out.extend([row[:pos], row[pos:]])
+    for key in break_after:
+        if int(key) >= len(rows):
+            raise look.LookError(f"direction: 行{index} の break_after の段番号 {key} が、段の数（{len(rows)}）以上です")
+    return out
+
+
+def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_lcs=False, notes=None):
     """build_plan の後に、曲の演出（direction）を当てる。
     direction のある曲は、自動割り当て（装飾・質感・保持・退場・背景処理・下敷き・切替・強調・コマ打ち・フラッシュ・
     巨大文字・カメラ・寄りの漸増・強さ3の揺れ）を全カットでいったん切り、指定のある項目だけ当てる。
-    指定の無い行の入りは cut（動かない入り）。退場は、次の行まで残る行は swap（退場なし）、空きがある行は fade。"""
+    指定の無い行の入りは cut（動かない入り）。退場は、次の行まで残る行は swap（退場なし）、空きがある行は fade。
+    段3（impacts・karaoke・land・break_after）は、そのキーがある行・曲だけ動く。words は 開始順の単語時刻（whisper）。
+    notes には警告の文を足す（呼び出し側が表示する）。カットの marks には kinetic_plan.md に出す印を足す"""
+    import look
+
     items = _direction_items(direction, len(plan))
-    for c, it in zip(plan, items):
+    impacts = direction.get("impacts")
+    kcfg = direction.get("karaoke")
+    if notes is None:
+        notes = []
+
+    def mark(c, text):
+        c.setdefault("marks", []).append(text)
+        notes.append(f"行{c['index']}: {text}")
+
+    for i, (c, it) in enumerate(zip(plan, items)):
         c.update({"decor": None, "texture": None, "hold": None, "exit": None, "under": None, "bgfx": None,
                   "wipe": "straight", "emphasis": False, "koma": 0, "flash": False,
                   "echo": False, "camera": "still", "creep": 0.0, "shake": 0, "land_zoom": 0.0,
@@ -2532,6 +2883,67 @@ def apply_direction(plan, direction, vdefaults):
             c["decor"] = it["decor"]
         if it.get("voice") is not None:
             c["voice"] = it["voice"]
+
+        # --- 段3：衝撃の段階（slam）。impacts のある曲だけ。無ければ今までの slam
+        if entrance == "slam" and impacts is not None:
+            name = it.get("impact") or "m"
+            if name not in impacts:
+                raise look.LookError(f"direction: 行{c['index']} は impact の指定が無く、既定の 'm' が impacts にありません")
+            if _is_chorus_or_bridge(c["section"]):
+                raise look.LookError(f"direction: 行{c['index']}（{c['section']}）は Chorus・Bridge の区分なので slam は使えません")
+            c["impact"] = name
+            c["impact_vals"] = dict(impacts[name])
+        # --- 着地の時刻
+        if it.get("land") is not None:
+            LF = c["impact_vals"]["land_frames"] if c.get("impact_vals") else 3
+            floor = c["start"] + LF / FPS      # 入りの頭（着地 − 着地フレーム）が行の開始より前に来ないように
+            if it["land"] == "start":
+                land = max(c["start"] + 0.1, floor)
+            else:
+                if words is None:
+                    raise look.LookError(f"direction: 行{c['index']} の land: first_word には単語時刻（whisper_words）が要ります")
+                win = _window_words(words, plan, i)
+                if not win:
+                    land = max(c["start"] + 0.1, floor)
+                    mark(c, "着地：区間に単語が無いので 開始+0.1")
+                else:
+                    w0 = float(win[0]["start"])
+                    if w0 - c["start"] >= 0.5:
+                        land = max(c["start"] + 0.1, floor)
+                        mark(c, f"着地：最初の単語が開始より {w0 - c['start']:.2f} 秒遅いので 開始+0.1（開始時刻の確認が要る）")
+                    else:
+                        land = max(w0, floor)
+            c["land"] = round(land, 3)
+        # --- karaoke と break_after の単語の途中の警告（同じ対応表を使う）
+        need_match = entrance == "karaoke" or it.get("break_after")
+        match_result = None
+        if need_match:
+            if words is None:
+                raise look.LookError(f"direction: 行{c['index']} の karaoke / break_after には単語時刻（whisper_words）が要ります")
+            flat = "".join(c["rows"])
+            match_result = _match_line(flat, _window_words(words, plan, i), use_lcs)
+        if entrance == "karaoke":
+            c["karaoke"] = {"unlit_opacity": kcfg["unlit_opacity"], "light_frames": kcfg["light_frames"],
+                            "keyword_unlit": kcfg.get("keyword_unlit", "text")}
+            if it.get("karaoke_land"):
+                c["karaoke_land"] = True
+            time_of, _word_of, n_units = match_result
+            cover = len(time_of) / n_units if n_units else 0.0
+            c["karaoke_cover"] = round(cover, 2)
+            match = (alignment[i].get("match") if alignment else None)
+            if (match is not None and match < kcfg["min_match"]) or cover < kcfg["min_cover"] or not time_of:
+                c["karaoke_all_lit"] = True
+                mark(c, f"karaoke：対応が足りない（match {match}、対応 {cover:.0%}）ので全文点灯に落とした")
+            else:
+                cap = c.get("sung_end") if c.get("sung_end") is not None else c["end"]
+                c["char_times"] = _karaoke_times(len(flat), time_of, c["start"], cap)
+        if it.get("break_after"):
+            split_rows_after(c["rows"], it["break_after"], c["index"])   # 範囲の検査（ここで止める）
+            _time_of, word_of, _n = match_result
+            for key, pos in sorted(it["break_after"].items(), key=lambda kv: int(kv[0])):
+                off = sum(len(r) for r in c["rows"][:int(key)]) + pos
+                if off in word_of and off - 1 in word_of and word_of[off] == word_of[off - 1]:
+                    mark(c, f"break_after[{key}]＝{pos}：単語の途中で切っています（段 {key} の {pos} 字目の後）")
     for i, (c, it) in enumerate(zip(plan, items)):
         nxt = plan[i + 1] if i + 1 < len(plan) else None
         name = it.get("exit")
@@ -2583,9 +2995,28 @@ def apply_look(plan, theme, direction, vdefaults):
         c["bg"] = palette
         mode = it.get("accent", "none")
         c["accent_mode"] = mode
-        for key in ("max_px", "tracking"):
+        for key in ("max_px", "tracking", "min_px"):
             if key in it:
                 c[key] = it[key]
+        if it.get("break_after"):
+            c["rows"] = split_rows_after(c["rows"], it["break_after"], c["index"])
+            c["break_after"] = it["break_after"]
+        pal = theme["palettes"][palette]
+        if mode == "glow":
+            gspec = (theme.get("parts") or {}).get("glow")
+            if gspec is None:
+                raise look.LookError(f"direction: 行{c['index']} は accent: glow ですが、テーマに parts.glow がありません")
+            ratio = look.contrast(pal["text"], look.over(pal.get("accent", pal["text"]), pal["bg"], gspec["max_alpha"]))
+            if ratio < look.GLOW_MIN_CONTRAST:
+                raise look.LookError(f"行{c['index']}: 配色 '{palette}' の文字と glow を重ねた背景の比が {ratio:.2f} で、"
+                                     f"{look.GLOW_MIN_CONTRAST} を割ります。止めました")
+        if c.get("entrance") == "karaoke":
+            u = pal.get("unlit_opacity", (c.get("karaoke") or {}).get("unlit_opacity", 0.65))
+            bgp = look.lift(pal["bg"])
+            ratio = look.contrast(look.over(pal["text"], bgp, u), bgp)
+            if ratio < look.UNLIT_MIN_CONTRAST:
+                raise look.LookError(f"行{c['index']}: 配色 '{palette}' の未点灯（不透明度 {u}、背景+10）の比が {ratio:.2f} で、"
+                                     f"{look.UNLIT_MIN_CONTRAST} を割ります。この組だけ unlit_opacity を上げてください。止めました")
         if c["layout"] == "vertical":
             c["layout"] = "center"   # 縦組みは使わない（PIL に raqm が無く、長音・括弧が縦用の字形に替わらない）
         flat = "".join(c["rows"])
@@ -2656,6 +3087,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
     if direction is not None:
         eff_style["hold_mode"] = "sung_end"   # 歌い終わり E ＋ 余韻。余韻は direction の声・行で決まる
     sung_ends = tails = fixed = None
+    words, use_lcs = None, False
     vdefaults = look.voice_defaults(direction, theme)
     if direction is not None:
         look.validate_direction(direction, len(alignment), vdefaults, theme)
@@ -2663,7 +3095,11 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
         cached = json.loads((cache_dir / "alignment.json").read_text(encoding="utf-8"))
         lines = lyric_lines if lyric_lines is not None else [a["line"] for a in alignment]
         wpath = words_cache_path(cache_dir, detect_language(lines), vocals=words_source_of(cached) == "vocals")
-        w_ends = sung_ends_from_words(alignment, json.loads(wpath.read_text(encoding="utf-8")))
+        wsegs = json.loads(wpath.read_text(encoding="utf-8"))
+        w_ends = sung_ends_from_words(alignment, wsegs)
+        # 単語時刻（開始順）。slam の着地・karaoke の点灯・break_after の警告が同じ読み込みを使う
+        words = sorted((w for seg in wsegs for w in seg.get("words", [])), key=lambda w: w["start"])
+        use_lcs = words_source_of(cached) == "vocals"
         vpath = cache_dir / VOCALS_NAME
         d_ends = vocal_ends(alignment, vpath, cache_dir, w_ends=w_ends) if vpath.exists() else None
         sung_ends = combine_sung_ends(w_ends, d_ends)
@@ -2672,7 +3108,12 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
 
     def post(plan):
         if direction is not None:
-            apply_direction(plan, direction, vdefaults)
+            stage_notes = []
+            apply_direction(plan, direction, vdefaults, alignment=alignment, words=words, use_lcs=use_lcs,
+                            notes=stage_notes)
+            if not quiet:
+                for note in stage_notes:
+                    print(f"      [警告] {note}")
             for c, tl in zip(plan, tails):
                 c["tail"] = eff_style.get("tail_sec", 0.6) if tl is None else tl
         if theme is not None:

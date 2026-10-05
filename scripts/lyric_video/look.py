@@ -36,6 +36,16 @@ look.py
             role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline）/ max_px / tracking（役の値の行ごとの上書き）
   key_word: {"from_line": N, "rule": "first_bracket"}   N 行目の最初の「」の中の語を実行時に取り出す（歌詞は書かない）
   bg_transitions: [{"from": 配色, "to": 配色, "start"|"after_line", "seconds"|"until_line"}]   背景色を時間で線形に補間する
+
+段3の項目（曲を特定しない形だけ。値は direction に書く）:
+  行: impact（impacts の名前。entrance: slam の行）／ land（first_word|start。着地を最初の単語の開始に合わせる）／
+      karaoke_land（真偽）／ counter（hide|resume|off、または {count, state, rate, enter, break}）／ solo（真偽）／
+      break_after {"<段番号>": <字の位置>}（その字の後で切る。段は 0 始まり）／ min_px（その行だけの下限）
+  最上位: impacts {名前: {overshoot, land_frames, undershoot, glyph_shake_px, zoom, screen_shake_px}}（全キー必須）
+          karaoke {unlit_opacity, light_frames, keyword_unlit, min_match, min_cover}
+          counter {appear: [...]} ／ interludes [...]
+  テーマ: palettes.<名前>.unlit_opacity（任意）／ parts.glow {dilate_px, blur_ratio, max_alpha} ／
+          parts.counter {role, px, border_px, dim, ...}
 """
 
 import hashlib
@@ -93,6 +103,10 @@ def validate_theme(theme, where="テーマ"):
             if key not in pal:
                 raise LookError(f"{where}: palettes.{name}.{key} がありません")
         for key, val in pal.items():
+            if key == "unlit_opacity":
+                if isinstance(val, bool) or not isinstance(val, (int, float)) or not 0 < val <= 1:
+                    raise LookError(f"{where}: palettes.{name}.unlit_opacity は 0 より大きく 1 以下の数値で書いてください")
+                continue
             if not (isinstance(val, str) and _HEX.match(val)):
                 raise LookError(f"{where}: palettes.{name}.{key} が #RRGGBB ではありません")
     for role, spec in theme["fonts"].items():
@@ -127,6 +141,26 @@ def validate_theme(theme, where="テーマ"):
         if val in (False, None, [], "none", "off"):
             continue
         raise LookError(f"{where}: texture.{key}={val!r} は未対応です（paper: plain|none、bg_image: false のみ）")
+    parts = theme.get("parts") or {}
+    if not isinstance(parts, dict) or not set(parts) <= {"glow", "counter"}:
+        raise LookError(f"{where}: parts は glow・counter だけ書けます")
+    glow = parts.get("glow")
+    if glow is not None:
+        if not isinstance(glow, dict) or set(glow) != {"dilate_px", "blur_ratio", "max_alpha"}:
+            raise LookError(f"{where}: parts.glow は dilate_px・blur_ratio・max_alpha の全部を書いてください")
+        if (isinstance(glow["dilate_px"], bool) or not isinstance(glow["dilate_px"], int) or glow["dilate_px"] < 0
+                or not isinstance(glow["blur_ratio"], (int, float)) or glow["blur_ratio"] <= 0
+                or not isinstance(glow["max_alpha"], (int, float)) or not 0 < glow["max_alpha"] <= 1):
+            raise LookError(f"{where}: parts.glow の値が不正です（dilate_px 整数、blur_ratio 正の数、max_alpha 0〜1）")
+    counter = parts.get("counter")
+    if counter is not None:
+        if not isinstance(counter, dict) or counter.get("role") not in theme["fonts"]:
+            raise LookError(f"{where}: parts.counter.role が fonts にありません")
+        for key in ("px", "border_px", "dim"):
+            if key not in counter or isinstance(counter[key], bool) or not isinstance(counter[key], (int, float)):
+                raise LookError(f"{where}: parts.counter.{key} は数値で書いてください")
+        if not 0 < counter["dim"] <= 1:
+            raise LookError(f"{where}: parts.counter.dim は 0 より大きく 1 以下で書いてください")
     width = (theme.get("layout") or {}).get("text_width")
     if width is not None and (isinstance(width, bool) or not isinstance(width, (int, float)) or not 300 <= width <= 1080):
         raise LookError(f"{where}: layout.text_width は 300〜1080 の数値で書いてください")
@@ -211,11 +245,22 @@ def direction_path(cache_dir):
 
 # direction の行の項目（許可リスト）。別名は読み込み時に正式名へ直す（動き §2 R2 は余韻を tail_sec と書く）。
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
-                  "role", "palette", "accent", "max_px", "tracking"}
-ACCENT_MODES = ("none", "key_word", "fill", "outline")
+                  "role", "palette", "accent", "max_px", "tracking",
+                  "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px"}
+ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow")
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
-DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions"}
+DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
+                      "impacts", "karaoke", "counter", "interludes"}
+LAND_MODES = ("first_word", "start")
+COUNTER_STATES = ("hide", "resume", "off")
+COUNTER_KEYS = {"count", "state", "rate", "enter", "break"}
+IMPACT_KEYS = ("overshoot", "land_frames", "undershoot", "glyph_shake_px", "zoom", "screen_shake_px")
+KARAOKE_KEYS = {"unlit_opacity", "light_frames", "keyword_unlit", "min_match", "min_cover"}
+SLAM_VOICE = "outer"       # slam（叩く入り）を使える声。外向きの行だけ（動き §9-7 ①）
+SLAM_MAX_LINES = 8         # slam の行数の上限（動き §9-7 ③）
+UNLIT_MIN_CONTRAST = 5.0   # karaoke の未点灯（bg+10 の最悪の背景）の下限（書体配色 §11.4）
+GLOW_MIN_CONTRAST = 7.0    # glow を重ねた背景に対する文字の下限（書体配色 §11.3）
 
 
 def _normalize_item(item, allowed, where):
@@ -232,15 +277,59 @@ def _normalize_item(item, allowed, where):
             raise LookError(f"direction: {where} の項目 '{name}' が別名と重複しています")
         if name in ("tail", "end") and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
             raise LookError(f"direction: {where} の '{k}' は 0 以上の数値で書いてください")
-        if name in ("voice", "exit", "entrance", "layout", "hold", "decor", "role", "palette", "accent") and not isinstance(v, str):
+        if name in ("voice", "exit", "entrance", "layout", "hold", "decor", "role", "palette", "accent", "impact") and not isinstance(v, str):
             raise LookError(f"direction: {where} の '{k}' は文字列で書いてください")
-        if name in ("max_px", "tracking") and (isinstance(v, bool) or not isinstance(v, (int, float))
-                                               or (name == "max_px" and v <= 0)):
+        if name in ("max_px", "tracking", "min_px") and (isinstance(v, bool) or not isinstance(v, (int, float))
+                                                         or (name in ("max_px", "min_px") and v <= 0)):
             raise LookError(f"direction: {where} の '{k}' は数値で書いてください")
+        if name == "land" and v not in LAND_MODES:
+            raise LookError(f"direction: {where} の land '{v}' は {', '.join(LAND_MODES)} のどれかで書いてください")
+        if name in ("karaoke_land", "solo") and not isinstance(v, bool):
+            raise LookError(f"direction: {where} の '{k}' は true / false で書いてください")
+        if name == "break_after":
+            _check_break_after(v, where)
+        if name == "counter":
+            _check_counter_item(v, where)
         if name == "accent" and v not in ACCENT_MODES:
             raise LookError(f"direction: {where} の accent '{v}' は {', '.join(ACCENT_MODES)} のどれかで書いてください")
         out[name] = v
     return out
+
+
+def _check_break_after(v, where):
+    if not isinstance(v, dict) or not v:
+        raise LookError(f'direction: {where} の break_after は {{"<段番号>": <字の位置>}} の形で書いてください')
+    for key, pos in v.items():
+        if not re.fullmatch(r"\d+", str(key)):
+            raise LookError(f"direction: {where} の break_after の段番号 '{key}' は 0 以上の整数で書いてください")
+        if isinstance(pos, bool) or not isinstance(pos, int) or pos <= 0:
+            raise LookError(f"direction: {where} の break_after[{key}] は正の整数（その字の後で切る）で書いてください")
+
+
+def _check_counter_item(v, where):
+    if isinstance(v, str):
+        if v not in COUNTER_STATES:
+            raise LookError(f"direction: {where} の counter '{v}' は {', '.join(COUNTER_STATES)} か辞書で書いてください")
+        return
+    if not isinstance(v, dict):
+        raise LookError(f"direction: {where} の counter は文字列か辞書で書いてください")
+    for key, val in v.items():
+        if key not in COUNTER_KEYS:
+            raise LookError(f"direction: {where} の counter に未知の項目 '{key}' があります（{', '.join(sorted(COUNTER_KEYS))}）")
+        if key == "count" and (isinstance(val, bool) or not isinstance(val, int) or val < 0):
+            raise LookError(f"direction: {where} の counter.count は 0 以上の整数で書いてください")
+        if key == "state" and val not in ("run", "dim"):
+            raise LookError(f"direction: {where} の counter.state は run か dim で書いてください")
+        if key == "rate" and val not in ("per_word", "per_word_x2"):
+            raise LookError(f"direction: {where} の counter.rate は per_word か per_word_x2 で書いてください")
+        if key == "enter" and val != "push":
+            raise LookError(f"direction: {where} の counter.enter は push だけです")
+        if key == "break":
+            if not isinstance(val, dict) or val.get("kind") != "shatter":
+                raise LookError(f"direction: {where} の counter.break.kind は shatter だけです（peel は作っていません）")
+            for kk in ("crack_f", "fall_f"):
+                if isinstance(val.get(kk), bool) or not isinstance(val.get(kk), int) or val[kk] <= 0:
+                    raise LookError(f"direction: {where} の counter.break.{kk} は正の整数で書いてください")
 
 
 def parse_line_keys(keys, n_lines):
@@ -273,7 +362,7 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         v = item.get("voice")
         if v is not None and v not in vdefaults:
             raise LookError(f"direction: 行{n} の声 '{v}' が voices にありません（{', '.join(sorted(vdefaults)) or 'なし'}）")
-        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking") if k in item]
+        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after") if k in item]
         if look_keys and theme is None:
             raise LookError(f"direction: 行{n} に見た目の項目（{', '.join(look_keys)}）がありますが、テーマが指定されていません"
                             f"（direction の look か --look）")
@@ -284,6 +373,20 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} の palette '{item['palette']}' がテーマの palettes にありません")
             if item.get("layout") == "vertical":
                 raise LookError(f"direction: 行{n} の layout 'vertical'（縦組み）はテーマを使う曲では使えません")
+            if item.get("accent") == "glow" and "glow" not in (theme.get("parts") or {}):
+                raise LookError(f"direction: 行{n} は accent: glow ですが、テーマに parts.glow がありません")
+        if item.get("entrance") == "karaoke":
+            if theme is None:
+                raise LookError(f"direction: 行{n} の entrance karaoke はテーマを使う曲でだけ使えます（未点灯の色をテーマの配色から決めます）")
+            if direction.get("karaoke") is None:
+                raise LookError(f"direction: 行{n} は entrance: karaoke ですが、最上位に karaoke の指定がありません")
+        if item.get("impact") is not None:
+            if item.get("entrance") != "slam":
+                raise LookError(f"direction: 行{n} の impact は entrance: slam の行だけに書けます")
+            if item["impact"] not in (direction.get("impacts") or {}):
+                raise LookError(f"direction: 行{n} の impact '{item['impact']}' が impacts にありません"
+                                f"（{', '.join(sorted(direction.get('impacts') or {})) or 'impacts なし'}）")
+    _validate_stage3(direction, by_line, theme)
     if theme is not None:
         for voice, spec in vdefaults.items():
             if spec.get("role") is not None and spec["role"] not in theme["fonts"]:
@@ -319,6 +422,87 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         for key in ("start", "seconds"):
             if key in tr and (isinstance(tr[key], bool) or not isinstance(tr[key], (int, float)) or tr[key] < 0):
                 raise LookError(f"direction: {where}.{key} は 0 以上の数値で書いてください")
+
+
+def _validate_stage3(direction, by_line, theme):
+    """段3の最上位の項目と、slam の使い方の検査（impacts のある曲だけ。無い曲は今までと同じ）"""
+    impacts = direction.get("impacts")
+    if impacts is not None:
+        if not isinstance(impacts, dict) or not impacts:
+            raise LookError("direction: impacts は {名前: {...}} の形で書いてください")
+        for name, spec in impacts.items():
+            if not isinstance(spec, dict) or set(spec) != set(IMPACT_KEYS):
+                raise LookError(f"direction: impacts.{name} は {', '.join(IMPACT_KEYS)} の全部を書いてください（足りない・余分な項目があります）")
+            for key, val in spec.items():
+                if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
+                    raise LookError(f"direction: impacts.{name}.{key} は 0 以上の数値で書いてください")
+            if not isinstance(spec["land_frames"], int) or not 1 <= spec["land_frames"] <= 5:
+                raise LookError(f"direction: impacts.{name}.land_frames は 1〜5 の整数で書いてください（入りは 6 フレーム）")
+            if not 0 < spec["undershoot"] <= 1 or spec["overshoot"] < 1:
+                raise LookError(f"direction: impacts.{name} の overshoot は 1 以上、undershoot は 0 より大きく 1 以下で書いてください")
+        slam_rows = [n for n, it in by_line.items() if it.get("entrance") == "slam"]
+        if len(slam_rows) > SLAM_MAX_LINES:
+            raise LookError(f"direction: slam の行が {len(slam_rows)} 行あります（上限 {SLAM_MAX_LINES}）。叩きが常態化するので止めました")
+        for n in slam_rows:
+            if by_line[n].get("voice") != SLAM_VOICE:
+                raise LookError(f"direction: 行{n} は slam ですが、声が '{SLAM_VOICE}' ではありません（slam は外向きの行だけ）")
+    kd = direction.get("karaoke")
+    if kd is not None:
+        if not isinstance(kd, dict) or not set(kd) <= KARAOKE_KEYS:
+            raise LookError(f"direction: karaoke は {', '.join(sorted(KARAOKE_KEYS))} の項目で書いてください")
+        for key in ("unlit_opacity", "light_frames", "min_match", "min_cover"):
+            if key not in kd:
+                raise LookError(f"direction: karaoke.{key} がありません")
+        if not (isinstance(kd["unlit_opacity"], (int, float)) and not isinstance(kd["unlit_opacity"], bool)
+                and 0 < kd["unlit_opacity"] <= 1):
+            raise LookError("direction: karaoke.unlit_opacity は 0 より大きく 1 以下の数値で書いてください")
+        if isinstance(kd["light_frames"], bool) or not isinstance(kd["light_frames"], int) or kd["light_frames"] < 1:
+            raise LookError("direction: karaoke.light_frames は 1 以上の整数で書いてください")
+        for key in ("min_match", "min_cover"):
+            if isinstance(kd[key], bool) or not isinstance(kd[key], (int, float)) or not 0 <= kd[key] <= 1:
+                raise LookError(f"direction: karaoke.{key} は 0〜1 の数値で書いてください")
+        if kd.get("keyword_unlit", "text") != "text":
+            raise LookError("direction: karaoke.keyword_unlit は text だけです")
+    if direction.get("counter") is not None and not isinstance(direction["counter"], dict):
+        raise LookError("direction: counter は辞書で書いてください")
+    if direction.get("interludes") is not None and not isinstance(direction["interludes"], list):
+        raise LookError("direction: interludes は配列で書いてください")
+
+
+# ---------------------------------------------------------------------------
+# 色の比（コントラスト）。式はここ1か所（未点灯・glow・カウンター・レポート・検査のすべてがこれを使う）
+
+def _rgb(c):
+    if isinstance(c, str):
+        c = c.lstrip("#")
+        return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+    return tuple(c)
+
+
+def _rel_lum(c):
+    def lin(v):
+        v = v / 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = _rgb(c)
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def contrast(fg, bg):
+    """WCAG 2.x のコントラスト比（1〜21）。色は '#RRGGBB' か (r, g, b)"""
+    a, b = _rel_lum(fg), _rel_lum(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def over(fg, bg, a):
+    """背景 bg の上に、不透明度 a で fg を重ねた色（8 ビットに丸める）"""
+    f, b = _rgb(fg), _rgb(bg)
+    return tuple(int(round(b[i] + (f[i] - b[i]) * a)) for i in range(3))
+
+
+def lift(bg, n=10):
+    """紙の微粒子の最悪側の背景（各チャンネル +n）"""
+    return tuple(min(c + n, 255) for c in _rgb(bg))
 
 
 def load_direction(cache_dir):
