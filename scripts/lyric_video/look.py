@@ -162,6 +162,23 @@ def validate_theme(theme, where="テーマ"):
                 raise LookError(f"{where}: parts.counter.{key} は数値で書いてください")
         if not 0 < counter["dim"] <= 1:
             raise LookError(f"{where}: parts.counter.dim は 0 より大きく 1 以下で書いてください")
+        extra = set(counter) - {"role", "px", "border_px", "dim", "palette", "slots", "radius", "pad_x", "pad_y", "avoid_px", "min_y"}
+        if extra:
+            raise LookError(f"{where}: parts.counter に未知の項目 {', '.join(sorted(extra))} があります")
+        if "palette" in counter and counter["palette"] not in theme["palettes"]:
+            raise LookError(f"{where}: parts.counter.palette '{counter['palette']}' が palettes にありません")
+        for key in ("radius", "pad_x", "pad_y", "avoid_px", "min_y"):
+            if key in counter and (isinstance(counter[key], bool) or not isinstance(counter[key], (int, float)) or counter[key] < 0):
+                raise LookError(f"{where}: parts.counter.{key} は 0 以上の数値で書いてください")
+        slots = counter.get("slots")
+        if slots is not None:
+            if not isinstance(slots, list) or not slots:
+                raise LookError(f"{where}: parts.counter.slots は配列で書いてください")
+            for sl in slots:
+                if (not isinstance(sl, dict) or set(sl) != {"corner", "x", "y"} or sl["corner"] not in ("tl", "tr")
+                        or any(isinstance(sl[k], bool) or not isinstance(sl[k], (int, float)) for k in ("x", "y"))):
+                    raise LookError(f"{where}: parts.counter.slots の要素は {{corner: tl|tr, x: 余白, y: 上からの位置}} で書いてください"
+                                    f"（上側の左右の隅だけ。下側はショートの操作列に隠れる）")
     width = (theme.get("layout") or {}).get("text_width")
     if width is not None and (isinstance(width, bool) or not isinstance(width, (int, float)) or not 300 <= width <= 1080):
         raise LookError(f"{where}: layout.text_width は 300〜1080 の数値で書いてください")
@@ -256,6 +273,11 @@ DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_tran
 LAND_MODES = ("first_word", "start")
 COUNTER_STATES = ("hide", "resume", "off")
 COUNTER_KEYS = {"count", "state", "rate", "enter", "break"}
+COUNTER_TOP_KEYS = {"appear", "voices"}
+APPEAR_KEYS = {"at", "after_line", "until_line", "at_fraction", "count", "rate"}
+INTERLUDE_KEYS = {"start", "after_line", "end", "until_line", "until", "kind", "zoom_peak", "zoom_ramp"}
+INTERLUDE_KINDS = ("duotone",)
+COUNTER_MIN_CONTRAST = 4.5   # カウンター（副要素）の下限。最悪の背景（背景+10）に対して（設計書 §4）
 IMPACT_KEYS = ("overshoot", "land_frames", "undershoot", "glyph_shake_px", "zoom", "screen_shake_px")
 KARAOKE_KEYS = {"unlit_opacity", "light_frames", "keyword_unlit", "min_match", "min_cover"}
 SLAM_MAX_LINES = 8         # slam の行数の上限（動き §9-7 ③）
@@ -473,10 +495,89 @@ def _validate_stage3(direction, by_line, theme):
                 raise LookError(f"direction: karaoke.{key} は 0〜1 の数値で書いてください")
         if kd.get("keyword_unlit", "text") != "text":
             raise LookError("direction: karaoke.keyword_unlit は text だけです")
-    if direction.get("counter") is not None and not isinstance(direction["counter"], dict):
-        raise LookError("direction: counter は辞書で書いてください")
-    if direction.get("interludes") is not None and not isinstance(direction["interludes"], list):
+    _validate_counter_top(direction, by_line)
+    _validate_interludes(direction)
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _validate_counter_top(direction, by_line):
+    """最上位の counter（appear・voices）と、行の counter を使うときの前提"""
+    cd = direction.get("counter")
+    uses_rows = any("counter" in it for it in by_line.values())
+    if cd is None:
+        if uses_rows:
+            raise LookError("direction: 行に counter がありますが、最上位の counter（voices）がありません")
+        return
+    if not isinstance(cd, dict) or not set(cd) <= COUNTER_TOP_KEYS:
+        raise LookError(f"direction: counter は {', '.join(sorted(COUNTER_TOP_KEYS))} の項目を持つ辞書で書いてください")
+    vs = cd.get("voices")
+    names = [vs] if isinstance(vs, str) else vs
+    if not isinstance(names, list) or not names or not all(isinstance(x, str) for x in names):
+        raise LookError("direction: counter.voices は声の名前（文字列）か、その配列で書いてください"
+                        "（カウンターが出てよい声。それ以外の声の行は消える・出ない）")
+    appear = cd.get("appear", [])
+    if not isinstance(appear, list):
+        raise LookError("direction: counter.appear は配列で書いてください")
+    for i, ap in enumerate(appear):
+        where = f"counter.appear[{i}]"
+        if not isinstance(ap, dict) or not set(ap) <= APPEAR_KEYS:
+            raise LookError(f"direction: {where} は {', '.join(sorted(APPEAR_KEYS))} の項目で書いてください")
+        if ("at" in ap) == ("after_line" in ap):
+            raise LookError(f"direction: {where} は at（秒）か after_line＋until_line（行）のどちらか1つで書いてください")
+        if "at" in ap and (not _num(ap["at"]) or ap["at"] < 0):
+            raise LookError(f"direction: {where}.at は 0 以上の秒で書いてください")
+        if "after_line" in ap:
+            if "until_line" not in ap:
+                raise LookError(f"direction: {where} は after_line と until_line を両方書いてください")
+            n = direction.get("n_lines")
+            for key in ("after_line", "until_line"):
+                if not (isinstance(ap[key], int) and not isinstance(ap[key], bool) and 1 <= ap[key] <= n):
+                    raise LookError(f"direction: {where}.{key} が行番号（1〜{n}）ではありません")
+        if "at_fraction" in ap and (not _num(ap["at_fraction"]) or not 0 <= ap["at_fraction"] <= 1):
+            raise LookError(f"direction: {where}.at_fraction は 0〜1 で書いてください")
+        if isinstance(ap.get("count"), bool) or not isinstance(ap.get("count"), int) or ap["count"] < 1:
+            raise LookError(f"direction: {where}.count は 1 以上の整数で書いてください")
+        if ap.get("rate", "per_onset") != "per_onset":
+            raise LookError(f"direction: {where}.rate は per_onset だけです（単語の無い区間は beats のオンセットで増やす）")
+
+
+def _validate_interludes(direction):
+    il = direction.get("interludes")
+    if il is None:
+        return
+    if not isinstance(il, list):
         raise LookError("direction: interludes は配列で書いてください")
+    n = direction.get("n_lines")
+    for i, it in enumerate(il):
+        where = f"interludes[{i}]"
+        if not isinstance(it, dict) or not set(it) <= INTERLUDE_KEYS:
+            raise LookError(f"direction: {where} は {', '.join(sorted(INTERLUDE_KEYS))} の項目で書いてください")
+        if it.get("kind", "duotone") not in INTERLUDE_KINDS:
+            raise LookError(f"direction: {where}.kind は {', '.join(INTERLUDE_KINDS)} だけです")
+        if ("start" in it) == ("after_line" in it):
+            raise LookError(f"direction: {where} は start（秒）か after_line（行）のどちらか1つを書いてください")
+        ends = [k for k in ("end", "until_line", "until") if k in it]
+        if len(ends) != 1:
+            raise LookError(f"direction: {where} は end（秒）・until_line（行）・until（\"end\"＝曲末）のどれか1つを書いてください")
+        for key in ("start", "end"):
+            if key in it and (not _num(it[key]) or it[key] < 0):
+                raise LookError(f"direction: {where}.{key} は 0 以上の秒で書いてください")
+        for key in ("after_line", "until_line"):
+            if key in it and not (isinstance(it[key], int) and not isinstance(it[key], bool) and 1 <= it[key] <= n):
+                raise LookError(f"direction: {where}.{key} が行番号（1〜{n}）ではありません")
+        if "until" in it and it["until"] != "end":
+            raise LookError(f'direction: {where}.until は "end"（曲末）だけです')
+        if "zoom_peak" in it and (not _num(it["zoom_peak"]) or not 1.0 <= it["zoom_peak"] <= 1.2):
+            raise LookError(f"direction: {where}.zoom_peak は 1.0〜1.2 で書いてください（区間の中点で最大になる往復の寄り）")
+        zr = it.get("zoom_ramp")
+        if zr is not None and (not isinstance(zr, dict) or set(zr) != {"to", "seconds"} or not _num(zr["to"])
+                               or not 1.0 <= zr["to"] <= 1.2 or not _num(zr["seconds"]) or zr["seconds"] <= 0):
+            raise LookError(f"direction: {where}.zoom_ramp は {{to: 1.0〜1.2, seconds: 正の数}} で書いてください")
+        if "zoom_peak" in it and zr is not None:
+            raise LookError(f"direction: {where} は zoom_peak か zoom_ramp のどちらか1つにしてください")
 
 
 # ---------------------------------------------------------------------------

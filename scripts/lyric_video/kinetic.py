@@ -651,7 +651,7 @@ def plan_to_markdown(plan, header=None):
     sung = any("sung_end" in c for c in plan)
     voiced = any("voice" in c for c in plan)
     looked = any("font_role" in c for c in plan)
-    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks"))
+    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo"))
     head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     if voiced:
@@ -689,6 +689,15 @@ def plan_to_markdown(plan, header=None):
                 bits.append(f"点灯 対応{c.get('karaoke_cover', 0):.0%}")
             if c.get("break_after"):
                 bits.append("改行 " + ",".join(f"{k}:{v}" for k, v in sorted(c["break_after"].items())))
+            if c.get("counter") is not None:
+                sp = c["counter"]
+                if isinstance(sp, str):
+                    bits.append(f"カウンター {sp}")
+                else:
+                    bits.append("カウンター " + ",".join(
+                        f"{k}={'割れ' if k == 'break' else v}" for k, v in sp.items()))
+            if c.get("solo"):
+                bits.append("solo")
             bits.extend(c.get("marks") or [])
             row += " " + "；".join(bits) + " |"
         if sung:
@@ -2188,8 +2197,9 @@ def _hash01(n):
     return x - math.floor(x)
 
 
-def apply_interlude_effect(frame, name, strength, t, beat_idx, beat_amt, palette):
-    """frame(PIL RGB) に間奏エフェクトをかける。strength 0..1、beat_amt はビート直後ほど1。"""
+def apply_interlude_effect(frame, name, strength, t, beat_idx, beat_amt, palette, scanlines=True):
+    """frame(PIL RGB) に間奏エフェクトをかける。strength 0..1、beat_amt はビート直後ほど1。
+    scanlines=False は duotone の走査線（横縞）を付けない（テーマの経路で使う）。既定は今までどおり"""
     if strength <= 0.01:
         return frame
     if name == "kaleido_soft":
@@ -2225,7 +2235,7 @@ def apply_interlude_effect(frame, name, strength, t, beat_idx, beat_amt, palette
         light = np.array(_hex(palette[1]), dtype=np.float32)
         tone = dark + (light - dark) * lum
         out = (arr * (1 - strength) + tone * strength).astype(np.int16)
-    if name in ("scan", "duotone"):
+    if name == "scan" or (name == "duotone" and scanlines):
         out = out.copy() if out is arr else out
         offset = int(t * 60) % 6
         out[offset::6] = (out[offset::6] * (1 - 0.5 * strength)).astype(np.int16)
@@ -2354,8 +2364,15 @@ class KineticRenderer:
             self.cuts.append(_Cut(c, self.sprites, colors, palette_bg, beats))
         self.decor = _shared_decor()
         self.impact_zoom = {}
+        self.impact_cap = {}
         self.impact_notes = []
         self._resolve_impact_zoom()
+        self.counter = None
+        self.counter_skipped = 0
+        self._cut_rects = {}
+        if self.themed:
+            self._setup_counter(look, beats)
+            self._check_stage3_late()
         for note in self.look_notes + self.impact_notes:
             print(f"      [書体] {note}")
 
@@ -2411,7 +2428,277 @@ class KineticRenderer:
                                 f"（左右の余白 {SIDE_MARGIN}px・上下 70px・画面の揺れ {sh:g}px・字の揺れ {gs:g}px を守る）。slam の行は寄りと揺れの分を残して"
                                 f"組むはずなので、組み方の誤りです。寄りを 0 に丸めず止めました")
             zoom[c["index"]] = z
+            self.impact_cap[c["index"]] = cap
         self.impact_zoom = zoom
+
+    # --- カウンター（外の層）と、段3後半の検査 ---
+
+    def _setup_counter(self, look, beats):
+        """direction に counter があるときだけ、カウンターの時間軸を作る（プランの counter・単語の開始・beats・テーマの部品だけから決まる）"""
+        import look as look_mod
+        from look import LookError
+
+        if not self._dir.get("counter"):
+            return
+        cfg = (self.theme.get("parts") or {}).get("counter")
+        if cfg is None or "palette" not in cfg or not cfg.get("slots"):
+            raise LookError("direction に counter がありますが、テーマの parts.counter に palette・slots がありません")
+        self.counter = kinetic_fx.Counter(self.plan, self._dir["counter"], beats, cfg)
+        ref = self._fonts.get(cfg["role"])
+        if ref is None:
+            raise LookError(f"parts.counter.role '{cfg['role']}' の書体が解決されていません")
+        font = self.sprites.fonts.get(look_mod.FontRef(ref["path"], ref["index"]), int(cfg["px"]))
+        self.counter.attach_font(font, self.theme["palettes"][cfg["palette"]]["accent"])
+        # 文字の外接矩形（着地後の大きさ × (1 ＋ 寄り)）。avoid は余白込み（置き場の判定）、clip は余白なし（割れの片を描かない範囲）
+        W, H = VIDEO_SIZE
+        margin = float(cfg.get("avoid_px", 24))
+        for j, (c, o) in enumerate(zip(self.plan, self.cuts)):
+            if not o.glyphs:
+                continue
+            X0, Y0, X1, Y1 = self._screen_rect(o)
+            z = 1.0 + self.impact_zoom.get(c["index"], 0.0)
+            clip = (W / 2 + (X0 - W / 2) * z, H / 2 + (Y0 - H / 2) * z, W / 2 + (X1 - W / 2) * z, H / 2 + (Y1 - H / 2) * z)
+            self._cut_rects[j] = ((clip[0] - margin, clip[1] - margin, clip[2] + margin, clip[3] + margin), clip)
+
+    def _counter_rects(self, t):
+        """t に出ている文字の外接矩形（余白込み・余白なし）。slam の入りの拡大中は含めない（読ませる時間ではない）"""
+        avoid, clip = [], []
+        for j, (a, b) in self._cut_rects.items():
+            c = self.plan[j]
+            if c["start"] <= t <= c["end"]:
+                avoid.append(a)
+                clip.append(b)
+        return avoid, clip
+
+    def color_intervals(self):
+        """黄緑（カウンターの色）と琥珀（鍵語の色）が出る区間（半開）。どちらも [(開始, 終了, 理由, 行)]。
+        黄緑 ＝ カウンターの不透明度が 0 でない区間・割れの片が残る区間・glow／fill の行の表示区間。
+        琥珀 ＝ 鍵語を含む行の表示区間（点灯前の未点灯の間も含めて、行の開始から終わりまで）"""
+        green, amber = [], []
+        part = (self.theme.get("parts") or {}).get("counter")
+        if not part or "palette" not in part:
+            return green, amber
+        gcol = self.theme["palettes"][part["palette"]].get("accent")
+        if self.counter is not None:
+            green.extend((a, b, "カウンター", None) for a, b in self.counter.intervals())
+        for c in self.plan:
+            pal = self.theme["palettes"][c["bg"]]
+            if c.get("accent_mode") in ("glow", "fill") and pal.get("accent") == gcol:
+                green.append((c["start"], c["end"], c["accent_mode"], c["index"]))
+            if c.get("accent_idx"):
+                amber.append((c["start"], c["end"], "鍵語", c["index"]))
+        return green, amber
+
+    def counter_contrast(self):
+        """カウンターの比（最悪の背景：背景+10。間奏の duotone をかけた後の色で）。{行: (最小の比, そのときの不透明度)}
+        消えていく途中・割れの落下は装飾として除く（読ませる対象ではない）"""
+        import look as look_mod
+
+        out = {}
+        if self.counter is None:
+            return out
+        part = self.theme["parts"]["counter"]
+        accent = self.theme["palettes"][part["palette"]]["accent"]
+        end = max(c["end"] for c in self.plan)
+        for k in range(int(end * FPS) + 1):
+            t = k / FPS
+            if self.counter.hide_factor(t) < 1.0:
+                continue
+            for st in self.counter.states(t):
+                if st["phase"] == "fall":
+                    continue
+                r = look_mod.contrast(look_mod.over(accent, self.effective_bg(t, 0), st["alpha"]), self.effective_bg(t, 10))
+                row = self.plan[max(bisect.bisect_right(self.starts, t) - 1, 0)]["index"]
+                if row not in out or r < out[row][0]:
+                    out[row] = (r, st["alpha"])
+        return out
+
+    def _check_stage3_late(self):
+        """direction のある曲の、段3後半の検査（止める）。①鍵語の行の表示中にカウンターが見えている ②割れの落ち切りが次の鍵語の行の開始より後
+        ③外の声でない行にカウンターが見えている（割れの行は割れの終わりまで許す）④黄緑と琥珀が同じ時間に出る ⑤カウンターの比が 4.5 を割る
+        ⑥solo の行の表示中に、カウンター・間奏・背景の補間・画面の寄り／揺れがある"""
+        if not self._strict:
+            return
+        from look import COUNTER_MIN_CONTRAST, LookError
+
+        green, amber = self.color_intervals()
+        bad = []
+        for a0, a1, _w, n in amber:
+            for g0, g1, why, gn in green:
+                ov = min(a1, g1) - max(a0, g0)
+                if ov > 1e-6:
+                    who = "カウンター" if why == "カウンター" else f"行{gn} の {why}"
+                    bad.append(f"鍵語の行{n}（{a0:.2f}〜{a1:.2f}秒）と{who}（{g0:.2f}〜{g1:.2f}秒）が {ov:.2f} 秒重なります")
+        if bad:
+            raise LookError("黄緑と琥珀が同じ時間に出ます（琥珀の行の間は外の層を出さない）。止めました：\n  " + "\n  ".join(bad[:8]))
+        if self.counter is not None:
+            for brow, (tb, t_end) in self.counter.break_rows.items():
+                for a0, _a1, _w, n in amber:
+                    if a0 > tb and t_end > a0 + 1e-9:
+                        raise LookError(f"行{brow} の割れの落ち切り（{t_end:.2f}秒）が、次の鍵語の行{n}の開始（{a0:.2f}秒）より後です。止めました")
+            cd = self._dir["counter"]
+            vs = cd["voices"]
+            outer = [vs] if isinstance(vs, str) else list(vs)
+            ivs = self.counter.intervals()
+            for c in self.plan:
+                if c.get("voice") in outer:
+                    continue
+                brk = self.counter.break_rows.get(c["index"])
+                for g0, g1 in ivs:
+                    ov0, ov1 = max(g0, c["start"]), min(g1, c["end"])
+                    if ov1 - ov0 > 1e-6 and not (brk is not None and ov1 <= brk[1] + 1e-6):
+                        raise LookError(f"行{c['index']}（声 {c.get('voice')}）の表示中（{ov0:.2f}〜{ov1:.2f}秒）にカウンターが出ています。"
+                                        f"外の層は外の声の行にだけ出す（二人の声の行は hide・off）。止めました")
+            lows = [(r, row) for row, (r, _a) in self.counter_contrast().items() if r < COUNTER_MIN_CONTRAST]
+            if lows:
+                r, row = min(lows)
+                raise LookError(f"行{row}：カウンターの比が最悪の背景で {r:.2f} で、{COUNTER_MIN_CONTRAST} を割ります（parts.counter.dim を見直す）。止めました")
+        for c in self.plan:
+            if not c.get("solo"):
+                continue
+            w0, w1 = c["start"] - 0.2, c["end"]
+            what = None
+            if self.counter is not None and any(min(w1, g1) - max(w0, g0) > 1e-6 for g0, g1 in self.counter.intervals()):
+                what = "カウンターが出ています"
+            elif any(min(w1, sp["t1"]) - max(w0, sp["t0"]) > 1e-6 for sp in self.interlude_spans):
+                what = "間奏・アウトロの効果の区間と重なります"
+            elif any(min(w1, tr[1]) - max(w0, tr[0]) > 1e-6 for tr in self._transitions):
+                what = "背景の補間の区間と重なります"
+            else:
+                for k in range(int(w0 * FPS), int(w1 * FPS) + 2):
+                    _bg, z, sx, sy = self.camera_at(k / FPS)
+                    if abs(z - 1.0) > 1e-9 or sx or sy:
+                        what = f"画面の寄り・揺れが 0 ではありません（{k / FPS:.2f}秒）"
+                        break
+            if what:
+                raise LookError(f"行{c['index']} は solo（唯一の主役）ですが、表示中（{w0:.2f}〜{w1:.2f}秒）に{what}。止めました")
+
+    # --- 検査の出力（look_report.md・動きの静止画） ---
+
+    def counter_row_table(self):
+        """行ごとのカウンターの状態。[{行, 声, 開始−0.3, 開始−0.15, 開始（不透明度）, 個数, 値, 状態}]"""
+        rows = []
+        if self.counter is None:
+            return rows
+        cn = self.counter
+        for c in self.plan:
+            t0 = c["start"]
+            st = cn.states(t0)
+            if c["index"] in cn.break_rows:
+                kind = "割れ"
+            elif cn.hide_factor(t0) == 0.0:
+                kind = "消えている"
+            elif isinstance(c.get("counter"), str):
+                kind = c["counter"]
+            else:
+                kind = "出ている" if st else "なし"
+            rows.append({"row": c["index"], "voice": c.get("voice"), "a_m30": cn.opacity_at(t0 - 0.3),
+                         "a_m15": cn.opacity_at(t0 - 0.15), "a_0": cn.opacity_at(t0),
+                         "a_end": cn.opacity_at(max(c["end"] - 1e-6, t0)), "n": len(st),
+                         "values": [s_["value"] for s_ in st], "kind": kind})
+        return rows
+
+    def look_report_text(self, theme_name=None):
+        """各行の 役／配色／背景色／文字色／主文字の比（点灯）／未点灯の比（bg+10）／glow の比／カウンターの比／寄りの上限／黄緑と琥珀の出る区間。
+        比はすべて look.contrast（式は1か所）。歌詞は書かない"""
+        import look as look_mod
+
+        green, amber = self.color_intervals()
+        ccon = self.counter_contrast()
+        part = (self.theme.get("parts") or {}).get("counter") or {}
+        out = [f"# look_report（テーマ {theme_name or self.theme.get('look')}）", "",
+               "比は WCAG 2.x（look.contrast）。最悪の背景 ＝ 背景色の各チャンネル +10（紙の微粒子）。歌詞は書かない。", "",
+               "| 行 | 役 | 配色 | 背景色 | 文字色 | 主文字の比（点灯） | 未点灯の比（bg+10） | glow の比 | カウンターの比（最小） | 寄り 段階/上限 | 黄緑の出る区間 | 琥珀の出る区間 | 同時 |",
+               "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for c in self.plan:
+            pal = self.theme["palettes"][c["bg"]]
+            main = look_mod.worst_contrast(pal["text"], pal["bg"], 1.0)
+            unlit = ""
+            if c.get("entrance") == "karaoke":
+                u = pal.get("unlit_opacity", (c.get("karaoke") or {}).get("unlit_opacity", 0.65))
+                unlit = f"{look_mod.worst_contrast(pal['text'], pal['bg'], u):.2f}（{u}）"
+            gl = ""
+            if c.get("accent_mode") == "glow":
+                ga = self.theme["parts"]["glow"]["max_alpha"]
+                gl = f"{look_mod.contrast(pal['text'], look_mod.over(pal.get('accent', pal['text']), pal['bg'], ga)):.2f}"
+            cc = ""
+            if c["index"] in ccon:
+                cc = f"{ccon[c['index']][0]:.2f}（{ccon[c['index']][1]:.2f}）"
+            zoom = ""
+            if c.get("impact"):
+                zoom = f"{c['impact']} {self.impact_zoom.get(c['index'], 0):.3f}/{self.impact_cap.get(c['index'], 0):.3f}"
+            w0, w1 = c["start"], c["end"]
+            gs = [f"{why}{max(g0, w0):.2f}–{min(g1, w1):.2f}" for g0, g1, why, gn in green
+                  if min(g1, w1) - max(g0, w0) > 1e-6]
+            am = f"鍵語 {w0:.2f}–{w1:.2f}" if c.get("accent_idx") else ""
+            clash = ""
+            if am:
+                clash = "重なる" if any(min(w1, g1) - max(w0, g0) > 1e-6 for g0, g1, _y, _n in green) else "なし"
+            out.append(f"| {c['index']} | {c['font_role']} | {c['bg']} | {pal['bg']} | {pal['text']} | {main:.2f} | {unlit} | {gl} | {cc} | {zoom} | "
+                       f"{'; '.join(gs)} | {am} | {clash} |")
+        if self.counter is not None:
+            cn = self.counter
+            out += ["", f"## カウンター（dim {part.get('dim')}、色 {self.theme['palettes'][part['palette']].get('accent')}）", "",
+                    "| 行 | 声 | 状態 | 不透明度 開始−0.3 | 開始−0.15 | 開始 | 終わり | 個数 | 値（開始時点） |",
+                    "|---|---|---|---|---|---|---|---|---|"]
+            for r in self.counter_row_table():
+                out.append(f"| {r['row']} | {r['voice']} | {r['kind']} | {r['a_m30']:.2f} | {r['a_m15']:.2f} | {r['a_0']:.2f} | {r['a_end']:.2f} | "
+                           f"{r['n']} | {','.join(str(v) for v in r['values'])} |")
+            out += ["", "割れ：" + (", ".join(f"行{n} {a:.2f}→{b:.2f}" for n, (a, b) in sorted(cn.break_rows.items())) or "なし"),
+                    "間奏の出現：" + (", ".join(f"{t:.2f}" for t in cn.appear_at) or "なし")]
+        if self.interlude_spans:
+            out += ["", "## 間奏・アウトロの効果", "", "| 区間 | 種類 | 寄り |", "|---|---|---|"]
+            for sp in self.interlude_spans:
+                z = (f"往復 1.00→{sp['zoom_peak']}→1.00" if sp["zoom_peak"] else
+                     f"1.00→{sp['zoom_ramp']['to']}（{sp['zoom_ramp']['seconds']}秒）" if sp["zoom_ramp"] else "なし")
+                out.append(f"| {sp['t0']:.2f}–{sp['t1']:.2f} | {sp['kind']}（走査線なし） | {z} |")
+        out += ["", "## 黄緑と琥珀の同時表示", "",
+                f"琥珀の区間 {len(amber)} 行 × 黄緑の区間 {len(green)} 件を照合。重なり：" +
+                ("なし" if not any(min(a1, g1) - max(a0, g0) > 1e-6 for a0, a1, _w, _n in amber for g0, g1, _y, _m in green) else "あり（止める）")]
+        return "\n".join(out) + "\n"
+
+    def write_look_report(self, cache_dir):
+        """direction のある曲の look_report.md を cache_dir（_work/<hash>/）に書く。Git の外"""
+        path = Path(cache_dir) / "look_report.md"
+        path.write_text(self.look_report_text(), encoding="utf-8")
+        return path
+
+    def motion_entries(self):
+        """動きの静止画（別シート）の行。[(ラベル, 行番号, 種類, [時刻...])]
+        slam＝着地 −2f・着地・+2f・+6f／karaoke＝点灯済み 0%・約50%・100%／カウンターの hide＝開始 −0.3・−0.15・開始（resume は開始の前後）／
+        割れ＝割れ始め・ひびの最後・落下の中ほど・落ち切り／間奏・アウトロ＝区間を6等分"""
+        ent = []
+        for j, c in enumerate(self.plan):
+            o = self.cuts[j]
+            t0, t1 = c["start"], c["end"]
+            if c.get("impact"):
+                L = c["land"]
+                ent.append((f"叩き {c['impact']}", c["index"], "slam", [L - 2 / FPS, L, L + 2 / FPS, L + 6 / FPS]))
+            if o.karaoke:
+                ct = c.get("char_times")
+                n = len(o.glyphs)
+                lf = o.light_frames / FPS
+                if ct:
+                    half = ct[max(math.ceil(n / 2) - 1, 0)] + lf
+                    full = min(ct[-1] + lf, t1 - 1e-3)
+                    ent.append(("点灯", c["index"], "karaoke", [t0 + 0.15, min(half, t1 - 1e-3), full]))
+                else:
+                    ent.append(("点灯（全文点灯に落とした行）", c["index"], "karaoke", [t0 + 0.15, (t0 + t1) / 2, t1 - 0.2]))
+            sp = c.get("counter")
+            if self.counter is not None and isinstance(sp, str) and sp == "hide":
+                ent.append(("カウンター hide", c["index"], "hide", [t0 - 0.3, t0 - 0.15, t0]))
+            if self.counter is not None and isinstance(sp, str) and sp == "resume":
+                ent.append(("カウンター resume", c["index"], "resume", [t0 - 1 / FPS, t0, t0 + 0.1]))
+            br = self.counter.break_rows.get(c["index"]) if self.counter is not None else None
+            if br:
+                b = next(b for b in self.counter.badges if b["break"] and abs(b["break"][0] - br[0]) < 1e-9)
+                _tb, cf, ff = b["break"]
+                ent.append(("カウンター割れ", c["index"], "break",
+                            [br[0], br[0] + cf / FPS, br[0] + (cf + ff / 2) / FPS, br[0] + (cf + ff - 1) / FPS]))
+        for k, sp in enumerate(self.interlude_spans):
+            a, b = sp["t0"], sp["t1"]
+            ent.append((f"間奏・アウトロ {k + 1}", 0, "interlude", [a + (b - a) * (i + 0.5) / 6 for i in range(6)]))
+        return ent
 
     # --- テーマ（名前付きの配色・書体の役・背景色の時間軸） ---
 
@@ -2421,14 +2708,36 @@ class KineticRenderer:
         self._paper = (theme.get("texture") or {}).get("paper", "plain") != "none"
         self._text_width = (theme.get("layout") or {}).get("text_width", TEXT_WIDTH)
         self._strict = bool(look.get("direction"))   # direction のある曲は、下限割れ・高さ超過で止める
+        self._dir = look.get("direction_data") or {}
         self._transitions = []
-        for tr in ((look.get("direction_data") or {}).get("bg_transitions") or []):
+        for tr in (self._dir.get("bg_transitions") or []):
             t0 = float(tr["start"]) if "start" in tr else float(plan[tr["after_line"] - 1]["end"])
             t1 = t0 + float(tr["seconds"]) if "seconds" in tr else float(plan[tr["until_line"] - 1]["start"])
             self._transitions.append((t0, max(t1, t0 + 1e-6), _hex(theme["palettes"][tr["from"]]["bg"]),
-                                      _hex(theme["palettes"][tr["to"]]["bg"])))
+                                      _hex(theme["palettes"][tr["to"]]["bg"]),
+                                      _hex(theme["palettes"][tr["from"]]["text"]), _hex(theme["palettes"][tr["to"]]["text"])))
         self._transitions.sort(key=lambda x: x[0])
         self._tr_starts = [x[0] for x in self._transitions]
+        # 間奏・アウトロの効果（direction の interludes。指定した区間だけ。他の空きには出ない）
+        self.interlude_spans = []
+        song_len = self.duration or look.get("duration")
+        for it in (self._dir.get("interludes") or []):
+            from look import LookError
+
+            t0 = float(it["start"]) if "start" in it else float(plan[it["after_line"] - 1]["end"])
+            to_end = it.get("until") == "end"
+            if "end" in it:
+                t1 = float(it["end"])
+            elif "until_line" in it:
+                t1 = float(plan[it["until_line"] - 1]["start"])
+            else:
+                if not song_len:
+                    raise LookError("interludes の until: end には曲の長さが要ります（書き出し・静止画の呼び出しに duration を渡してください）")
+                t1 = float(song_len)
+            if t1 <= t0:
+                raise LookError(f"interludes: 区間が空です（{t0:.2f}〜{t1:.2f}秒）")
+            self.interlude_spans.append({"t0": t0, "t1": t1, "kind": it.get("kind", "duotone"), "to_end": to_end,
+                                         "zoom_peak": it.get("zoom_peak"), "zoom_ramp": it.get("zoom_ramp")})
 
     def _look_context(self, c):
         import look as look_mod
@@ -2454,11 +2763,79 @@ class KineticRenderer:
         color = _hex(self.theme["palettes"][cut["bg"]]["bg"])
         j = bisect.bisect_right(self._tr_starts, t) - 1
         if j >= 0:
-            t0, t1, ca, cb = self._transitions[j]
+            t0, t1, ca, cb = self._transitions[j][:4]
             if cut["start"] <= t0:   # この区間より前に始まったカットの間だけ。次のカットの開始で硬く切り替わる
                 u = min(max((t - t0) / (t1 - t0), 0.0), 1.0)
                 color = tuple(a + (b - a) * u for a, b in zip(ca, cb))
         return color
+
+    def text_color_at(self, t):
+        """その時刻の本文色。背景色の補間と同じ進み具合で、補間の区間は 2 つの配色の本文色の間を線形に補間する"""
+        k = max(bisect.bisect_right(self.starts, t) - 1, 0)
+        cut = self.plan[k]
+        color = _hex(self.theme["palettes"][cut["bg"]]["text"])
+        j = bisect.bisect_right(self._tr_starts, t) - 1
+        if j >= 0:
+            t0, t1 = self._transitions[j][:2]
+            ta, tb = self._transitions[j][4:6]
+            if cut["start"] <= t0:
+                u = min(max((t - t0) / (t1 - t0), 0.0), 1.0)
+                color = tuple(a + (b - a) * u for a, b in zip(ta, tb))
+        return color
+
+    # --- 間奏・アウトロ（テーマの経路。direction の interludes で指定した区間だけ） ---
+
+    def _interlude_at(self, t):
+        """(区間, 強さ 0〜1)。区間の外は (None, 0)。強さは INTERLUDE_FADE で出入り（曲末まで続く区間は出だしだけ）"""
+        for sp in self.interlude_spans:
+            if sp["t0"] <= t <= sp["t1"]:
+                st = min((t - sp["t0"]) / INTERLUDE_FADE, 1.0)
+                if not sp["to_end"]:
+                    st = min(st, (sp["t1"] - t) / INTERLUDE_FADE)
+                return sp, max(st, 0.0)
+        return None, 0.0
+
+    def interlude_zoom(self, t):
+        """画面全体の寄りの倍率。往復（zoom_peak：区間の中点で最大、前半・後半とも smoothstep）か、
+        一方向（zoom_ramp：開始から seconds かけて to まで。以後は保つ）"""
+        f = 1.0
+        for sp in self.interlude_spans:
+            if not sp["t0"] <= t <= sp["t1"]:
+                continue
+            if sp["zoom_peak"] is not None:
+                u = (t - sp["t0"]) / (sp["t1"] - sp["t0"])
+                f *= 1.0 + (float(sp["zoom_peak"]) - 1.0) * _smooth(2 * u if u < 0.5 else 2 - 2 * u)
+            elif sp["zoom_ramp"] is not None:
+                zr = sp["zoom_ramp"]
+                f *= 1.0 + (float(zr["to"]) - 1.0) * _smooth((t - sp["t0"]) / float(zr["seconds"]))
+        return f
+
+    def _duotone_colors(self, t):
+        """duotone の2色。暗い側 ＝ その時刻の背景色、明るい側 ＝ その時刻の本文色（背景の補間と同じ進み具合）"""
+        def to_hex(c):
+            return "#%02X%02X%02X" % tuple(int(round(v)) for v in c)
+
+        return to_hex(self.bg_color_at(t)), to_hex(self.text_color_at(t))
+
+    def _themed_interlude(self, frame, t):
+        sp, st = self._interlude_at(t)
+        if sp is None or st <= 0.01:
+            return frame
+        # 拍の弾み（beat_amt）は使わない。走査線なし（グリッチを使わない）
+        return apply_interlude_effect(frame, sp["kind"], st, t, 0, 0.0, self._duotone_colors(t), scanlines=False)
+
+    def effective_bg(self, t, lift=0):
+        """間奏の duotone をかけた後の、背景の1画素の色（lift ＝ 紙の微粒子で明るくなった分）。効果の外では背景色（＋lift）そのまま"""
+        px = np.array([min(int(round(v)) + lift, 255) for v in self.bg_color_at(t)], dtype=np.float32)
+        sp, st = self._interlude_at(t)
+        if sp is None or st <= 0.01:
+            return tuple(int(v) for v in px)
+        dark = np.array(_hex(self._duotone_colors(t)[0]), dtype=np.float32)
+        light = np.array(_hex(self._duotone_colors(t)[1]), dtype=np.float32)
+        lum = float(np.clip((px[0] * 0.299 + px[1] * 0.587 + px[2] * 0.114) / 255.0 * 1.25, 0, 1))
+        tone = dark + (light - dark) * lum
+        out = px * (1 - st) + tone * st
+        return tuple(int(v) for v in np.clip(out, 0, 255))
 
     def _themed_background(self, t):
         """単色（＋紙の微粒子だけ）。補間中の色はキャッシュしない（色の数だけ 6MB の画像が溜まるため）"""
@@ -2541,12 +2918,14 @@ class KineticRenderer:
             g_zoom += c.get("beat_zoom", 0.012) * (self.bg.pulse(t) - 1.0) / max(self.bg.pulse_scale - 1.0, 1e-3)
         elif c["level"] == 1:
             g_zoom = 1.0 + c.get("creep", 0.015) * uc
+        if self.themed and self.interlude_spans:
+            g_zoom *= self.interlude_zoom(t)   # 間奏・アウトロの寄り引き（指定した区間だけ 1.0 以外）
         return bg_cam, g_zoom, sx, sy
 
     def frame_at(self, t):
         bg_cam, g_zoom, sx, sy = self.camera_at(t)
         if self.themed:
-            frame = self._themed_background(t)
+            frame = self._themed_interlude(self._themed_background(t), t)
         else:
             frame = self._plain_background(t, bg_cam)
         return self._foreground(frame, t, bg_cam, g_zoom, sx, sy)
@@ -2604,6 +2983,9 @@ class KineticRenderer:
         for j in active:
             text_color, _stroke, accent = self.cuts[j].colors
             self.decor.draw(frame, self.plan[j], t, _hex(text_color), _hex(accent), bg_cam)
+        if self.counter is not None:
+            avoid, clip = self._counter_rects(t)
+            self.counter_skipped += self.counter.draw(frame, t, avoid, clip, shatter_pieces)   # 外の層。文字の下
         grain = 0.0
         for j in active:
             self.cuts[j].draw(frame, t, self.sprites, bg_cam)
@@ -2637,6 +3019,8 @@ def render_kinetic(image_path, audio_path, plan, beats, style, output_path, prog
     # subclipped の後は audio.duration が切り出した長さになるので、曲全体の長さは先に控える
     song_duration = audio.duration
     renderer = KineticRenderer(image_path, plan, beats, style, duration=song_duration, backgrounds=backgrounds, look=look)
+    if renderer.themed and (look or {}).get("direction") and (look or {}).get("cache_dir"):
+        renderer.write_look_report(look["cache_dir"])
     t0 = max(float(t_start or 0.0), 0.0)
     t1 = min(float(t_end), song_duration) if t_end is not None else song_duration
     if t1 - t0 < 0.1:
@@ -2745,6 +3129,62 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
                     d.text((6, r * thumb_h + 160), f"余韻 {_fmt(c.get('tail'))}", font=small, fill=(200, 200, 200))
                     d.text((6, r * thumb_h + 180), f"終 {c['end']:.2f}", font=small, fill=(200, 200, 200))
         path = out_dir / f"sheet_{s // cuts_per_sheet + 1:02d}.png"
+        sheet.save(path)
+        sheets.append(path)
+    if renderer.themed and (look or {}).get("direction"):
+        # 動きの静止画（別シート）と、検査の報告。今の列（上）は変えない
+        sheets.extend(render_motion_sheets(renderer, out_dir, cuts_per_sheet=cuts_per_sheet))
+        if (look or {}).get("cache_dir"):
+            renderer.write_look_report(look["cache_dir"])
+    return sheets
+
+
+def render_motion_sheets(renderer, out_dir, cuts_per_sheet=8):
+    """動きの静止画の別シート（sheet_motion_NN.png）。行の種類に応じた列。
+    ラベル：時刻・役と大きさ・背景色と文字色の色コード・点灯済み字数・カウンターの値と不透明度・画面の寄り"""
+    ent = renderer.motion_entries()
+    if not ent:
+        return []
+    out_dir = Path(out_dir)
+    thumb_w, thumb_h = 216, 384
+    ncols = max(len(e[3]) for e in ent)
+    label_font = ImageFont.truetype(FONT_HEAVY, 22)
+    tiny = ImageFont.truetype(FONT_HEAVY, 12)
+    sheets = []
+    for s0 in range(0, len(ent), cuts_per_sheet):
+        chunk = ent[s0:s0 + cuts_per_sheet]
+        sheet = Image.new("RGB", (thumb_w * ncols + 140, thumb_h * len(chunk)), (40, 40, 40))
+        d = ImageDraw.Draw(sheet)
+        for r, (label, row, kind, times) in enumerate(chunk):
+            y0 = r * thumb_h
+            d.text((6, y0 + 8), f"#{row}" if row else "間奏", font=label_font, fill=(255, 255, 255))
+            d.text((6, y0 + 40), label, font=tiny, fill=(255, 230, 120))
+            if row:
+                c = renderer.plan[row - 1]
+                pal = renderer.theme["palettes"][c["bg"]]
+                for k, line in enumerate((f"{c['font_role']} {renderer.cuts[row - 1].size}px", f"bg {pal['bg']}", f"tx {pal['text']}")):
+                    d.text((6, y0 + 60 + k * 16), line, font=tiny, fill=(190, 210, 255))
+            for k, t in enumerate(times):
+                im = renderer.frame_at(t).resize((thumb_w, thumb_h), Image.BILINEAR)
+                x0 = 140 + k * thumb_w
+                sheet.paste(im, (x0, y0))
+                lines = [f"{t:.3f}s"]
+                if row:
+                    c = renderer.plan[row - 1]
+                    o = renderer.cuts[row - 1]
+                    if o.karaoke:
+                        n_lit, n_all = o.lit_count(t - c["start"])
+                        lines.append(f"点灯 {n_lit}/{n_all}")
+                    bg = renderer.bg_color_at(t)
+                    lines.append("bg #%02X%02X%02X" % tuple(int(round(v)) for v in bg))
+                if renderer.counter is not None:
+                    sts = renderer.counter.states(t)
+                    lines.append("C " + (" ".join(f"{s_['value']}({s_['alpha']:.2f}{'' if s_['phase'] == 'run' else s_['phase'][0]})" for s_ in sts) or "なし"))
+                _b, z, sx, sy = renderer.camera_at(t)
+                lines.append(f"寄り {z:.3f}")
+                for m, line in enumerate(lines):
+                    d.text((x0 + 4, y0 + 4 + m * 14), line, font=tiny, fill=(255, 230, 120))
+        path = out_dir / f"sheet_motion_{s0 // cuts_per_sheet + 1:02d}.png"
         sheet.save(path)
         sheets.append(path)
     return sheets
@@ -2969,6 +3409,16 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                 # 点灯の上限は表示の終わり（direction の end で固定した行は sung_end が end より後になりうる）
                 cap = min(c["sung_end"], c["end"]) if c.get("sung_end") is not None else c["end"]
                 c["char_times"] = _karaoke_times(len(flat), time_of, c["start"], cap)
+        # --- 段3後半：カウンター（行の状態と、増える時刻の元になる単語の開始）・solo
+        if direction.get("counter") is not None:
+            if words is None:
+                raise look.LookError(f"direction: 行{c['index']}：counter には単語時刻（whisper_words）が要ります")
+            if "counter" in it:
+                c["counter"] = it["counter"]
+            # 単語の開始（行の開始より前の単語は開始に寄せる。バッジは行の開始から出るため）
+            c["counter_words"] = [round(max(float(w["start"]), c["start"]), 3) for w in _window_words(words, plan, i)]
+        if it.get("solo"):
+            c["solo"] = True
         if it.get("break_after"):
             split_rows_after(c["rows"], it["break_after"], c["index"])   # 範囲の検査（ここで止める）
             _time_of, word_of, _n = match_result
@@ -3171,6 +3621,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
                                   variant=variant, md_header=header, **kwargs)
     runtime = {"style": eff_style, "look": theme_name, "theme": theme, "fonts": fonts,
                "direction": direction is not None, "direction_data": direction, "variant": variant,
+               "duration": duration, "cache_dir": str(cache_dir),
                "digest": {"look": None if theme is None else look.theme_digest(theme),
                           "direction": None if direction is None else look.direction_digest(direction)}}
     return plan, runtime

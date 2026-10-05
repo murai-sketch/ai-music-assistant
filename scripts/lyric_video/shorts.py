@@ -125,8 +125,11 @@ KIND_WEIGHT_SCENE = {"bridge": 2.8, "quiet": 2.6, "verse": 2.4, "pre": 1.8,
 
 def find_shorts(alignment, sections=None, beats=None, duration=None,
                 target=DEFAULT_TARGET, min_sec=SHORT_MIN, max_sec=SHORT_MAX,
-                limit=5, max_hold=2.8, mode="hook"):
+                limit=5, max_hold=2.8, mode="hook", spans=None):
     """切り抜き候補をスコア順に返す。
+
+    spans: 行ごとの表示区間 [(開始, 終了)]（kinetic のプランの start／end）。渡すと、行の終わりを max_hold の見積もりでなく
+           実際の表示の終わりにする（歌い終わりまで残す方式・direction のある曲）。渡さなければ今までと同じ
 
     mode: hook（サビ優先・既定）/ scene（情景優先）/ mix（両方）
 
@@ -137,7 +140,7 @@ def find_shorts(alignment, sections=None, beats=None, duration=None,
         # 切り口ごとに点の付け方が違うので、点数順に混ぜると片方だけになる
         # （サビ優先の点は構造的に高く出る）。交互に採って、両方が必ず入るようにする。
         lists = [find_shorts(alignment, sections, beats, duration, target, min_sec,
-                             max_sec, limit, max_hold, mode=m) for m in ("hook", "scene")]
+                             max_sec, limit, max_hold, mode=m, spans=spans) for m in ("hook", "scene")]
         out = []
         while len(out) < limit and any(lists):
             for lst in lists:
@@ -160,7 +163,10 @@ def find_shorts(alignment, sections=None, beats=None, duration=None,
     sections = list(sections or [r.get("section") or "" for r in alignment])
     sections += [""] * (len(alignment) - len(sections))
     kinds = [section_kind(s) for s in sections]
-    spans = _sung_spans(alignment, max_hold)
+    if spans is not None and len(spans) == len(alignment):
+        spans = [(float(a), max(float(b), float(a) + 0.1)) for a, b in spans]
+    else:
+        spans = _sung_spans(alignment, max_hold)
     blocks = _blocks(spans, kinds)
     block_start = {b[0] for b in blocks}
     block_end = {b[1] for b in blocks}

@@ -530,3 +530,331 @@ def apply_grain(frame, t, strength):
     speck = _GRAIN["specks"][int(t * 12) % len(_GRAIN["specks"])]
     arr = arr + speck * (0.55 * strength)
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+# ---------------------------------------------------------------------------
+# カウンター（歌詞を使わない、増え続ける数字。通知のバッジ）
+#
+# 装飾（Decor）は歌詞の文字列を素材にするが、カウンターは歌詞を使わない。数字は
+# 「単語の開始ごとに +1」（歌に連動）、単語の無い区間は「beats のオンセットごとに +1」で増える。
+# 時間軸（出る・消える・増える・割れる）はプラン（各カットの counter と単語の開始 counter_words）と
+# direction 最上位の counter.appear だけから決まる。描画はその時間軸を読むだけ。
+
+COUNTER_FPS = 30
+COUNTER_HIDE_SEC = 0.3     # hide：行の開始のこの秒数前から、この秒数かけて薄く消える（開始の時点で 0）
+
+
+class Counter:
+    """カウンターの時間軸と描画。
+
+    行の counter の読み方（行は開始順に1回ずつ走査する）:
+      "hide"    行の開始の 0.3 秒前から 0.3 秒で薄く消え、開始の時点で 0。値は保持。次の resume まで消えたまま
+      "resume"  行の開始で 0 フレームで戻る（値は続き）
+      "off"     行の開始で全部取り除く
+      辞書      count（バッジの個数にそろえる。足りない分は 0 から行の開始で出る）／ enter: push（1個、行の開始で押し入る）／
+                rate（per_word | per_word_x2。以後の行にも続く）／ state（run | dim。以後の行にも続く）／
+                break（全バッジを割る。割れ始め ＝ max(行の最初の単語の開始, 行の開始)）
+      指定なし  直前の状態のまま（出ていれば、この行の単語でも増える）
+    最上位 counter.appear は、新しいバッジを 0 から出す（それまでのバッジは取り除く）。単語の無い区間なので、
+    次の行の開始までは beats のオンセットごとに +1。"""
+
+    def __init__(self, plan, spec, beats, cfg):
+        self.plan = plan
+        self.spec = spec or {}
+        self.beats = sorted(float(b) for b in (beats or []))
+        self.cfg = cfg
+        self.dim = float(cfg["dim"])
+        self.slots = list(cfg.get("slots") or [])
+        self.badges = []
+        self.hides = []     # [フェード開始, 消えた時刻, 戻る時刻]
+        self.dims = []      # [(時刻, 薄いか)]
+        self.break_rows = {}   # 行番号 → (割れ始め, 落ち切り)
+        self.appear_at = []
+        self.font = None
+        self.width = self.height = 0
+        self._img_cache = {}
+        self._build()
+
+    # --- 時間軸 ---
+
+    def _appear_events(self):
+        out = []
+        for ap in self.spec.get("appear", []):
+            if "at" in ap:
+                t = float(ap["at"])
+            else:
+                a = float(self.plan[ap["after_line"] - 1]["end"])
+                b = float(self.plan[ap["until_line"] - 1]["start"])
+                t = a + (b - a) * float(ap.get("at_fraction", 0.5))
+            out.append({"t": t, "count": int(ap["count"])})
+        return sorted(out, key=lambda e: e["t"])
+
+    def _build(self):
+        from look import LookError
+
+        INF = float("inf")
+        badges, hides, dims = self.badges, self.hides, self.dims
+        alive = []
+        rate = "per_word"
+        hidden = False
+        last_resume = 0.0
+        appear = self._appear_events()
+        self.appear_at = [e["t"] for e in appear]
+        ai = 0
+
+        def new_badge(t):
+            b = {"id": len(badges), "t_on": t, "t_end": INF, "break": None, "incs": []}
+            badges.append(b)
+            alive.append(b)
+
+        def resume(t):
+            nonlocal hidden, last_resume
+            if hidden:
+                hides[-1][2] = t
+                hidden = False
+                last_resume = t
+
+        for c in self.plan:
+            t0 = float(c["start"])
+            while ai < len(appear) and appear[ai]["t"] <= t0 + 1e-9:
+                ev = appear[ai]
+                ai += 1
+                for b in alive:
+                    b["t_end"] = ev["t"]
+                alive.clear()
+                resume(ev["t"])
+                dims.append((ev["t"], False))
+                for _ in range(ev["count"]):
+                    new_badge(ev["t"])
+                for bt in self.beats:
+                    if ev["t"] <= bt < t0:
+                        for b in alive:
+                            b["incs"].append((bt, 1))
+                rate = "per_word"
+            spec = c.get("counter")
+            broke = False
+            if isinstance(spec, str):
+                if spec == "hide":
+                    if not hidden:
+                        hides.append([max(t0 - COUNTER_HIDE_SEC, last_resume), t0, INF])
+                        hidden = True
+                elif spec == "resume":
+                    resume(t0)
+                elif spec == "off":
+                    for b in alive:
+                        b["t_end"] = t0
+                    alive.clear()
+            elif isinstance(spec, dict):
+                resume(t0)
+                if "rate" in spec:
+                    rate = spec["rate"]
+                if "state" in spec:
+                    dims.append((t0, spec["state"] == "dim"))
+                if spec.get("enter") == "push":
+                    new_badge(t0)
+                n = spec.get("count")
+                if n is not None:
+                    if len(alive) > n:
+                        raise LookError(f"行{c['index']}: counter.count {n} が、出ているバッジの数 {len(alive)} より少ないです"
+                                        f"（減らすときは break か off を使う）")
+                    while len(alive) < n:
+                        new_badge(t0)
+                brk = spec.get("break")
+                if brk:
+                    words = c.get("counter_words") or []
+                    tb = max(float(words[0]) if words else t0, t0)
+                    for b in alive:
+                        b["break"] = (tb, int(brk["crack_f"]), int(brk["fall_f"]))
+                        b["t_end"] = tb + (int(brk["crack_f"]) + int(brk["fall_f"])) / COUNTER_FPS
+                    if alive:
+                        self.break_rows[c["index"]] = (tb, tb + (int(brk["crack_f"]) + int(brk["fall_f"])) / COUNTER_FPS)
+                    alive.clear()
+                    broke = True
+            if alive and not hidden and not broke:
+                step = 2 if rate == "per_word_x2" else 1
+                for tw in c.get("counter_words") or []:
+                    for b in alive:
+                        b["incs"].append((float(tw), step))
+        dims.sort(key=lambda x: x[0])
+        most = 0
+        for b in badges:
+            b["incs"].sort()
+        # 同時に出るバッジの数が、置き場の数を超えないこと（上側の隅だけ。下側は使わない）
+        marks = sorted({b["t_on"] for b in badges})
+        for t in marks:
+            n = sum(1 for b in badges if b["t_on"] <= t < b["t_end"])
+            most = max(most, n)
+        if most > len(self.slots):
+            raise LookError(f"カウンターのバッジが同時に {most} 個出ますが、テーマの parts.counter.slots は {len(self.slots)} か所です")
+        self.max_value = max([sum(n for _t, n in b["incs"]) for b in badges] + [0])
+
+    def hide_factor(self, t):
+        f = 1.0
+        for fs, ha, rs in self.hides:
+            if t < fs or t >= rs:
+                continue
+            if t < ha:
+                f = min(f, 1.0 - (t - fs) / max(ha - fs, 1e-9))
+            else:
+                f = 0.0
+        return f
+
+    def dim_at(self, t):
+        flag = False
+        for ts, d in self.dims:
+            if ts <= t:
+                flag = d
+            else:
+                break
+        return flag
+
+    def states(self, t):
+        """時刻 t に出ているバッジ。[{id, slot, value, alpha, phase(run|crack|fall), q, break_t}]
+        alpha は 0〜1（薄い状態・消えていく途中・割れの片の薄れを含む）。alpha が 0 のものは返さない"""
+        base = self.hide_factor(t) * (self.dim if self.dim_at(t) else 1.0)
+        out = []
+        alive = [b for b in self.badges if b["t_on"] <= t < b["t_end"]]
+        for slot, b in enumerate(alive):
+            value = sum(n for tt, n in b["incs"] if tt <= t)
+            phase, q, bt = "run", 0.0, None
+            a = base
+            if b["break"] is not None:
+                tb, cf, ff = b["break"]
+                bt = tb
+                f = (t - tb) * COUNTER_FPS
+                if f >= cf:
+                    phase = "fall"
+                    q = min((f - cf) / ff, 1.0)
+                    a = base * (1.0 - q * q)
+                elif f >= 0:
+                    phase = "crack"
+            if a <= 0.0:
+                continue
+            out.append({"id": b["id"], "slot": slot, "value": value, "alpha": a, "phase": phase, "q": q, "break_t": bt})
+        return out
+
+    def opacity_at(self, t):
+        return max([s["alpha"] for s in self.states(t)] + [0.0])
+
+    def intervals(self):
+        """どれかのバッジの不透明度が 0 でない区間 [(開始, 終了)]（半開。消えていく途中・割れの片も含む）"""
+        segs = []
+        for b in self.badges:
+            lo, hi = b["t_on"], b["t_end"]
+            cuts = [(lo, hi)]
+            for _fs, ha, rs in self.hides:
+                nxt = []
+                for a, z in cuts:
+                    if rs <= a or ha >= z:
+                        nxt.append((a, z))
+                        continue
+                    if ha > a:
+                        nxt.append((a, ha))
+                    if rs < z:
+                        nxt.append((rs, z))
+                cuts = nxt
+            segs.extend((a, z) for a, z in cuts if z > a)
+        segs.sort()
+        merged = []
+        for a, z in segs:
+            if merged and a <= merged[-1][1] + 1e-9:
+                merged[-1][1] = max(merged[-1][1], z)
+            else:
+                merged.append([a, z])
+        return [(a, z) for a, z in merged]
+
+    # --- 描画 ---
+
+    def attach_font(self, font, color):
+        """書体と色（'#RRGGBB'）を渡して、バッジの大きさ（全バッジ共通。桁数の最大に合わせる）を決める"""
+        self.font = font
+        self.color = _hex(color)
+        digits = max(len(str(self.max_value)), 2)
+        cfg = self.cfg
+        border = int(cfg["border_px"])
+        self.border = border
+        self.width = int(math.ceil(font.getlength("0" * digits))) + 2 * int(cfg.get("pad_x", 22)) + 2 * border
+        self.height = int(cfg["px"]) + 2 * int(cfg.get("pad_y", 8)) + 2 * border
+        self._img_cache.clear()
+
+    def _badge(self, value, interior, crack, color):
+        key = (value, interior, crack)
+        im = self._img_cache.get(key)
+        if im is not None:
+            return im
+        if len(self._img_cache) > 800:
+            self._img_cache.clear()
+        w, h = self.width, self.height
+        im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        radius = int(self.cfg.get("radius", 16))
+        d.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=interior + (255,), outline=color + (255,), width=self.border)
+        d.text((w / 2, h / 2), str(value), font=self.font, fill=color + (255,), anchor="mm")
+        if crack:
+            # 片の境目（4分割の線）。バッジの領域の中だけ。線の色は背景色（割れ目）
+            m = Image.new("L", (w, h), 0)
+            md = ImageDraw.Draw(m)
+            md.rounded_rectangle([self.border, self.border, w - 1 - self.border, h - 1 - self.border],
+                                 radius=max(radius - self.border, 0), fill=255)
+            line = Image.new("L", (w, h), 0)
+            ld = ImageDraw.Draw(line)
+            ld.line([(w // 2, 0), (w // 2, h)], fill=255, width=3)
+            ld.line([(0, h // 2), (w, h // 2)], fill=255, width=3)
+            line = Image.fromarray(np.minimum(np.asarray(line), np.asarray(m)))
+            im.paste(Image.new("RGBA", (w, h), interior + (255,)), (0, 0), line)
+        self._img_cache[key] = im
+        return im
+
+    def place(self, slot, avoid):
+        """置き場の左上 (x, y)。文字の外接矩形（avoid）と重なるときは、同じ隅の中で上へ逃がす。逃がせなければ None"""
+        if slot >= len(self.slots):
+            return None
+        sl = self.slots[slot]
+        x = sl["x"] if sl["corner"] == "tl" else VIDEO_SIZE[0] - sl["x"] - self.width
+        y = float(sl["y"])
+        min_y = float(self.cfg.get("min_y", 48))
+        while True:
+            if not any(x < r[2] and x + self.width > r[0] and y < r[3] and y + self.height > r[1] for r in avoid):
+                return int(x), int(y)
+            y -= 12
+            if y < min_y:
+                return None
+
+    def draw(self, frame, t, avoid, clip, shatter):
+        """avoid: 余白込みの文字の外接矩形（置き場の判定）。clip: 余白なしの文字の外接矩形（割れの片をここへ描かない）。
+        shatter: 4片に割る関数（kinetic.shatter_pieces）。戻り値: 置けずに描かなかったバッジの数"""
+        skipped = 0
+        color = self.color
+        for st in self.states(t):
+            pos = self.place(st["slot"], avoid)
+            if pos is None:
+                skipped += 1
+                continue
+            x, y = pos
+            crop = np.asarray(frame.crop((x, y, x + self.width, y + self.height))).reshape(-1, 3)
+            interior = tuple(int(round(v)) for v in crop.mean(axis=0))
+            crack = st["phase"] != "run"
+            im = self._badge(st["value"], interior, crack, color)
+            if st["phase"] == "fall":
+                for piece, x0, y0, ox, oy in shatter(im, st["q"], st["id"] * 4 + 1):
+                    p = self._with_alpha(piece, st["alpha"])
+                    px, py = int(x + x0 + ox), int(y + y0 + oy)
+                    for r in clip:
+                        ix0, iy0 = max(int(r[0]), px), max(int(r[1]), py)
+                        ix1, iy1 = min(int(math.ceil(r[2])), px + p.size[0]), min(int(math.ceil(r[3])), py + p.size[1])
+                        if ix1 > ix0 and iy1 > iy0:
+                            p.paste((0, 0, 0, 0), (ix0 - px, iy0 - py, ix1 - px, iy1 - py))
+                    frame.paste(p, (px, py), p)
+                continue
+            im = self._with_alpha(im, st["alpha"])
+            frame.paste(im, (x, y), im)
+        return skipped
+
+    @staticmethod
+    def _with_alpha(im, a):
+        aq = round(a * 20) / 20
+        if aq >= 1.0:
+            return im
+        out = im.copy()
+        out.putalpha(im.getchannel("A").point(lambda v: int(v * aq)))
+        return out

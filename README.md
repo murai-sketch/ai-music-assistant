@@ -140,6 +140,54 @@ demucs は音声の読み書きに `ffmpeg` を使うため、`ffmpeg` が PATH 
 ... --short 1        # --short 1,3 / --short all / --short-sec 15
 ```
 
+**曲ごとの見た目と演出（任意）**
+
+書体・配色の組は `scripts/lyric_video/looks/<名前>.json`（テーマ。Git に入る。曲を特定しない値だけ）、
+行ごとの演出は `_work/<音源ハッシュ>/direction.json`（Git に入らない。行番号で書き、歌詞の本文は持たない）に書きます。
+direction は `make_lyric_video.py ... --direction-from <ファイル>` で登録し、`--stills <DIR>` で静止画一覧を見てから書き出します。
+direction のある曲は、`kinetic_plan.json` を手で直さず、direction を直して `--replan` します。
+書き間違い（未知の項目・存在しない名前）は、黙って既定値に戻さず止まります。
+
+```jsonc
+{
+  "n_lines": 40,                       // alignment の行数と違ったら止まる
+  "look": "<テーマ名>",
+  "voices": {"<声>": {"tail": 0.3}},   // 声の名前は任意の文字列
+  "lines": {
+    "1": {"voice": "<声>", "role": "<役>", "palette": "<配色>", "entrance": "karaoke"},
+    "5-6": {"entrance": "cut", "break_after": {"0": 7}},          // 段 0 の 7 字目の後で改行
+    "9": {"entrance": "slam", "impact": "s", "land": "first_word",
+          "counter": {"enter": "push"}},
+    "12": {"accent": "glow", "counter": "hide"},                  // hide / resume / off
+    "20": {"solo": true, "max_px": 140, "min_px": 128}
+  },
+  "impacts": {"s": {"overshoot": 1.4, "land_frames": 4, "undershoot": 0.96,
+                    "glyph_shake_px": 0, "zoom": 0.02, "screen_shake_px": 0}},  // 全キー必須
+  "slam_voice": "<声>",
+  "karaoke": {"unlit_opacity": 0.65, "light_frames": 3, "keyword_unlit": "text",
+              "min_match": 0.6, "min_cover": 0.6},
+  "counter": {"voices": ["<声>"],      // カウンターが出てよい声（それ以外の声の行では出ない）
+              "appear": [{"after_line": 10, "until_line": 11, "at_fraction": 0.5, "count": 1, "rate": "per_onset"}]},
+  "interludes": [
+    {"after_line": 10, "until_line": 11, "kind": "duotone", "zoom_peak": 1.04},
+    {"after_line": 40, "until": "end", "kind": "duotone", "zoom_ramp": {"to": 1.03, "seconds": 12.0}}
+  ]
+}
+```
+
+- **`impacts` / `slam`**：叩きつけの衝撃を段階（名前）で定義し、行に `impact` で当てます。`slam` の行は `slam_voice` の声だけ、Chorus・Bridge の区分には使えず、全体で 8 行まで
+- **`karaoke`**：単語時刻で 1 字ずつ点灯します。照合が足りない行は全文点灯に落とし、警告と `kinetic_plan.md` の印を出します。未点灯の濃さは配色の組の `unlit_opacity` でも上書きできます
+- **`break_after`**：行ごとの改行位置（`{"<段番号>": <字の位置>}`、段は 0 始まり）。単語の途中なら警告
+- **`accent: glow`**：文字の後ろの淡い光（テーマの `parts.glow`。明滅しない）
+- **`counter`**：歌詞を使わない増える数字（テーマの `parts.counter`）。行の値は `hide`（行の開始の 0.3 秒前から薄く消え、開始で 0）／`resume`（行の開始で 0 フレームで戻る。値は続き）／`off`／辞書（`count`・`enter: push`・`rate`・`state`・`break`）。数字は単語の開始ごと（`per_word_x2` は +2）、`appear` の区間は beats のオンセットごとに増えます。`break` は全バッジを 4 片に割ります（文字は割らない）
+- **`interludes`**：指定した区間だけ、背景の補間に追従する 2 色刷り（走査線なし）と、画面全体の寄り引きを足します。区間は時刻（`start`／`end`）か行（`after_line`／`until_line`、曲末は `until: "end"`）で書きます
+- **`solo`**：その行の表示中は、カウンター・間奏・背景の補間・画面の寄り／揺れがないことを検査します（あれば止まる）
+
+**止まる条件**（黙って直さず、行番号と数値を出して止まります）：文字の左右の余白が 92px を割る／役の下限を割る／`slam` の寄りが外接矩形に収まらない／
+`break_after` が範囲外／鍵語の行の表示中にカウンターが見える／割れの落ち切りが次の鍵語の行の開始より後／外の声でない行にカウンターが出る／
+差し色どうし（カウンターの色と鍵語の色）が同じ時間に出る／カウンターの比が最悪の背景で 4.5:1 を割る／`solo` の行の表示中に他の動きがある。
+静止画一覧の出力先には、動きの静止画（`sheet_motion_NN.png`）が増え、`_work/<ハッシュ>/look_report.md` に行ごとのコントラスト比と差し色の出る区間が出ます。
+
 **背景素材**
 
 画像でも動画でも使えます。用途（Verse／サビ／囁き／間奏／どこでも）を付けて複数登録でき、

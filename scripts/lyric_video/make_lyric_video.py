@@ -241,6 +241,7 @@ def main():
                 target=args.short_sec, min_sec=float(lo), max_sec=float(hi or shorts.SHORT_MAX),
                 limit=max(args.short_count, 1), max_hold=style.get("max_hold_sec", 2.8),
                 mode=args.short_mode,
+                spans=[(c["start"], c["end"]) for c in plan] if (rt["direction"] or style.get("hold_mode") == "sung_end") else None,
             )
             mode_ja = {"hook": "サビ頭から", "scene": "情景・心情の場面", "mix": "サビと情景の両方"}
             print(f"[4/4] ショート候補（{mode_ja[args.short_mode]} / 目安 {args.short_sec:.0f}秒 / {lo}〜{hi}秒）:")

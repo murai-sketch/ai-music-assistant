@@ -48,7 +48,11 @@
   "layout": {"text_width": 896},
   "parts": {
     "glow": {"dilate_px": 6, "blur_ratio": 0.125, "max_alpha": 0.18},
-    "counter": {"role": "outer_sub", "px": 44, "border_px": 3, "dim": 0.6}
+    "counter": {
+      "role": "outer_sub", "px": 44, "border_px": 3, "dim": 0.6, "palette": "cool",
+      "radius": 16, "pad_x": 22, "pad_y": 8, "avoid_px": 24, "min_y": 48,
+      "slots": [{"corner": "tl", "x": 64, "y": 120}, {"corner": "tr", "x": 64, "y": 120}, {"corner": "tl", "x": 64, "y": 220}]
+    }
   },
   "texture": {"paper": "plain", "bg_image": false}
 }
