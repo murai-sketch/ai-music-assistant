@@ -58,7 +58,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from align import WORK_DIR, _audio_hash, _get_audio_duration, align_lyrics, detect_language, words_cache_path  # noqa: E402
+from align import WORK_DIR, _audio_hash, _get_audio_duration, align_lyrics, detect_language, words_cache_path, words_source_of  # noqa: E402
 from beats import detect_beats  # noqa: E402
 import shorts as shorts_mod  # noqa: E402
 from song_note import SongNote, sections_for_alignment  # noqa: E402
@@ -86,6 +86,8 @@ STATE = {
     "song_path": None,
     "align_status": "idle",
     "align_error": None,
+    "align_warning": None,
+    "separate_vocals_default": False,
     "render_status": "idle",
     "render_error": None,
     "render_output": None,
@@ -135,10 +137,15 @@ def _backup_alignment(reason):
     return dest
 
 
+def _words_source():
+    """alignment.json がどの文字起こしから作られたか。"vocals"（ボーカル分離）／"mix"（元音源。キー無しも同じ）"""
+    return words_source_of(_load_json(_cache_dir() / "alignment.json", {}))
+
+
 def _transcript():
     note = _note()
     language = detect_language(note.lyric_lines) if note else "ja"
-    segs = _load_json(words_cache_path(_cache_dir(), language), [])
+    segs = _load_json(words_cache_path(_cache_dir(), language, vocals=(_words_source() == "vocals")), [])
     words = []
     for s in segs:
         for w in s.get("words", []):
@@ -148,15 +155,25 @@ def _transcript():
     return words
 
 
-def _run_alignment(reset):
+def _run_alignment(reset, separate_vocals=False):
     STATE["align_status"] = "running"
     STATE["align_error"] = None
+    STATE["align_warning"] = None
     try:
         note = _note()
         if reset:
             _backup_alignment("before-realign")
             (_cache_dir() / "alignment.json").unlink(missing_ok=True)
-        align_lyrics(STATE["audio_path"], note.lyric_lines, use_cache=True)
+        align_lyrics(STATE["audio_path"], note.lyric_lines, use_cache=True,
+                    separate_vocals=separate_vocals)
+        # 指定と結果の作成元が違う＝手直し済みを残して作り直さなかった（align.py の Q4）。画面にも出す
+        got = words_source_of(_load_json(_cache_dir() / "alignment.json", {}))
+        want = "vocals" if separate_vocals else "mix"
+        if got != want:
+            STATE["align_warning"] = (
+                f"手直し済みのタイミングを残しました（作成元の文字起こし：{'ボーカル分離' if got == 'vocals' else '元音源'}）。"
+                f"今回の指定（{'ボーカル分離あり' if want == 'vocals' else 'ボーカル分離なし'}）は反映されていません。"
+                f"作り直すなら「作り直す」を使ってください")
         style = STYLES[DEFAULT_STYLE]
         detect_beats(
             STATE["audio_path"],
@@ -398,6 +415,8 @@ class Handler(BaseHTTPRequestHandler):
                 "transcript": _transcript(),
                 "beats": _beats(),
                 "ignored_gaps": cache.get("ignored_gaps", []),
+                "words_source": words_source_of(cache),
+                "separate_vocals_default": bool(STATE["separate_vocals_default"]),
                 "backups": sorted(p.name for p in _cache_dir().glob("alignment.bak-*.json"))[-8:],
             })
         elif path == "/backgrounds":
@@ -430,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._json({"error": traceback.format_exc().strip().split("\n")[-1]}, 500)
         elif path == "/align/status":
-            self._json({"status": STATE["align_status"], "error": STATE["align_error"]})
+            self._json({"status": STATE["align_status"], "error": STATE["align_error"], "warning": STATE["align_warning"]})
         elif path == "/render/status":
             self._json({
                 "status": STATE["render_status"], "error": STATE["render_error"],
@@ -540,7 +559,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._need("audio_path", "song_path"):
                 return
             params = json.loads(body.decode("utf-8")) if body else {}
-            threading.Thread(target=_run_alignment, args=(bool(params.get("reset")),), daemon=True).start()
+            threading.Thread(target=_run_alignment, args=(bool(params.get("reset")), bool(params.get("separate_vocals"))), daemon=True).start()
             self._json({"ok": True})
         elif path == "/preview":
             if not self._need("audio_path", "song_path", "image_path"):
@@ -661,7 +680,9 @@ fieldset.part legend { color:var(--dim); font-size:12px; }
   <select id="songSelect"><option value="">曲ノートを選ぶ</option></select>
   <button id="alignBtn">自動タイミング</button>
   <button id="realignBtn" title="保存済みの手直しを退避してから作り直す">作り直す</button>
+  <label title="文字起こしだけをボーカル分離音声（demucs）で行う。要 demucs（README）"><input type="checkbox" id="sepVocals">ボーカル分離（厚い音源向け）</label>
   <span class="status" id="alignStatus"></span>
+  <span class="status" id="wordsSourceLabel"></span>
   <span style="flex:1"></span>
   <select id="styleSelect"></select>
   <button id="undoBtn" title="⌘Z">↶</button><button id="redoBtn" title="⌘⇧Z">↷</button>
@@ -865,16 +886,24 @@ async function loadConfig() {
   if (s.audio) markDrop('dropAudio', '🎵 ' + s.audio);
   if (s.image) markDrop('dropImage', '🖼 ' + s.image);
   if (s.song) ss.value = s.song;
-  if (s.audio && s.song) await loadProject();
+  if (s.audio && s.song) await loadProject(true);
 }
 function markDrop(id, text) { $(id).classList.add('ready'); $(id).textContent = text; }
 
-async function loadProject() {
+let wordsSource = 'mix', sepFirstLoad = true;
+// fresh=true：曲・音源を開いたとき。チェックを既定値に戻す（--separate-vocals は最初の読み込みだけ）
+async function loadProject(fresh = false) {
   const res = await fetch('/project');
   if (!res.ok) return;
   const p = await res.json();
   rows = p.alignment; noteLines = p.note_lines; words = p.transcript; beats = p.beats;
   ignoredGaps = p.ignored_gaps || [];
+  wordsSource = p.words_source || 'mix';
+  if (fresh) {
+    $('sepVocals').checked = wordsSource === 'vocals' || (sepFirstLoad && !!p.separate_vocals_default);
+    sepFirstLoad = false;
+  } else if (wordsSource === 'vocals') $('sepVocals').checked = true;
+  $('wordsSourceLabel').textContent = '文字起こし：' + (wordsSource === 'vocals' ? 'ボーカル分離' : '元音源');
   const bs = $('backupSelect');
   bs.length = 1; p.backups.slice().reverse().forEach(n => bs.add(new Option(n.replace('alignment.bak-', '').replace('.json', ''), n)));
   undoStack = []; redoStack = []; lastSnap = snapshot(); setDirty(false);
@@ -925,23 +954,26 @@ function setupDrop(dropId, inputId, url, done) {
     done();
   }
 }
-setupDrop('dropAudio', 'fileAudio', '/upload/audio', async () => { peaks = null; await decodeWaveform(); await loadProject(); });
+setupDrop('dropAudio', 'fileAudio', '/upload/audio', async () => { peaks = null; await decodeWaveform(); await loadProject(true); });
 setupDrop('dropImage', 'fileImage', '/upload/image', () => requestPreview(true));
 $('songSelect').onchange = async e => {
   if (!e.target.value) return;
   const r = await (await fetch('/song?name=' + encodeURIComponent(e.target.value), {method: 'POST'})).json();
   $('alignStatus').textContent = r.ok ? `${r.title}（BPM ${r.bpm ?? '不明'}／${r.lines}行）` : r.error;
-  if ($('dropAudio').classList.contains('ready')) await loadProject();
+  if ($('dropAudio').classList.contains('ready')) await loadProject(true);
 };
 
 async function runAlign(reset) {
   if (reset && !confirm('保存済みの手直しをバックアップに退避して、自動タイミングを作り直します。よろしいですか？')) return;
-  $('alignStatus').textContent = '実行中…（初回は文字起こしに数分かかります）';
-  const r = await fetch('/align/run', {method: 'POST', body: JSON.stringify({reset})});
+  const separate_vocals = $('sepVocals').checked;
+  $('alignStatus').textContent = separate_vocals
+    ? '実行中…（ボーカル分離と文字起こしで数分かかります）'
+    : '実行中…（初回は文字起こしに数分かかります）';
+  const r = await fetch('/align/run', {method: 'POST', body: JSON.stringify({reset, separate_vocals})});
   if (!r.ok) { $('alignStatus').textContent = (await r.json()).error; return; }
   const poll = setInterval(async () => {
     const s = await (await fetch('/align/status')).json();
-    if (s.status === 'done') { clearInterval(poll); $('alignStatus').textContent = '✅ 完了'; await loadProject(); }
+    if (s.status === 'done') { clearInterval(poll); await loadProject(); $('alignStatus').textContent = s.warning ? '⚠ 完了（注意）：' + s.warning : '✅ 完了'; }
     if (s.status === 'error') { clearInterval(poll); $('alignStatus').textContent = '❌ ' + (s.error || '').trim().split('\n').pop(); }
   }, 1500);
 }
@@ -1600,7 +1632,9 @@ def main():
     parser.add_argument("--image", help="起動時にセットする背景画像")
     parser.add_argument("--song", help="起動時にセットする曲ノート（01_Songs/ 配下）")
     parser.add_argument("--no-browser", action="store_true", help="ブラウザを自動で開かない")
+    parser.add_argument("--separate-vocals", action="store_true", help="自動タイミングの「ボーカル分離」チェックを初期ONにする")
     args = parser.parse_args()
+    STATE["separate_vocals_default"] = args.separate_vocals
 
     if args.audio:
         STATE["audio_path"] = str(Path(args.audio).resolve())

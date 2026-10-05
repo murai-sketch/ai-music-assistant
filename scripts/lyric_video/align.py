@@ -51,8 +51,13 @@ whisper_words.json（生の文字起こし）と alignment.json（行タイミ�
 import bisect
 import difflib
 import hashlib
+import importlib.util
 import json
+import os
+import shutil
 import statistics
+import subprocess
+import sys
 import unicodedata
 from pathlib import Path
 
@@ -119,9 +124,70 @@ def _units(text, language):
     return out
 
 
-def words_cache_path(cache_dir, language):
-    """文字起こしキャッシュの置き場所。日本語は従来の名前のまま（既存曲のキャッシュを生かす）。"""
-    return Path(cache_dir) / ("whisper_words.json" if language == "ja" else f"whisper_words.{language}.json")
+def words_cache_path(cache_dir, language, vocals=False):
+    """文字起こしキャッシュの置き場所。日本語は従来の名前のまま（既存曲のキャッシュを生かす）。
+    vocals=True（ボーカル分離音声の文字起こし）は言語の前に .vocals を挟む。"""
+    mid = ".vocals" if vocals else ""
+    return Path(cache_dir) / (f"whisper_words{mid}.json" if language == "ja" else f"whisper_words{mid}.{language}.json")
+
+
+VOCALS_NAME = "vocals.htdemucs.flac"
+
+
+def words_source_of(cache):
+    """alignment.json（読み込み済みの辞書）がどの文字起こしから作られたか。
+    "vocals"（ボーカル分離）／"mix"（元音源。キーが無いものも mix 扱い）。判定はここ1か所に置く。"""
+    return (cache or {}).get("words_source", "mix")
+
+
+def separate_vocals(audio_path, cache_dir):
+    """demucs(htdemucs) でボーカルだけを取り出し、cache_dir/vocals.htdemucs.flac に保存して返す。
+    既にあれば demucs は呼ばない。失敗したら最終ファイルを作らずに例外を投げる（元音源には戻さない）。
+    文字起こし専用。動画の音声・ビート検出には使わない。"""
+    cache_dir = Path(cache_dir)
+    out_path = cache_dir / VOCALS_NAME
+    if out_path.exists():
+        return out_path
+
+    if importlib.util.find_spec("demucs") is None:
+        raise RuntimeError("demucs が入っていません。README の『ボーカル分離（任意）』の手順で入れてください")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cache_dir / f"_sep_tmp-{os.getpid()}"
+    print("      ボーカル分離中（demucs htdemucs、初回はモデルのダウンロードと数分の処理）...")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "demucs", "-n", "htdemucs", "--two-stems=vocals",
+             "--other-method", "none", "--flac", "--filename", "{stem}.{ext}",
+             "-o", str(tmp), str(audio_path)],
+            stderr=subprocess.PIPE,
+        )
+        err = b""
+        while True:  # 進行表示はそのままコンソールへ流しつつ、失敗時のために末尾を保持する
+            chunk = os.read(proc.stderr.fileno(), 4096)
+            if not chunk:
+                break
+            sys.stderr.write(chunk.decode("utf-8", "replace"))
+            sys.stderr.flush()
+            err = (err + chunk)[-8000:]
+        proc.wait()
+        if proc.returncode != 0:
+            text = err.decode("utf-8", "replace").replace("\r", "\n")
+            tail = "\n".join([ln for ln in text.splitlines() if ln.strip()][-6:])
+            raise RuntimeError(
+                f"demucs の実行に失敗しました（終了コード {proc.returncode}）。"
+                f"ffmpeg が PATH に無い場合も失敗します（README『ボーカル分離（任意）』）。\n"
+                f"demucs の出力（末尾）:\n{tail}"
+            )
+        produced = tmp / "htdemucs" / "vocals.flac"
+        if not produced.exists():
+            raise RuntimeError(f"demucs の出力が見つかりません: {produced}")
+        produced.rename(out_path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out_path
+
+
+_separate_vocals = separate_vocals  # align_lyrics の引数名が同名のため別名を置く
 
 
 def _transcribe_words(audio_path, audio_duration=None, language=WHISPER_LANGUAGE):
@@ -532,10 +598,12 @@ def _uniform_fallback_align(lyric_lines, audio_duration):
     return result
 
 
-def align_lyrics(audio_path, lyric_lines, use_cache=True):
+def align_lyrics(audio_path, lyric_lines, use_cache=True, separate_vocals=False):
     """歌唱音声 + 歌詞行リスト から、行ごとの{line, start, end}リストを返す。
     結果は音声ファイルのハッシュでキャッシュされる。
-    言語は歌詞から決め、文字起こしのキャッシュは言語ごとに分ける（日本語の既存曲は従来の名前のまま）。"""
+    言語は歌詞から決め、文字起こしのキャッシュは言語ごとに分ける（日本語の既存曲は従来の名前のまま）。
+    separate_vocals=True なら文字起こしだけをボーカル分離音声で行う（時刻・長さ・キャッシュの置き場は元音源のまま）。
+    alignment.json の words_source は分離ありのときだけ "vocals" と書く（無いものは元音源の文字起こし扱い）。"""
     language = detect_language(lyric_lines)
     audio_path = Path(audio_path)
     audio_hash = _audio_hash(audio_path)
@@ -545,7 +613,22 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
     if use_cache and cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
         if cached.get("lyric_lines") == lyric_lines:
-            return cached["alignment"]
+            cached_source = words_source_of(cached)
+            want_source = "vocals" if separate_vocals else "mix"
+            if cached_source == want_source:
+                return cached["alignment"]
+            if cached.get("edited"):
+                print(f"[WARN] 既存の自動タイミングは手直し済みで、{cached_source} の文字起こしから作られています"
+                      f"（今回の指定は {want_source}）。手直しを残してそのまま使います。"
+                      f"作り直すなら GUI の「作り直す」を使ってください。")
+                return cached["alignment"]
+            print(f"      既存の自動タイミングは {cached_source} の文字起こしから作られているため、"
+                  f"{want_source} で作り直します。")
+            # 作成元が違う → 指定どおりに作り直す。timing_editor 等での手直しは edited に現れないので、
+            # 上書き前に必ず退避する
+            backup = cache_path.with_name(f"alignment.bak-source-changed-{audio_hash}.json")
+            backup.write_text(cache_path.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"      作り直し前の版は {backup.name} に退避しました。")
         if cached.get("edited"):
             # 歌詞ノートが変わった。GUIでの手直しを失わないよう退避してから作り直す
             backup = cache_path.with_name(f"alignment.bak-lyrics-changed-{audio_hash}.json")
@@ -554,11 +637,15 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
                   f"手直し済みの版は {backup.name} に退避しました（GUIの「バックアップから戻す」で戻せます）。")
 
     audio_duration = _get_audio_duration(audio_path)
-    words_path = words_cache_path(cache_dir, language)
+    words_path = words_cache_path(cache_dir, language, vocals=separate_vocals)
     if use_cache and words_path.exists():
         word_segments = json.loads(words_path.read_text(encoding="utf-8"))
     else:
-        word_segments = _transcribe_words(audio_path, audio_duration, language)
+        if separate_vocals:
+            src = _separate_vocals(audio_path, cache_dir)
+        else:
+            src = audio_path
+        word_segments = _transcribe_words(src, audio_duration, language)
         cache_dir.mkdir(parents=True, exist_ok=True)
         words_path.write_text(
             json.dumps(word_segments, ensure_ascii=False, indent=1), encoding="utf-8"
@@ -576,26 +663,29 @@ def align_lyrics(audio_path, lyric_lines, use_cache=True):
         alignment = _uniform_fallback_align(lyric_lines, audio_duration)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"lyric_lines": lyric_lines, "alignment": alignment}
+    if separate_vocals:
+        payload["words_source"] = "vocals"  # 分離なしは書かない（従来とバイト単位で同じ）
     cache_path.write_text(
-        json.dumps(
-            {"lyric_lines": lyric_lines, "alignment": alignment},
-            ensure_ascii=False, indent=2,
-        ),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return alignment
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) != 3:
-        print("使い方: python3 align.py <audio> <01_Songs/曲名.md>")
-        sys.exit(1)
+    ap = argparse.ArgumentParser(description="歌詞行を歌唱音声に時刻合わせする")
+    ap.add_argument("audio")
+    ap.add_argument("song_note", help="01_Songs/曲名.md")
+    ap.add_argument("--separate-vocals", action="store_true",
+                    help="文字起こしだけをボーカル分離音声（demucs htdemucs）で行う。要 demucs（README）")
+    args = ap.parse_args()
 
     from song_note import SongNote
 
-    note = SongNote(sys.argv[2])
-    result = align_lyrics(sys.argv[1], note.lyric_lines)
+    note = SongNote(args.song_note)
+    result = align_lyrics(args.audio, note.lyric_lines, separate_vocals=args.separate_vocals)
     for item in result:
         print(f"[{item['start']:6.2f} -> {item['end']:6.2f}] {item['line']}")

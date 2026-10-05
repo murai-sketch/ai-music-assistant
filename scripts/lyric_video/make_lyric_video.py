@@ -18,6 +18,9 @@ make_lyric_video.py
     --style は kawaii / deathcore / kawaii-deathcore-wametal から選択
     （省略時は kawaii-deathcore-wametal）。
 
+    --separate-vocals を付けると、自動タイミングの文字起こしだけをボーカル分離音声
+    （demucs）で行う。動画の音声・ビート検出・ショートは元音源のまま。要 demucs（README）。
+
     --renderer は kinetic（既定。キネティックタイポグラフィ、kinetic.py）/
     classic（中央下の字幕ポップイン、render.py）。
     kinetic では書き出す前に --stills <DIR> で各カットの静止画一覧を出し、
@@ -70,6 +73,11 @@ def parse_args():
     parser.add_argument(
         "--no-cache", action="store_true",
         help="align/beatsのキャッシュを無視して再計算する",
+    )
+    parser.add_argument(
+        "--separate-vocals", action="store_true",
+        help="文字起こしだけをボーカル分離音声（demucs htdemucs）で行う。"
+             "動画の音声・ビート検出・ショートは元音源のまま。要 demucs（README）",
     )
     parser.add_argument(
         "--renderer", default="kinetic", choices=["kinetic", "classic"],
@@ -151,7 +159,8 @@ def main():
     style = get_style(args.style)
 
     print("[2/4] 歌詞タイミングを推定中（whisper文字起こし、初回は時間がかかります）...")
-    alignment = align_lyrics(audio_path, note.lyric_lines, use_cache=not args.no_cache)
+    alignment = align_lyrics(audio_path, note.lyric_lines, use_cache=not args.no_cache,
+                              separate_vocals=args.separate_vocals)
     print(f"      {len(alignment)}行のタイミングを取得")
 
     print("[3/4] ビート/オンセットを検出中...")

@@ -161,6 +161,7 @@ def _enforce_monotonic(alignment):
 
 
 def _save_cache(alignment_path, cache):
+    cache["edited"] = True  # GUI 保存と同じ意味（手直し済み）。words_source は cache のまま残る
     alignment_path.write_text(
         json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
     )

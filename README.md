@@ -107,6 +107,27 @@ scripts/lyric_video/.venv/bin/python scripts/lyric_video/timing_gui.py \
 描画のプレビュー、部分書き出しができます。ブラウザから使うローカル専用のツールで、
 `127.0.0.1` のみを待ち受けます。
 
+**ボーカル分離（任意）**
+
+歌が演奏に埋もれて文字起こしが拾えない曲（実行時の `一括照合: N/M行` の N が小さいとき）で試してください。
+文字起こしだけをボーカル分離音声で行えます。唸り声（グロウル）の曲では、分離なしのほうが良いことがあります
+（テストでは英語のグロウル曲が、分離ありで 19/54行、分離なしで 52/54行でした）。両方試して照合行数を比べてください。
+[demucs](https://github.com/facebookresearch/demucs) を使います。
+
+```bash
+# 任意導入（requirements.txt には入れていません。torch が入り数百MBになります）
+scripts/lyric_video/.venv/bin/pip install demucs
+```
+
+demucs は音声の読み書きに `ffmpeg` を使うため、`ffmpeg` が PATH 上にある必要があります。
+
+- CLI：`make_lyric_video.py ... --separate-vocals`、または `scripts/lyric_video/.venv/bin/python scripts/lyric_video/align.py <音源> "01_Songs/<曲名>.md" --separate-vocals`
+- GUI：「自動タイミング」の横の「ボーカル分離」にチェック。起動時に `--separate-vocals` を付けると初期ONになります
+- 初回は htdemucs のモデルが自動でダウンロードされ、所要時間は、実測で 4〜5分の曲が約2分強でした（CPU、2026-10-05、1環境での値。環境によって変わります）。demucs が無い・失敗したときは、元音源に切り替えずエラーで止まります
+- 分離音声は `_work/<音源ハッシュ>/vocals.htdemucs.flac`、その文字起こしは `whisper_words.vocals*.json` に残ります（`_work/` は Git に入りません）。分離をやり直すときは `vocals.htdemucs.flac` を消してください。`--no-cache` でも分離音声は作り直しません
+- 分離音声は文字起こしだけに使います。動画の音声・ビート検出・ショートは元音源のままです
+- 手直し済みのタイミングがある曲で分離の指定を変えても、手直しは残して警告を出します。作り直すときは GUI の「作り直す」を使ってください
+
 **ショート動画（TikTok / YouTube ショート）**
 
 15〜60秒の切り抜き区間を自動で選びます。行の途中では切らず、サビの頭から始まり、
