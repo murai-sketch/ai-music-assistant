@@ -45,10 +45,10 @@
   },
   "default_role": "outer",
   "default_palette": "cool",
-  "layout": {"text_width": 900},
+  "layout": {"text_width": 896},
   "parts": {
     "glow": {"dilate_px": 6, "blur_ratio": 0.125, "max_alpha": 0.18},
-    "counter": {"role": "outer_sub", "px": 44, "border_px": 3, "dim": 0.5}
+    "counter": {"role": "outer_sub", "px": 44, "border_px": 3, "dim": 0.6}
   },
   "texture": {"paper": "plain", "bg_image": false}
 }

@@ -23,7 +23,7 @@ look.py
             thicken {below_px, px}（以下の大きさで同色の縁で太らせる）・layer_outline {px}（層が重なるときだけ背景色の縁）
   palettes: bg・text（必須）、stroke・sub・accent（任意）。名前は自由（"image" は使えない）
   voices.<声>: role・palette・tail。default_role／default_palette: direction 無し（--look だけ）のときの既定
-  layout.text_width: 文字を収める横幅 px。texture: paper（plain / none）・bg_image（false のみ。単色背景）
+  layout.text_width: 文字を収める横幅 px（左右の余白 92px なら 896）。texture: paper（plain / none）・bg_image（false のみ。単色背景）
 
 演出（direction.json）の形:
   {
@@ -42,6 +42,7 @@ look.py
       karaoke_land（真偽）／ counter（hide|resume|off、または {count, state, rate, enter, break}）／ solo（真偽）／
       break_after {"<段番号>": <字の位置>}（その字の後で切る。段は 0 始まり）／ min_px（その行だけの下限）
   最上位: impacts {名前: {overshoot, land_frames, undershoot, glyph_shake_px, zoom, screen_shake_px}}（全キー必須）
+          slam_voice "<声>" または ["<声>", ...]（slam を使える声。slam の行があるとき必須）
           karaoke {unlit_opacity, light_frames, keyword_unlit, min_match, min_cover}
           counter {appear: [...]} ／ interludes [...]
   テーマ: palettes.<名前>.unlit_opacity（任意）／ parts.glow {dilate_px, blur_ratio, max_alpha} ／
@@ -251,13 +252,12 @@ ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow")
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
-                      "impacts", "karaoke", "counter", "interludes"}
+                      "impacts", "slam_voice", "karaoke", "counter", "interludes"}
 LAND_MODES = ("first_word", "start")
 COUNTER_STATES = ("hide", "resume", "off")
 COUNTER_KEYS = {"count", "state", "rate", "enter", "break"}
 IMPACT_KEYS = ("overshoot", "land_frames", "undershoot", "glyph_shake_px", "zoom", "screen_shake_px")
 KARAOKE_KEYS = {"unlit_opacity", "light_frames", "keyword_unlit", "min_match", "min_cover"}
-SLAM_VOICE = "outer"       # slam（叩く入り）を使える声。外向きの行だけ（動き §9-7 ①）
 SLAM_MAX_LINES = 8         # slam の行数の上限（動き §9-7 ③）
 UNLIT_MIN_CONTRAST = 5.0   # karaoke の未点灯（bg+10 の最悪の背景）の下限（書体配色 §11.4）
 GLOW_MIN_CONTRAST = 7.0    # glow を重ねた背景に対する文字の下限（書体配色 §11.3）
@@ -443,9 +443,19 @@ def _validate_stage3(direction, by_line, theme):
         slam_rows = [n for n, it in by_line.items() if it.get("entrance") == "slam"]
         if len(slam_rows) > SLAM_MAX_LINES:
             raise LookError(f"direction: slam の行が {len(slam_rows)} 行あります（上限 {SLAM_MAX_LINES}）。叩きが常態化するので止めました")
-        for n in slam_rows:
-            if by_line[n].get("voice") != SLAM_VOICE:
-                raise LookError(f"direction: 行{n} は slam ですが、声が '{SLAM_VOICE}' ではありません（slam は外向きの行だけ）")
+        sv = direction.get("slam_voice")
+        if slam_rows and sv is None:
+            raise LookError("direction: slam の行がありますが、slam を使える声（最上位の slam_voice）が書かれていません")
+        if sv is not None:
+            names = [sv] if isinstance(sv, str) else sv
+            if not isinstance(names, list) or not names or not all(isinstance(x, str) for x in names):
+                raise LookError("direction: slam_voice は声の名前（文字列）か、その配列で書いてください")
+            for n in slam_rows:
+                if by_line[n].get("voice") not in names:
+                    raise LookError(f"direction: 行{n} は slam ですが、声が slam_voice（{', '.join(names)}）ではありません"
+                                    f"（slam は指定した声の行だけ）")
+    elif direction.get("slam_voice") is not None:
+        raise LookError("direction: slam_voice がありますが、impacts がありません")
     kd = direction.get("karaoke")
     if kd is not None:
         if not isinstance(kd, dict) or not set(kd) <= KARAOKE_KEYS:
@@ -498,6 +508,12 @@ def over(fg, bg, a):
     """背景 bg の上に、不透明度 a で fg を重ねた色（8 ビットに丸める）"""
     f, b = _rgb(fg), _rgb(bg)
     return tuple(int(round(b[i] + (f[i] - b[i]) * a)) for i in range(3))
+
+
+def worst_contrast(fg, bg, a):
+    """最悪の背景に対する比の定義：contrast(over(fg, bg, a), bg+10)。
+    文字（バッジ）は名目の背景 bg の上で重ね、比べる背景は紙の微粒子で各チャンネル +10 明るくなった背景"""
+    return contrast(over(fg, bg, a), lift(bg))
 
 
 def lift(bg, n=10):

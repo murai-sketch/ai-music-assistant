@@ -255,22 +255,34 @@ def main():
                 out = (Path(args.out) if args.out and len(picks) == 1
                        else cache_dir / shorts.output_name(cand))
                 print(f"      [{cand['rank']}] {cand['start']:.2f}〜{cand['end']:.2f}秒 を書き出し中...")
-                render_kinetic(image_path, audio_path, plan, beats, style, out,
-                               t_start=cand["start"], t_end=cand["end"], backgrounds=backgrounds, look=rt)
+                try:
+                    render_kinetic(image_path, audio_path, plan, beats, style, out,
+                                   t_start=cand["start"], t_end=cand["end"], backgrounds=backgrounds, look=rt)
+                except look.LookError as e:
+                    print(f"[ERROR] {e}")
+                    sys.exit(1)
                 print(f"[DONE] 出力: {out}")
             return
 
         if args.stills:
             print(f"[4/4] 静止画一覧を書き出し中: {args.stills}")
-            sheets = render_stills(image_path, plan, beats, style, args.stills, backgrounds=backgrounds, look=rt)
+            try:
+                sheets = render_stills(image_path, plan, beats, style, args.stills, backgrounds=backgrounds, look=rt)
+            except look.LookError as e:
+                print(f"[ERROR] {e}")
+                sys.exit(1)
             print(f"[DONE] {len(sheets)}枚: {args.stills}")
             return
         if not args.out:
             print("[ERROR] --out を指定してください")
             sys.exit(1)
         print(f"[4/4] 動画を書き出し中 (renderer=kinetic, style={args.style})...")
-        output_path = render_kinetic(image_path, audio_path, plan, beats, style, args.out,
-                                     backgrounds=backgrounds, look=rt)
+        try:
+            output_path = render_kinetic(image_path, audio_path, plan, beats, style, args.out,
+                                         backgrounds=backgrounds, look=rt)
+        except look.LookError as e:
+            print(f"[ERROR] {e}")
+            sys.exit(1)
 
     print(f"[DONE] 出力: {output_path}")
 

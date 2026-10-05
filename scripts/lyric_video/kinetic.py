@@ -133,6 +133,13 @@ INTERLUDE_BAR_BRIGHTEN = 1.7  # 背景は文字のために暗く保持してい
 SIDE_MARGIN = 92          # テーマを使う曲の左右の余白の下限（px。direction のある曲の検査）
 TEXT_WIDTH = 860          # center / diagonal（左右それぞれ約110px の余白）
 TEXT_WIDTH_NARROW = 790   # 左右に寄せたレイアウト（寄せた側がより端に近づくため）
+# 構図のずらし（描画と、テーマの幅の見積もり _fit_look_rows が同じ値を使う。ここ1か所）
+ANCHOR_X = {"left": 0.47, "right": 0.53}   # 文字の中心の画面幅に対する位置（中央からのずれ）
+ANCHOR_DY = 0.05                           # left は上へ、right は下へ（画面の高さに対する割合）
+ROW_SHIFT_BASE, ROW_SHIFT_STEP = 60, 40    # 段 ri の行頭の位置: left は −BASE＋ri×STEP、right は ＋BASE−ri×STEP
+DIAGONAL_DEG = 8                           # diagonal の傾き（度。左上がり）
+VERTICAL_MARGIN = 70                       # 文字の外接矩形の上下の余白の下限（px）
+WORD_WINDOW_LEAD = 0.3                     # 行の単語の区間は [開始 − この秒数, 次の行の開始)（歌い終わり・点灯・着地が共通で使う）
 
 VERTICAL_MAP = {"ー": "｜", "「": "﹁", "」": "﹂", "『": "﹃", "』": "﹄", "（": "︵", "）": "︶", "…": "︙"}
 
@@ -319,7 +326,7 @@ def sung_ends_from_words(alignment, word_segments, chain_gap=SUNG_CHAIN_GAP_SEC)
                    key=lambda w: w["start"])
     result = []
     for i, item in enumerate(alignment):
-        lo = float(item["start"]) - 0.3
+        lo = float(item["start"]) - WORD_WINDOW_LEAD
         hi = float(alignment[i + 1]["start"]) if i + 1 < len(alignment) else float("inf")
         last = None
         for w in words:
@@ -1047,9 +1054,9 @@ class _Cut:
                 # 弧に沿わせるときの半径。段が長いほど緩い弧にして、端が落ちすぎないようにする
                 arc_r = max(row_w * 1.5, 700.0) if cut["layout"] == "arc" else 0.0
                 if cut["layout"] == "left":
-                    x = -row_w / 2 - 60 + ri * 40
+                    x = -row_w / 2 - ROW_SHIFT_BASE + ri * ROW_SHIFT_STEP
                 elif cut["layout"] == "right":
-                    x = -row_w / 2 + 60 - ri * 40
+                    x = -row_w / 2 + ROW_SHIFT_BASE - ri * ROW_SHIFT_STEP
                 else:
                     x = -row_w / 2
                 y0 = y_cursor
@@ -1154,9 +1161,9 @@ class _Cut:
         # kinetic_plan.json で1カットずつ直せる
         ty = float(cut.get("text_y", 0.5))
         if cut["layout"] == "left":
-            self.anchor = (VIDEO_SIZE[0] * 0.47, VIDEO_SIZE[1] * (ty - 0.05))
+            self.anchor = (VIDEO_SIZE[0] * ANCHOR_X["left"], VIDEO_SIZE[1] * (ty - ANCHOR_DY))
         elif cut["layout"] == "right":
-            self.anchor = (VIDEO_SIZE[0] * 0.53, VIDEO_SIZE[1] * (ty + 0.05))
+            self.anchor = (VIDEO_SIZE[0] * ANCHOR_X["right"], VIDEO_SIZE[1] * (ty + ANCHOR_DY))
         elif cut["layout"] == "vertical":
             self.anchor = (VIDEO_SIZE[0] * (0.68 if cut["index"] % 2 else 0.32), VIDEO_SIZE[1] * (ty - 0.04))
         else:
@@ -1165,13 +1172,13 @@ class _Cut:
             # 画面の上下からはみ出さないよう、文字の中心位置を戻す
             _x0, y0, _x1, y1 = self._bounds()
             ax, ay = self.anchor
-            margin = 70
+            margin = VERTICAL_MARGIN
             if ay + y0 < margin:
                 ay = margin - y0
             if ay + y1 > VIDEO_SIZE[1] - margin:
                 ay = VIDEO_SIZE[1] - margin - y1
             self.anchor = (ax, ay)
-        self.base_angle = -8 if cut["layout"] == "diagonal" else 0
+        self.base_angle = -DIAGONAL_DEG if cut["layout"] == "diagonal" else 0
         if cut.get("entrance") == "stamp":
             self.base_angle = -4 if cut["index"] % 2 else 3
         if cut["layout"] == "grid":
@@ -1227,6 +1234,20 @@ class _Cut:
         layout = cut["layout"]
         strict = bool(look.get("strict"))
         SIDE = SIDE_MARGIN
+        # slam の行は、寄り・画面の揺れ・字の揺れの分を先に引いた幅・高さで組む（演出 §9-12）。
+        # 幅の上限 ＝ (896 − 2×画面の揺れ) ÷ (1＋寄り) − 2×字の揺れ
+        # 高さの上限 ＝ (1780 − 2×画面の揺れ) ÷ (1＋寄り) − 2×字の揺れ
+        # 画面の揺れは寄りの外、字の揺れは寄りの内側で引く。寄りは段階の値のまま（頭打ちしない）
+        iv = cut.get("impact_vals")
+        z_nom = float(iv["zoom"]) if iv else 0.0
+        shake = float(iv["screen_shake_px"]) if iv else 0.0
+        gshake = float(iv.get("glyph_shake_px", 0)) if iv else 0.0
+        usable_w = VIDEO_SIZE[0] - 2 * SIDE
+        usable_h = VIDEO_SIZE[1] - 140
+        if iv:
+            usable_w = (usable_w - 2 * shake) / (1.0 + z_nom) - 2 * gshake
+            usable_h = (usable_h - 2 * shake) / (1.0 + z_nom) - 2 * gshake
+            budget = min(budget, usable_w)
 
         def width(row, s):
             f = fonts.get(font, s)
@@ -1235,10 +1256,10 @@ class _Cut:
         def row_budget(ri):
             if layout not in ("left", "right"):
                 return budget
-            # 段 ri の中心の画面中央からのずれ。left は x = -w/2 - 60 + ri*40、アンカーは 0.47（right は逆）
-            off = (VIDEO_SIZE[0] * (0.47 if layout == "left" else 0.53) - VIDEO_SIZE[0] / 2) \
-                + (-60 + ri * 40 if layout == "left" else 60 - ri * 40)
-            return min(budget, VIDEO_SIZE[0] - 2 * SIDE - 2 * abs(off))
+            # 段 ri の中心の画面中央からのずれ（描画と同じ定数。left は x = -w/2 - BASE + ri*STEP、right は逆）
+            off = (VIDEO_SIZE[0] * ANCHOR_X[layout] - VIDEO_SIZE[0] / 2) \
+                + (-ROW_SHIFT_BASE + ri * ROW_SHIFT_STEP if layout == "left" else ROW_SHIFT_BASE - ri * ROW_SHIFT_STEP)
+            return min(budget, usable_w - 2 * abs(off))
 
         def fit_row(row, ri):
             bud = row_budget(ri)
@@ -1255,11 +1276,11 @@ class _Cut:
             size = min(fit_row(r, i) for i, r in enumerate(rs))
             if layout == "diagonal":
                 # 回転（-8°）後の外接矩形の幅が収まるまで下げる
-                rad = math.radians(8)
+                rad = math.radians(DIAGONAL_DEG)
                 while size > 1:
                     w_max = max(width(r, size) for r in rs)
                     h_all = len(rs) * size * look["leading"]
-                    if w_max * math.cos(rad) + h_all * math.sin(rad) <= VIDEO_SIZE[0] - 2 * SIDE:
+                    if w_max * math.cos(rad) + h_all * math.sin(rad) <= usable_w:
                         break
                     size -= 1
             return size
@@ -1276,7 +1297,7 @@ class _Cut:
                 if len(cand) == len(rows):
                     continue
                 s_c = fit(cand)
-                if len(cand) * s_c * look["leading"] > VIDEO_SIZE[1] - 140:
+                if len(cand) * s_c * look["leading"] > usable_h:
                     break   # これ以上段を増やすと画面の高さに収まらない
                 if best is None or s_c > best[1]:
                     best = (cand, s_c)
@@ -1293,8 +1314,8 @@ class _Cut:
                                 f"break_after・max_px・min_px を見直してください。黙って縮めず止めました")
             else:
                 notes.append(f"行{cut['index']}: 段を増やしても下限 {min_px}px を割る（{size}px で描く）【要確認】")
-        if strict and len(rows) * size * look["leading"] > VIDEO_SIZE[1] - 140:
-            raise LookError(f"行{cut['index']}: {len(rows)}段 × {size}px で、画面の高さ（上下の余白 70px を除く）に収まりません。"
+        if strict and len(rows) * size * look["leading"] > usable_h:
+            raise LookError(f"行{cut['index']}: {len(rows)}段 × {size}px で、画面の高さ（上下の余白 70px と、寄り・揺れの分を除く）に収まりません。"
                             f"break_after を見直してください")
         return rows, size, notes
 
@@ -1572,7 +1593,7 @@ class _Cut:
             alpha = 0.0 if tl < 0 else 1.0
             ct = cut.get("char_times")
             if cut.get("karaoke_land") and ct:
-                p = (cut["start"] + tl - ct[0]) * FPS
+                p = (cut["start"] + tl - cut.get("karaoke_land_at", ct[0])) * FPS
                 if 0 <= p < 3:
                     scale = _lerp(1.06, 1.0, p / 3)
 
@@ -2338,50 +2359,58 @@ class KineticRenderer:
         for note in self.look_notes + self.impact_notes:
             print(f"      [書体] {note}")
 
+    def _screen_rect(self, o):
+        """カットの文字の外接矩形（アンカーを足した画面の座標）。回転（diagonal 等）は両向きの角を取って広いほうを採る"""
+        x0, y0, x1, y1 = o._bounds()
+        ax, ay = o.anchor
+        if not o.base_angle:
+            return ax + x0, ay + y0, ax + x1, ay + y1
+        rad = math.radians(abs(o.base_angle))
+        c, s_ = math.cos(rad), math.sin(rad)
+        xs, ys = [], []
+        for sg in (1, -1):
+            for px in (x0, x1):
+                for py in (y0, y1):
+                    xs.append(ax + px * c - sg * py * s_)
+                    ys.append(ay + sg * px * s_ + py * c)
+        return min(xs), min(ys), max(xs), max(ys)
+
     def _resolve_impact_zoom(self):
-        """slam（impact のあるカット）の画面の寄りを、着地後の外接矩形で頭打ちにする（動き §9-0 #3・§9-6）。
-        上限 ＝ min(段階の値, 896 ÷ 外接矩形の幅 − 1)。そのうえで、
-        ①最大の段階の寄りの最小値 < 最小の段階の寄り × 2 なら、最小の段階の寄りを 最大の最小値 ÷ 2 に下げる
-        ②中間の段階が最大の最小値を超えたら、最大の最小値に揃える（小 ≦ 中 ≦ 大）。
-        外接矩形はプランの時点では分からないので、ここ（描画の準備時）で決める。結果は self.impact_zoom[カット番号]"""
-        items = [(c, o) for c, o in zip(self.plan, self.cuts) if c.get("impact_vals") and o.glyphs]
-        if not items:
-            return
-        usable = VIDEO_SIZE[0] - 2 * SIDE_MARGIN
+        """余白の検査（direction のある曲）と、slam（impact のあるカット）の寄りの上限の検査。
+        上限 z ＝ min(448 ÷ max(540−x0, x1−540), 890 ÷ max(960−y0, y1−960)) − 1
+        （448 ＝ 540 − 左右の余白 92、890 ＝ 960 − 上下の余白 70。座標は着地後の外接矩形に anchor を足した画面の座標）。
+        画面の揺れは分子から、字の揺れは分母（寄りの内側）から引く（(448 − 画面の揺れ) ÷ (… ＋ 字の揺れ)）。slam の行は組む時点で寄りと揺れの分を残してあるので、
+        上限は段階の値以上になる。寄りは段階の値のまま使う（頭打ち・引き下げはしない）。
+        上限が段階の値を下回ったら、組み方の誤りとして止める。結果は self.impact_zoom[カット番号]"""
+        from look import LookError
+
+        W, H = VIDEO_SIZE
+        strict = bool(getattr(self, "_strict", False))
         zoom = {}
-        for c, o in items:
-            x0, y0, x1, y1 = o._bounds()
-            w, h = x1 - x0, y1 - y0
-            if o.base_angle:
-                rad = math.radians(abs(o.base_angle))
-                w = w * math.cos(rad) + h * math.sin(rad)
-            cap = max(usable / max(w, 1.0) - 1.0, 0.0)
-            z = min(float(c["impact_vals"]["zoom"]), cap)
+        for c, o in zip(self.plan, self.cuts):
+            if not o.glyphs:
+                continue
+            X0, Y0, X1, Y1 = self._screen_rect(o)
+            iv = c.get("impact_vals")
+            z = float(iv["zoom"]) if iv else 0.0
+            sh = float(iv["screen_shake_px"]) if iv else 0.0
+            gs = float(iv.get("glyph_shake_px", 0)) if iv else 0.0
+            if strict:
+                # 左右の余白 92px（着地後の静止時）。寄りと揺れを含めた最大の瞬間は、下の slam の検査で見る
+                m = min(X0, W - X1)
+                if m < SIDE_MARGIN - 1e-6:
+                    raise LookError(f"行{c['index']}: 文字の外接矩形の左右の余白が {m:.2f}px で、{SIDE_MARGIN}px を割ります"
+                                    f"（左 {X0:.2f}px・右 {W - X1:.2f}px）。構図・max_px・break_after を見直してください。黙って縮めず止めました")
+            if not iv:
+                continue
+            hx = max(W / 2 - X0, X1 - W / 2)
+            hy = max(H / 2 - Y0, Y1 - H / 2)
+            cap = min((W / 2 - SIDE_MARGIN - sh) / max(hx + gs, 1.0), (H / 2 - VERTICAL_MARGIN - sh) / max(hy + gs, 1.0)) - 1.0
+            if cap < z - 1e-9:
+                raise LookError(f"行{c['index']}: 衝撃 {c['impact']} の寄り {z} に対し、外接矩形から出る寄りの上限が {cap:.4f} です"
+                                f"（左右の余白 {SIDE_MARGIN}px・上下 70px・画面の揺れ {sh:g}px・字の揺れ {gs:g}px を守る）。slam の行は寄りと揺れの分を残して"
+                                f"組むはずなので、組み方の誤りです。寄りを 0 に丸めず止めました")
             zoom[c["index"]] = z
-            if z < float(c["impact_vals"]["zoom"]) - 1e-9:
-                self.impact_notes.append(
-                    f"行{c['index']}: 衝撃 {c['impact']} の寄りを {c['impact_vals']['zoom']} → {z:.4f} に頭打ち（外接矩形の幅 {w:.0f}px、余白 {SIDE_MARGIN}px を守る）")
-        nominal = {}
-        for c, _o in items:
-            nominal.setdefault(c["impact"], float(c["impact_vals"]["zoom"]))
-        names = sorted(nominal, key=lambda n: nominal[n])
-        if len(names) >= 2:
-            small, large = names[0], names[-1]
-            idx_of = {n: [c["index"] for c, _o in items if c["impact"] == n] for n in names}
-            l_min = min(zoom[i] for i in idx_of[large])
-            for n in names[1:-1]:
-                for i in idx_of[n]:
-                    if zoom[i] > l_min:
-                        self.impact_notes.append(f"行{i}: 衝撃 {n} の寄り {zoom[i]:.4f} が 最大の段階（{large}）の最小 {l_min:.4f} を超えるので揃える")
-                        zoom[i] = l_min
-            s_max = max(zoom[i] for i in idx_of[small])
-            if l_min < s_max * 2:
-                for i in idx_of[small]:
-                    new = min(zoom[i], l_min / 2)
-                    if new < zoom[i] - 1e-9:
-                        self.impact_notes.append(
-                            f"行{i}: 衝撃 {small} の寄り {zoom[i]:.4f} → {new:.4f}（最大の段階 {large} の最小 {l_min:.4f} の 1/2。2倍の差を保つ）")
-                    zoom[i] = new
         self.impact_zoom = zoom
 
     # --- テーマ（名前付きの配色・書体の役・背景色の時間軸） ---
@@ -2759,7 +2788,7 @@ def _is_chorus_or_bridge(section):
 
 def _window_words(words, plan, i):
     """行 i の区間 [開始 − 0.3, 次の行の開始) に始まる単語（開始順。sung_ends_from_words と同じ区間）"""
-    lo = plan[i]["start"] - 0.3
+    lo = plan[i]["start"] - WORD_WINDOW_LEAD
     hi = plan[i + 1]["start"] if i + 1 < len(plan) else float("inf")
     return [w for w in words if lo <= w["start"] < hi]
 
@@ -2927,6 +2956,8 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                             "keyword_unlit": kcfg.get("keyword_unlit", "text")}
             if it.get("karaoke_land"):
                 c["karaoke_land"] = True
+                if match_result[0]:
+                    c["karaoke_land_at"] = round(max(min(match_result[0].values()), c["start"]), 3)   # 最初の単語の開始
             time_of, _word_of, n_units = match_result
             cover = len(time_of) / n_units if n_units else 0.0
             c["karaoke_cover"] = round(cover, 2)
@@ -2935,15 +2966,19 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                 c["karaoke_all_lit"] = True
                 mark(c, f"karaoke：対応が足りない（match {match}、対応 {cover:.0%}）ので全文点灯に落とした")
             else:
-                cap = c.get("sung_end") if c.get("sung_end") is not None else c["end"]
+                # 点灯の上限は表示の終わり（direction の end で固定した行は sung_end が end より後になりうる）
+                cap = min(c["sung_end"], c["end"]) if c.get("sung_end") is not None else c["end"]
                 c["char_times"] = _karaoke_times(len(flat), time_of, c["start"], cap)
         if it.get("break_after"):
             split_rows_after(c["rows"], it["break_after"], c["index"])   # 範囲の検査（ここで止める）
             _time_of, word_of, _n = match_result
             for key, pos in sorted(it["break_after"].items(), key=lambda kv: int(kv[0])):
                 off = sum(len(r) for r in c["rows"][:int(key)]) + pos
-                if off in word_of and off - 1 in word_of and word_of[off] == word_of[off - 1]:
-                    mark(c, f"break_after[{key}]＝{pos}：単語の途中で切っています（段 {key} の {pos} 字目の後）")
+                if off in word_of and off - 1 in word_of:
+                    if word_of[off] == word_of[off - 1]:
+                        mark(c, f"break_after[{key}]＝{pos}：単語の途中で切っています（段 {key} の {pos} 字目の後）")
+                else:
+                    mark(c, f"break_after[{key}]＝{pos}：単語の途中かは判定できません（隣の字が単語に対応していない）")
     for i, (c, it) in enumerate(zip(plan, items)):
         nxt = plan[i + 1] if i + 1 < len(plan) else None
         name = it.get("exit")
@@ -3012,10 +3047,9 @@ def apply_look(plan, theme, direction, vdefaults):
                                      f"{look.GLOW_MIN_CONTRAST} を割ります。止めました")
         if c.get("entrance") == "karaoke":
             u = pal.get("unlit_opacity", (c.get("karaoke") or {}).get("unlit_opacity", 0.65))
-            bgp = look.lift(pal["bg"])
-            ratio = look.contrast(look.over(pal["text"], bgp, u), bgp)
+            ratio = look.worst_contrast(pal["text"], pal["bg"], u)
             if ratio < look.UNLIT_MIN_CONTRAST:
-                raise look.LookError(f"行{c['index']}: 配色 '{palette}' の未点灯（不透明度 {u}、背景+10）の比が {ratio:.2f} で、"
+                raise look.LookError(f"行{c['index']}: 配色 '{palette}' の未点灯（不透明度 {u}、最悪の背景＝背景+10）の比が {ratio:.2f} で、"
                                      f"{look.UNLIT_MIN_CONTRAST} を割ります。この組だけ unlit_opacity を上げてください。止めました")
         if c["layout"] == "vertical":
             c["layout"] = "center"   # 縦組みは使わない（PIL に raqm が無く、長音・括弧が縦用の字形に替わらない）
