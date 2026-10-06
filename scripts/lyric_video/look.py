@@ -264,12 +264,12 @@ def direction_path(cache_dir):
 # direction の行の項目（許可リスト）。別名は読み込み時に正式名へ直す（動き §2 R2 は余韻を tail_sec と書く）。
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
-                  "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars"}
+                  "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow")
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
-                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical"}
+                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points"}
 VERTICAL_KEYS = {"height", "top", "kana_shift"}   # kana_shift: 小書きの仮名を右上へ寄せる量（字の大きさの割合。既定 0＝寄せない）
 import kinetic_vertical as _kv   # noqa: E402（定数だけ。kinetic_vertical は look を遅延 import するので循環しない）
 
@@ -321,6 +321,12 @@ def _normalize_item(item, allowed, where):
             raise LookError(f"direction: {where} の land '{v}' は {', '.join(LAND_MODES)} のどれかで書いてください")
         if name in ("karaoke_land", "solo") and not isinstance(v, bool):
             raise LookError(f"direction: {where} の '{k}' は true / false で書いてください")
+        if name == "text_y" and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.15 <= v <= 0.85):
+            raise LookError(f"direction: {where} の text_y は 0.15〜0.85（画面の高さに対する文字の中心位置）で書いてください")
+        if name == "ink":
+            import kinetic_points   # 遅延 import（kinetic_points は look を遅延 import する）
+
+            kinetic_points.check_ink(v, where, read=True)
         if name == "break_after":
             _check_break_after(v, where)
         if name == "counter":
@@ -419,6 +425,8 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
             if item.get("entrance", "cut") not in VERTICAL_ENTRANCES:
                 raise LookError(f"direction: 行{n} は縦組みですが、入り '{item.get('entrance')}' は縦組みでは使えません"
                                 f"（使える入り: {', '.join(VERTICAL_ENTRANCES)}）。横向きの動き・slam は止めました")
+        if item.get("ink") is not None and item.get("entrance") == "karaoke":
+            raise LookError(f"direction: 行{n} の ink（読み字の質感）は karaoke の行には掛けません（未点灯の濃さの基準が崩れる）")
         if item.get("entrance") == "karaoke":
             if theme is None:
                 raise LookError(f"direction: 行{n} の entrance karaoke はテーマを使う曲でだけ使えます（未点灯の色をテーマの配色から決めます）")
@@ -431,6 +439,10 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} の impact '{item['impact']}' が impacts にありません"
                                 f"（{', '.join(sorted(direction.get('impacts') or {})) or 'impacts なし'}）")
     _validate_stage3(direction, by_line, theme)
+    if direction.get("points") is not None:
+        import kinetic_points   # 遅延 import
+
+        kinetic_points.validate_points(direction["points"], n_lines, theme)
     vt = direction.get("vertical")
     if vt is not None:
         if not isinstance(vt, dict) or not vt or not set(vt) <= VERTICAL_KEYS:

@@ -43,6 +43,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 import kinetic_bg
 import kinetic_fx
+import kinetic_points
 import kinetic_vertical
 
 VIDEO_SIZE = (1080, 1920)
@@ -444,14 +445,29 @@ def _exit_len_sec(cut):
     return _exit_frames_of(cut.get("exit"), cut["end"] - cut["start"]) / FPS
 
 
-def resolve_span(plan, spec, duration=None, where="区間"):
-    """direction の区間指定（背景の補間・間奏・カウンターの出現・素材）を (開始, 終了) の秒に直す。時刻の解決はここだけ。
+def resolve_span(plan, spec, duration=None, where="区間", shown=None):
+    """direction の区間指定（背景の補間・間奏・カウンターの出現・素材・点の層）を (開始, 終了) の秒に直す。時刻の解決はここだけ。
     開始：start（秒）／after_line（その行の表示の終わり）。start_at: "exit_start" を足すと after_line の行の退場の頭
     　　　（表示の終わり − 退場の長さ）。（bg_transitions の "from"（配色の名前）とは別の名前にしてある）
     終了：seconds（開始から）／end（秒）／until_line（その行の開始）／until: "end"（曲の長さ。duration が要る）。
+    点の層の書き方：lines: [a, b]（行 a の開始〜行 b の終わり）／section: 名前（その区分の最初の行〜最後の行。飛び飛びなら止める）。
+    shown（行ごとの表示の終わり。plan と同じ並び）を渡すと、lines・section の終わりは 行の終わりでなく表示の終わり（次の行の見え始めまで延ばした分を含む）。
     空の区間かどうかは呼び出し側が決める（ここでは止めない）"""
     from look import LookError
 
+    if "lines" in spec or "section" in spec:
+        if "lines" in spec:
+            a, b = spec["lines"]
+            idx = list(range(a - 1, b))
+        else:
+            idx = [j for j, c in enumerate(plan) if c.get("section") == spec["section"]]
+            if not idx:
+                raise LookError(f"{where}: 区分 '{spec['section']}' の行がありません")
+            if idx != list(range(idx[0], idx[-1] + 1)):
+                raise LookError(f"{where}: 区分 '{spec['section']}' は飛び飛びです（行 {', '.join(str(plan[j]['index']) for j in idx)}）。"
+                                f"lines で範囲を指定してください")
+        ends = [max(float(plan[j]["end"]), float(shown[j])) if shown is not None else float(plan[j]["end"]) for j in idx]
+        return float(plan[idx[0]]["start"]), max(ends)
     if "start" in spec:
         t0 = float(spec["start"])
     else:
@@ -923,6 +939,21 @@ class _Sprites:
         self.base[key] = g
         return g
 
+    def inked(self, g, key, ink):
+        """読み字に質感（かすれ）を掛けた1字。g は glyph・glyph_v の返り値（画像, l, t, 送り）、key はその字のキー。
+        字の画像の不透明度（縁を含む）のインクを抜く。雑音は (字・画像の大きさ) で固定（色・時間は含まない）。
+        既存の glyph のキーは変えない（ink の指定が無い行はここを通らない）。戻り値は (g, key) と同じ形"""
+        ikey = ("ink", key, ink["mode"], ink.get("amount"))
+        hit = self.base.get(ikey)
+        if hit is None:
+            img = g[0]
+            a = kinetic_points.ink_alpha(img.getchannel("A"), ink, (str(key[1] if key[0] == "v" else key[0]), img.size[0], img.size[1], 0))
+            im2 = img.copy()
+            im2.putalpha(a)
+            hit = (im2, g[1], g[2], g[3])
+            self.base[ikey] = hit
+        return hit, ikey
+
     def outlined(self, ch, font_path, size, fill, outline):
         """太い外側の縁取り＋文字色の細い縁取り（細い書体を太く見せる）。"""
         key = ("outlined", ch, font_path, size, fill, outline)
@@ -1166,7 +1197,24 @@ class _Cut:
 
         kids_style = bool(cut.get("profile_kids"))
 
+        self.read_ink = cut.get("read_ink")    # 読み字の質感（direction の行の ink。kasure だけ）
+        if self.read_ink:
+            if self.karaoke:
+                raise RuntimeError(f"行{cut['index']}: 読み字の ink は karaoke の行には掛けません（未点灯の濃さの基準が崩れる）")
+            if kids_style or neon:
+                raise RuntimeError(f"行{cut['index']}: 読み字の ink は子ども向けの書体・neon の入りには掛けません")
+
         def make_glyph(draw_ch, fpath, gsize, fill, stroke, sw):
+            if self.read_ink:
+                if gsize < kinetic_points.READ_INK_MIN_PX:
+                    raise RuntimeError(f"行{cut['index']}: 読み字の ink は字 {kinetic_points.READ_INK_MIN_PX}px 以上だけです（この行は {gsize}px）。"
+                                       f"小さい字にかすれを掛けると読めない")
+                if vt:
+                    g0, k0 = (sprites.glyph_v(draw_ch, fpath, gsize, fill, stroke, sw, kana_shift),
+                              ("v", draw_ch, fpath, gsize, fill, stroke, sw, kana_shift))
+                else:
+                    g0, k0 = sprites.glyph(draw_ch, fpath, gsize, fill, stroke, sw), (draw_ch, fpath, gsize, fill, stroke, sw)
+                return sprites.inked(g0, k0, self.read_ink)
             if kids_style:
                 return sprites.outlined(draw_ch, fpath, gsize, fill, "#FFFFFF"), ("outlined", draw_ch, fpath, gsize, fill)
             if neon:
@@ -2570,6 +2618,12 @@ class KineticRenderer:
         if self.themed:
             self._setup_counter(look, beats)
             self._check_stage3_late()
+        self.points = []            # 点の層（direction の points）。無い曲は空のまま（描画・検査・レポートに何も足さない）
+        self.points_max = 0
+        self._points_scan = None
+        if self.themed and self._dir.get("points"):
+            self._setup_points(look, beats)
+            self._check_points()
         for note in self.look_notes + self.impact_notes:
             print(f"      [書体] {note}")
 
@@ -2802,9 +2856,12 @@ class KineticRenderer:
             raise LookError(f"parts.counter.role '{cfg['role']}' の書体が解決されていません")
         font = self.sprites.fonts.get(look_mod.FontRef(ref["path"], ref["index"]), int(cfg["px"]))
         self.counter.attach_font(font, self.theme["palettes"][cfg["palette"]]["accent"])
-        # 文字の外接矩形（着地後の大きさ × (1 ＋ 寄り)）。avoid は余白込み（置き場の判定）、clip は余白なし（割れの片を描かない範囲）
+        self._compute_cut_rects(float(cfg.get("avoid_px", 24)))
+
+    def _compute_cut_rects(self, margin):
+        """文字の外接矩形（着地後の大きさ × (1 ＋ 寄り)）。avoid は余白込み（置き場の判定）、clip は余白なし（割れの片を描かない範囲）。
+        カウンターと点の層（読み字の周りの空け）が同じものを使う"""
         W, H = VIDEO_SIZE
-        margin = float(cfg.get("avoid_px", 24))
         for j, (c, o) in enumerate(zip(self.plan, self.cuts)):
             if not o.glyphs:
                 continue
@@ -2822,6 +2879,237 @@ class KineticRenderer:
                 avoid.append(a)
                 clip.append(b)
         return avoid, clip
+
+    # --- 点の層（direction の points。読み字の下に敷く） ---
+
+    def _setup_points(self, look, beats):
+        """direction の points から PointLayer を作る。区間は resolve_span（表示の終わり込み）、字は実行時にプランの行から取る
+        （direction・コードに歌詞を書かない）。読み字の周りの空けは _compute_cut_rects の外接矩形から"""
+        import look as look_mod
+        from look import LookError
+
+        self._compute_cut_rects(0.0)
+        shown = [self._shown_end(c) for c in self.plan]
+        duration = self.duration or look.get("duration")
+        self.point_sprites = kinetic_points.PointSprites(self.sprites.fonts)
+        n_alpha = len(self.plan)
+        for i, sp in enumerate(self._dir["points"]):
+            where = f"points[{i}]"
+            span = sp["span"]
+            t0, t1 = resolve_span(self.plan, span, duration, where=where, shown=shown)
+            if t1 <= t0:
+                raise LookError(f"direction: {where} の区間が空です（{t0:.2f}〜{t1:.2f}秒）")
+            rows = [j for j, c in enumerate(self.plan) if frame_overlap(c["start"], shown[j], t0, t1) > 0]
+            src = sp.get("source", "line")
+            flats = ["".join(c["rows"]) for c in self.plan]
+            if isinstance(src, dict):
+                k = src["key"]
+                if k["line"] > n_alpha:
+                    raise LookError(f"direction: {where}.source.key.line が行数（{n_alpha}）を超えています")
+                text = kinetic_points.source_chars(flats[k["line"] - 1][k["from"]:k["from"] + k["len"]])
+                variants = [(0.0, text)]
+            elif src == "section":
+                name = span.get("section") or (self.plan[rows[0]].get("section") if rows else None)
+                text = "".join(kinetic_points.source_chars(flats[j]) for j, c in enumerate(self.plan) if c.get("section") == name)
+                variants = [(0.0, text)]
+            else:
+                if not rows:
+                    before = [j for j, c in enumerate(self.plan) if c["start"] <= t0]
+                    rows_src = [before[-1]] if before else [0]
+                else:
+                    rows_src = rows
+                variants = [(self.plan[j]["start"], kinetic_points.source_chars(flats[j])) for j in rows_src]
+                variants = [(a, tx) if tx else (a, "・") for a, tx in variants]
+                if any(tx == "・" for _a, tx in variants):
+                    raise LookError(f"direction: {where}（source: line）の行に、点に使える字（文字・数字）がありません")
+            if not variants[0][1]:
+                raise LookError(f"direction: {where} の source から点に使う字が取れません（空白・約物だけ）")
+            rects = []
+            for j in range(len(self.plan)):
+                if j not in self._cut_rects or self.plan[j]["start"] > t1 + 1.0 or shown[j] < t0 - 1.0:
+                    continue
+                rects.append({"ts": self.plan[j]["start"], "te": max(self.plan[j]["end"], shown[j]),
+                              "box": self._cut_rects[j][1], "h": float(self.cuts[j].size)})
+            anchor = None
+            if rows and rows[0] in self._cut_rects:
+                b = self._cut_rects[rows[0]][1]
+                anchor = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+            layer = kinetic_points.PointLayer(sp, i, t0, t1, variants, rects, beats=beats, anchor=anchor)
+            role = sp.get("role") or ("tsubu" if "tsubu" in self.theme["fonts"] else self.theme.get("default_role"))
+            ref = self._fonts.get(role)
+            if ref is None:
+                raise LookError(f"direction: {where} の書体の役 '{role}' が解決されていません")
+            fspec = self.theme["fonts"][role]
+            if (fspec.get("family"), fspec.get("style")) in kinetic_points.LIGHT_BAD_FONTS and any(
+                    look_mod.is_light_palette(self.theme["palettes"][self.plan[j]["bg"]]) for j in rows):
+                raise LookError(f"direction: {where}：白地（明るい地）の粒・線・形に使えない書体です（{fspec.get('family')} {fspec.get('style')}。"
+                                f"字が黒い塊になる。書体配色カタログ §6）")
+            self.points.append({"layer": layer, "font_ref": look_mod.FontRef(ref["path"], ref["index"]), "role": role,
+                                "rows": rows, "t0": t0, "t1": t1})
+
+    def _check_points(self):
+        """点の層の検査（止める）：①読み字の大きさ（60px 以上・点の最大の字の 1.5 倍以上）と、各行に読み字があること ②1フレームの字数の上限
+        ③solo の行・間奏の区間との重なり ④読み字の比（空けの範囲に点を重ねた最悪の背景で 4.5 以上） ⑤全フレームの走査：空けの範囲の不透明度、
+        字数の上限（実際に描く字数）"""
+        import look as look_mod
+        from look import LookError
+
+        P = kinetic_points
+        self._points_contrast = {}
+        for pt in self.points:
+            L = pt["layer"]
+            for j in pt["rows"]:
+                c, o = self.plan[j], self.cuts[j]
+                if not o.glyphs:
+                    raise LookError(f"points[{L.index}]：行{c['index']} に読み字がありません（点の層だけで行を表さない）")
+                if o.size < P.READ_MIN_PX:
+                    raise LookError(f"points[{L.index}]：行{c['index']} の読み字が {o.size}px で、{P.READ_MIN_PX}px を割ります")
+                if o.size < P.READ_RATIO * L.size_max - 1e-9:
+                    raise LookError(f"points[{L.index}]：行{c['index']} の読み字（{o.size}px）が、点の層の最大の字（{L.size_max}px）の "
+                                    f"{P.READ_RATIO} 倍（{P.READ_RATIO * L.size_max:.0f}px）に足りません。点を小さくするか、読み字を大きくしてください")
+                pal = self.theme["palettes"][c["bg"]]
+                bg = look_mod.worst_bg(pal["text"], pal["bg"])
+                ratio = look_mod.contrast(pal["text"], look_mod.over(pal["text"], bg, P.CLEAR_OPACITY))
+                self._points_contrast[(L.index, c["index"])] = ratio
+                if ratio < 4.5:
+                    raise LookError(f"points[{L.index}]：行{c['index']} の読み字の比が、空けの範囲に点（不透明度 {P.CLEAR_OPACITY}）を重ねた最悪の背景で "
+                                    f"{ratio:.2f} になり、4.5 を割ります")
+            if L.nominal_max() > P.MAX_CHARS:
+                raise LookError(f"points[{L.index}]：1フレームの字数が {L.nominal_max()} で、上限 {P.MAX_CHARS} を超えます（自動で減らさない）")
+            w0, w1 = L.t0, L.t1
+            for c in self.plan:
+                if c.get("solo") and frame_overlap(c["start"] - 0.2, self._shown_end(c), w0, w1):
+                    raise LookError(f"points[{L.index}]（{w0:.2f}〜{w1:.2f}秒）が、solo の行{c['index']} の表示中と重なります。止めました")
+            for sp_ in self.interlude_spans:
+                if frame_overlap(sp_["t0"], sp_["t1"], w0, w1):
+                    raise LookError(f"points[{L.index}]（{w0:.2f}〜{w1:.2f}秒）が、間奏・アウトロの効果の区間（{sp_['t0']:.2f}〜{sp_['t1']:.2f}秒）と重なります。止めました")
+        # 字数の合計（同じ時刻に出る点の層を足す）
+        if len(self.points) > 1:
+            lo = min(p_["t0"] for p_ in self.points)
+            hi = max(p_["t1"] for p_ in self.points)
+            for k in range(int(math.ceil(lo * FPS - 1e-9)), int(hi * FPS) + 1):
+                tot = sum(p_["layer"].nominal(k / FPS) for p_ in self.points)
+                if tot > P.MAX_CHARS:
+                    raise LookError(f"{k / FPS:.2f}秒：点の層の字数の合計が {tot} で、上限 {P.MAX_CHARS} を超えます（同じ時刻に出る点の層を足した数。自動で減らさない）")
+        self._scan_points()
+
+    def _scan_points(self):
+        """全フレーム（30fps）の走査（止める）：読み字の空けの範囲（広げた矩形の中）の点の不透明度が 0.25 を超えない／1フレームに描く字数の上限。
+        結果（最大字数・平均字数・空けの中の不透明度の最大）は look_report に出す"""
+        from look import LookError
+
+        P = kinetic_points
+        stats = {p_["layer"].index: {"max": 0, "sum": 0, "n": 0, "clear_max": 0.0} for p_ in self.points}
+        lo = min(p_["t0"] for p_ in self.points)
+        hi = max(p_["t1"] for p_ in self.points)
+        for k in range(int(math.ceil(lo * FPS - 1e-9)), int(hi * FPS) + 1):
+            t = k / FPS
+            total = big = 0
+            for pt in self.points:
+                L = pt["layer"]
+                if t < L.t0 - 1e-9 or t > L.t1 + 1e-9:
+                    continue
+                d = L.points_at(t)
+                n = len(d["x"])
+                total += n
+                big += int((d["size"] > P.BIG_PX).sum())
+                st = stats[L.index]
+                st["max"] = max(st["max"], n)
+                st["sum"] += n
+                st["n"] += 1
+                for r in L.rects:
+                    if not r["ts"] <= t <= r["te"] or n == 0:
+                        continue
+                    x0, y0, x1, y1 = r["box"]
+                    pad = r["h"] * P.CLEAR_PAD_RATIO + d["size"] / 2.0
+                    inside = (d["x"] >= x0 - pad) & (d["x"] <= x1 + pad) & (d["y"] >= y0 - pad) & (d["y"] <= y1 + pad)
+                    if inside.any():
+                        m = float(d["op"][inside].max())
+                        st["clear_max"] = max(st["clear_max"], m)
+                        if m > P.CLEAR_OPACITY + 0.5 / 16 + 1e-9:
+                            raise LookError(f"points[{L.index}]：{t:.2f}秒、読み字の空けの範囲に不透明度 {m:.2f} の点があります（上限 {P.CLEAR_OPACITY}）。止めました")
+            if total > P.MAX_CHARS or big > P.MAX_BIG_CHARS:
+                raise LookError(f"{t:.2f}秒：点の層の字数が {total}（60px を超える字 {big}）で、上限（{P.MAX_CHARS}字・60px 超は {P.MAX_BIG_CHARS}字）を超えます。止めました")
+        self._points_scan = stats
+
+    def _draw_points(self, frame, t):
+        """点の層を貼る（decor の後・カウンターと読み字の前）。色は その時刻の本文色。貼った字数の上限は式の誤りの検出（通常は走査で止まっている）"""
+        color = tuple(int(round(v)) for v in self.text_color_at(t))
+        total = big = 0
+        for pt in self.points:
+            L = pt["layer"]
+            if t < L.t0 - 1e-9 or t > L.t1 + 1e-9:
+                continue
+            n, b = L.draw(frame, t, color, self.point_sprites, pt["font_ref"])
+            total += n
+            big += b
+        if total > self.points_max:
+            self.points_max = total
+        if total > kinetic_points.MAX_CHARS or big > kinetic_points.MAX_BIG_CHARS:
+            raise RuntimeError(f"{t:.2f}秒：点の層の字数が上限を超えました（{total}字、60px 超 {big}字）")
+
+    def _read_run(self, j):
+        """行 j の読み字が「全字が最終位置・不透明度 1（karaoke は未点灯の濃さ以上）」で連続して見える最長の区間（秒, 開始, 終わり）。
+        30fps の全フレームを走査（表示の終わりまで。入りの途中・退場の途中は含まない）"""
+        o, c = self.cuts[j], self.plan[j]
+        dur = c["end"] - c["start"]
+        thr = (o.unlit - 0.02) if o.karaoke else 0.98
+        best, cur_n, cur_s = (0.0, None, None), 0, None
+        k0 = int(math.ceil(c["start"] * FPS - 1e-9))
+        k1 = int(math.ceil(self.shown_until[j] * FPS - 1e-9))
+        for k in range(k0, k1 + 1):
+            t = k / FPS
+            ok = False
+            if t < self.shown_until[j] - 1e-9 or k == k1:
+                tl = self._cut_time(j, t) - c["start"]
+                if 0 <= tl <= dur and o.glyphs:
+                    ok = True
+                    for g in o.glyphs:
+                        dx, dy, sc, ang, _a, _ct, _cr = o.glyph_state(g, tl, dur)
+                        if (abs(dx) > 1.0 or abs(dy) > 1.0 or abs(sc - 1.0) > 0.02 or abs(ang) > 1.0
+                                or o.glyph_opacity(g, tl, dur) < thr):
+                            ok = False
+                            break
+            if ok:
+                if cur_n == 0:
+                    cur_s = t
+                cur_n += 1
+                if cur_n / FPS > best[0]:
+                    best = (cur_n / FPS, cur_s, t)
+            else:
+                cur_n = 0
+        return best
+
+    def points_report_lines(self):
+        """look_report に足す節（点の層があるときだけ）"""
+        P = kinetic_points
+        stats = self._points_scan or {}
+        out = ["", "## 点の層", "",
+               "字は実行時に行から取る（歌詞は書かない）。空けの中の不透明度は全フレーム走査の最大（上限 0.25＋量子化 1/32）。"
+               "点滅の検査（§6）は書き出した mp4 に measure_flicker.py を掛ける（この表には入らない）。", "",
+               "| 点 | 種類 | 区間 | 内容 | 役 | 最大字数 | 平均字数 | 空けの中の不透明度の最大 | 最大の字 | ink |",
+               "|---|---|---|---|---|---|---|---|---|---|"]
+        for pt in self.points:
+            L = pt["layer"]
+            st = stats.get(L.index, {})
+            avg = (st["sum"] / st["n"]) if st.get("n") else 0.0
+            out.append(f"| {L.index} | {L.kind} | {L.t0:.2f}–{L.t1:.2f} | {L.describe()} | {pt['role']} | {st.get('max', 0)} | {avg:.0f} | "
+                       f"{st.get('clear_max', 0.0):.2f} | {L.size_max}px | {(L.ink or {}).get('mode', '')} |")
+        out += ["", "| 点 | 行 | 読み字 | 読める時間（秒） | 区間 | 読み字の比（空けに点を重ねた最悪） |", "|---|---|---|---|---|---|"]
+        short = []
+        for pt in self.points:
+            L = pt["layer"]
+            for j in pt["rows"]:
+                c = self.plan[j]
+                sec, a, b = self._read_run(j)
+                span = f"{a:.2f}–{b:.2f}" if a is not None else "—"
+                flag = "（1.0 秒未満）" if sec < 1.0 else ""
+                if sec < 1.0:
+                    short.append((c["index"], sec))
+                out.append(f"| {L.index} | {c['index']} | {self.cuts[j].size}px | {sec:.2f}{flag} | {span} | "
+                           f"{self._points_contrast.get((L.index, c['index']), 0):.2f} |")
+        out += ["", "読める時間が 1.0 秒未満の行：" + (", ".join(f"行{n}（{s_:.2f}秒）" for n, s_ in short) if short else "なし")]
+        return out
 
     def color_intervals(self):
         """黄緑（カウンターの色）と琥珀（鍵語の色）が出る区間（半開）。どちらも [(開始, 終了, 理由, 行)]。
@@ -3040,6 +3328,8 @@ class KineticRenderer:
         out += ["", "## 黄緑と琥珀の同時表示", "",
                 f"琥珀の区間 {len(amber)} 行 × 黄緑の区間 {len(green)} 件を照合。重なり：" +
                 ("なし" if not any(frame_overlap(a0, a1, g0, g1) for a0, a1, _w, _n in amber for g0, g1, _y, _m in green) else "あり（止める）")]
+        if self.points:
+            out += self.points_report_lines()
         return "\n".join(out) + "\n"
 
     def write_look_report(self, cache_dir):
@@ -3363,6 +3653,8 @@ class KineticRenderer:
         for j in active:
             text_color, _stroke, accent = self.cuts[j].colors
             self.decor.draw(frame, self.plan[j], self._cut_time(j, t), _hex(text_color), _hex(accent), bg_cam)
+        if self.points:
+            self._draw_points(frame, t)   # 点の層。decor の上、カウンターと読み字の下
         if self.counter is not None:
             avoid, clip = self._counter_rects(t)
             self.counter_skipped += self.counter.draw(frame, t, avoid, clip, shatter_pieces)   # 外の層。文字の下
@@ -3737,6 +4029,10 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             c["hold"] = it["hold"]
         if it.get("decor") is not None:
             c["decor"] = it["decor"]
+        if it.get("text_y") is not None:
+            c["text_y"] = float(it["text_y"])    # 文字の中心位置（画面の高さに対する割合。既定 0.5。点の層の下で読み字を下寄りに置く等）
+        if it.get("ink") is not None:
+            c["read_ink"] = dict(it["ink"])     # 読み字の質感（かすれ。_Cut が掛ける）
         if it.get("voice") is not None:
             c["voice"] = it["voice"]
 
