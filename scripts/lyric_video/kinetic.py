@@ -2621,6 +2621,7 @@ class KineticRenderer:
         self.points = []            # 点の層（direction の points）。無い曲は空のまま（描画・検査・レポートに何も足さない）
         self.points_max = 0
         self._points_scan = None
+        self._point_rects_cache = None
         if self.themed and self._dir.get("points"):
             self._setup_points(look, beats)
             self._check_points()
@@ -2856,11 +2857,13 @@ class KineticRenderer:
             raise LookError(f"parts.counter.role '{cfg['role']}' の書体が解決されていません")
         font = self.sprites.fonts.get(look_mod.FontRef(ref["path"], ref["index"]), int(cfg["px"]))
         self.counter.attach_font(font, self.theme["palettes"][cfg["palette"]]["accent"])
-        self._compute_cut_rects(float(cfg.get("avoid_px", 24)))
+        self._counter_margin = float(cfg.get("avoid_px", 24))
+        self._compute_cut_rects()
 
-    def _compute_cut_rects(self, margin):
-        """文字の外接矩形（着地後の大きさ × (1 ＋ 寄り)）。avoid は余白込み（置き場の判定）、clip は余白なし（割れの片を描かない範囲）。
-        カウンターと点の層（読み字の周りの空け）が同じものを使う"""
+    def _compute_cut_rects(self):
+        """文字の外接矩形（着地後の大きさ × (1 ＋ 寄り)）。**余白なし**だけを持つ（clip＝割れの片を描かない範囲）。
+        カウンターは自分の余白（avoid_px）を足して置き場を判定する（_counter_rects）。点の層（読み字の周りの空け）は余白なしをそのまま読む。
+        同じ辞書を余白違いで上書きしない（点の層を足すとカウンターの余白が 0 になった。T35 R0-2）"""
         W, H = VIDEO_SIZE
         for j, (c, o) in enumerate(zip(self.plan, self.cuts)):
             if not o.glyphs:
@@ -2868,15 +2871,16 @@ class KineticRenderer:
             X0, Y0, X1, Y1 = self._screen_rect(o)
             z = 1.0 + self.impact_zoom.get(c["index"], 0.0)
             clip = (W / 2 + (X0 - W / 2) * z, H / 2 + (Y0 - H / 2) * z, W / 2 + (X1 - W / 2) * z, H / 2 + (Y1 - H / 2) * z)
-            self._cut_rects[j] = ((clip[0] - margin, clip[1] - margin, clip[2] + margin, clip[3] + margin), clip)
+            self._cut_rects[j] = clip
 
     def _counter_rects(self, t):
         """t に出ている文字の外接矩形（余白込み・余白なし）。slam の入りの拡大中は含めない（読ませる時間ではない）"""
         avoid, clip = [], []
-        for j, (a, b) in self._cut_rects.items():
+        m = self._counter_margin
+        for j, b in self._cut_rects.items():
             c = self.plan[j]
             if c["start"] <= t <= max(c["end"], self.shown_until[j]):   # 延ばした間（次の行の見え始めまで）の前の行も含める
-                avoid.append(a)
+                avoid.append((b[0] - m, b[1] - m, b[2] + m, b[3] + m))
                 clip.append(b)
         return avoid, clip
 
@@ -2888,7 +2892,7 @@ class KineticRenderer:
         import look as look_mod
         from look import LookError
 
-        self._compute_cut_rects(0.0)
+        self._compute_cut_rects()
         shown = [self._shown_end(c) for c in self.plan]
         duration = self.duration or look.get("duration")
         self.point_sprites = kinetic_points.PointSprites(self.sprites.fonts)
@@ -2929,10 +2933,10 @@ class KineticRenderer:
                 if j not in self._cut_rects or self.plan[j]["start"] > t1 + 1.0 or shown[j] < t0 - 1.0:
                     continue
                 rects.append({"ts": self.plan[j]["start"], "te": max(self.plan[j]["end"], shown[j]),
-                              "box": self._cut_rects[j][1], "h": float(self.cuts[j].size)})
+                              "box": self._cut_rects[j], "h": float(self.cuts[j].size)})
             anchor = None
             if rows and rows[0] in self._cut_rects:
-                b = self._cut_rects[rows[0]][1]
+                b = self._cut_rects[rows[0]]
                 anchor = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
             layer = kinetic_points.PointLayer(sp, i, t0, t1, variants, rects, beats=beats, anchor=anchor)
             role = sp.get("role") or ("tsubu" if "tsubu" in self.theme["fonts"] else self.theme.get("default_role"))
@@ -2949,8 +2953,9 @@ class KineticRenderer:
 
     def _check_points(self):
         """点の層の検査（止める）：①読み字の大きさ（60px 以上・点の最大の字の 1.5 倍以上）と、各行に読み字があること ②1フレームの字数の上限
-        ③solo の行・間奏の区間との重なり ④読み字の比（空けの範囲に点を重ねた最悪の背景で 4.5 以上） ⑤全フレームの走査：空けの範囲の不透明度、
-        字数の上限（実際に描く字数）"""
+        ③solo の行・間奏の区間との重なり ④読み字の比（空けの範囲に点を重ねた最悪の背景で 4.5 以上） ⑤全フレームの走査（_scan_points）：
+        空けの範囲の被覆（重なりを含めた画素。頭打ちの後の値なので、コードが正しければ上限を超えない＝自己確認であって独立の測定ではない。
+        独立の測定は書き出したフレームの画素からの逆算）、字数の上限（実際に描く字数）"""
         import look as look_mod
         from look import LookError
 
@@ -2994,17 +2999,22 @@ class KineticRenderer:
         self._scan_points()
 
     def _scan_points(self):
-        """全フレーム（30fps）の走査（止める）：読み字の空けの範囲（広げた矩形の中）の点の不透明度が 0.25 を超えない／1フレームに描く字数の上限。
-        結果（最大字数・平均字数・空けの中の不透明度の最大）は look_report に出す"""
+        """全フレーム（30fps）の走査（止める）：読み字の空けの範囲（広げた矩形の中）の点の被覆（重なりを含めた画素）が 0.25＋1/255 を超えない／
+        1フレームに描く字数の上限。被覆は頭打ち（composite_cov）を掛けた後の値を測るので、コードが正しければ上限を超えず、止まる経路は
+        ほぼ働かない（コードの自己確認）。測定ではない。独立の測定は、書き出したフレームの画素から被覆を逆算する（点の層なし・ありの差）。
+        結果（最大字数・平均字数・頭打ちの後の被覆の最大）は look_report に出す"""
         from look import LookError
 
         P = kinetic_points
         stats = {p_["layer"].index: {"max": 0, "sum": 0, "n": 0, "clear_max": 0.0} for p_ in self.points}
         lo = min(p_["t0"] for p_ in self.points)
         hi = max(p_["t1"] for p_ in self.points)
+        rects = self._point_rects()
+        items = [(p_["layer"], p_["font_ref"]) for p_ in self.points]
         for k in range(int(math.ceil(lo * FPS - 1e-9)), int(hi * FPS) + 1):
             t = k / FPS
             total = big = 0
+            live = []
             for pt in self.points:
                 L = pt["layer"]
                 if t < L.t0 - 1e-9 or t > L.t1 + 1e-9:
@@ -3017,32 +3027,37 @@ class KineticRenderer:
                 st["max"] = max(st["max"], n)
                 st["sum"] += n
                 st["n"] += 1
-                for r in L.rects:
-                    if not r["ts"] <= t <= r["te"] or n == 0:
-                        continue
-                    x0, y0, x1, y1 = r["box"]
-                    pad = r["h"] * P.CLEAR_PAD_RATIO + d["size"] / 2.0
-                    inside = (d["x"] >= x0 - pad) & (d["x"] <= x1 + pad) & (d["y"] >= y0 - pad) & (d["y"] <= y1 + pad)
-                    if inside.any():
-                        m = float(d["op"][inside].max())
-                        st["clear_max"] = max(st["clear_max"], m)
-                        if m > P.CLEAR_OPACITY + 0.5 / 16 + 1e-9:
-                            raise LookError(f"points[{L.index}]：{t:.2f}秒、読み字の空けの範囲に不透明度 {m:.2f} の点があります（上限 {P.CLEAR_OPACITY}）。止めました")
+                live.append(st)
+            if live and total and any(r["ts"] - P.CLEAR_RAMP <= t <= r["te"] + P.CLEAR_RAMP for r in rects):
+                # 空けの範囲の被覆を、重なりを含めた画素で測る（字ごとの不透明度ではなく）
+                _n, _b, m = P.render_points(None, t, None, items, self.point_sprites, rects)
+                for st in live:
+                    st["clear_max"] = max(st["clear_max"], m)
+                if m > P.CLEAR_OPACITY + 1.0 / 255 + 1e-9:
+                    raise LookError(f"{t:.2f}秒、読み字の空けの範囲の点の被覆が {m:.3f} です（上限 {P.CLEAR_OPACITY}）。止めました")
             if total > P.MAX_CHARS or big > P.MAX_BIG_CHARS:
                 raise LookError(f"{t:.2f}秒：点の層の字数が {total}（60px を超える字 {big}）で、上限（{P.MAX_CHARS}字・60px 超は {P.MAX_BIG_CHARS}字）を超えます。止めました")
         self._points_scan = stats
 
+    def _point_rects(self):
+        """全層の読み字の矩形（空けの範囲）。層をまたいで足す（色が同じなので被覆は1枚に集める）"""
+        if getattr(self, "_point_rects_cache", None) is None:
+            seen, out = set(), []
+            for pt in self.points:
+                for r in pt["layer"].rects:
+                    key = (r["ts"], r["te"], r["box"], r["h"])
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(r)
+            self._point_rects_cache = out
+        return self._point_rects_cache
+
     def _draw_points(self, frame, t):
-        """点の層を貼る（decor の後・カウンターと読み字の前）。色は その時刻の本文色。貼った字数の上限は式の誤りの検出（通常は走査で止まっている）"""
+        """点の層を貼る（decor の後・カウンターと読み字の前）。色は その時刻の本文色。空けの範囲の字は被覆に集めて画素ごとに頭打ちし、
+        色を1回だけ貼る（kinetic_points.render_points）。貼った字数の上限は式の誤りの検出（通常は走査で止まっている）"""
         color = tuple(int(round(v)) for v in self.text_color_at(t))
-        total = big = 0
-        for pt in self.points:
-            L = pt["layer"]
-            if t < L.t0 - 1e-9 or t > L.t1 + 1e-9:
-                continue
-            n, b = L.draw(frame, t, color, self.point_sprites, pt["font_ref"])
-            total += n
-            big += b
+        items = [(pt["layer"], pt["font_ref"]) for pt in self.points]
+        total, big, _m = kinetic_points.render_points(frame, t, color, items, self.point_sprites, self._point_rects())
         if total > self.points_max:
             self.points_max = total
         if total > kinetic_points.MAX_CHARS or big > kinetic_points.MAX_BIG_CHARS:
@@ -3085,9 +3100,9 @@ class KineticRenderer:
         P = kinetic_points
         stats = self._points_scan or {}
         out = ["", "## 点の層", "",
-               "字は実行時に行から取る（歌詞は書かない）。空けの中の不透明度は全フレーム走査の最大（上限 0.25＋量子化 1/32）。"
+               "字は実行時に行から取る（歌詞は書かない）。空けの中の被覆（頭打ち後）は、頭打ちを掛けた後の値の全フレーム走査の最大（重なりを含めた画素。全層を合わせた値。上限 0.25＋1/255）。**測定ではなく、頭打ちのコードの自己確認。この列を合格の根拠にしない（独立の測定は書き出したフレームの画素からの逆算）。**"
                "点滅の検査（§6）は書き出した mp4 に measure_flicker.py を掛ける（この表には入らない）。", "",
-               "| 点 | 種類 | 区間 | 内容 | 役 | 最大字数 | 平均字数 | 空けの中の不透明度の最大 | 最大の字 | ink |",
+               "| 点 | 種類 | 区間 | 内容 | 役 | 最大字数 | 平均字数 | 被覆（頭打ち後・自己確認） | 最大の字 | ink |",
                "|---|---|---|---|---|---|---|---|---|---|"]
         for pt in self.points:
             L = pt["layer"]

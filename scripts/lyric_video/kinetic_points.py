@@ -43,7 +43,11 @@ MIN_RAMP_SEC = 0.5          # 字数の増減にかける最短の時間
 MIN_FLASH_GAP = 2.0         # 0 フレームの切り替えを置ける最短の間隔（kinetic.MIN_FLASH_GAP と同じ値）
 REVERSE_SEC = 1.0           # 切り替えた後、逆向きに戻してよい最短の時間
 RANK_FADE_SEC = 0.2         # 字ごとの出入りの長さ
-EDGE_FADE_SEC = 0.4         # 粒・線の区間の頭と尻の出入り
+EDGE_FADE_SEC = 0.5         # 粒・線の区間の頭と尻の出入り（仕様 §3-6「0.5 秒以上かけて増減」）
+DISPERSE_MIN_SEC = 0.5       # shape の散りの最短（0 は区間の尻で一気に消える）
+SHAPE_DEFAULTS = {"gather": 0.6, "draw_on": 0.6, "disperse": 0.45}   # _init_shape の既定（検査も同じ値で見る）
+GATHER_MIN_SEC = 0.5        # shape の集まりの最短（仕様 §3-6。それより速いと数百字が一気に現れる）
+UNSAFE_SKIP_TRACK_RULES = False   # 試験用（demo_parts.py の --unsafe-flicker-demo だけが立てる）。本番の CLI・GUI・direction からは立てられない
 MARGIN = 92                 # 左右の余白
 MAX_R = 448                 # 形の中心からの最大の半径
 CACHE_MAX = 20000
@@ -58,13 +62,14 @@ SPAN_KEYS = {"lines", "section", "start", "after_line", "start_at", "seconds", "
 COMMON_KEYS = {"kind", "span", "source", "density", "count", "track", "size_px", "opacity", "ink", "seed", "role"}
 KIND_KEYS = {
     "tsubu": COMMON_KEYS | {"drift_px_s"},
-    "tate_line": COMMON_KEYS | {"motion", "speed_px_s", "length_px", "on_sec", "beat_sync"},
+    "tate_line": COMMON_KEYS | {"motion", "speed_px_s", "length_px", "on_sec", "beat_sync", "dir"},
     "shape": COMMON_KEYS | {"shape", "from", "orient", "gather", "draw_on", "disperse", "flow", "wobble_px", "big"},
 }
 SHAPE_KEYS = {"disc": {"type", "center", "r0", "r"}, "spiral": {"type", "center", "r0", "turns", "r_max"},
               "concentric": {"type", "center", "rings", "r_min", "gap"}, "outline": {"type", "points", "closed", "mask"}}
 FROM_MODES = ("scatter", "line", "edge")
 ORIENTS = ("upright", "tangent")
+TATE_DIRS = ("mixed", "down", "up")   # 流れる線の向き：線ごとに乱数（既定）／全部上→下／全部下→上
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +204,7 @@ def parse_track(spec, kind, where):
             c = item["count"]
             if isinstance(c, bool) or not isinstance(c, int) or not lo <= c <= hi:
                 _err(f"direction: {w} の count は {lo}〜{hi} の整数で書いてください"
-                     f"（{'本数' if kind == 'tate_line' else '字数'}）")
+                     f"（{'本数' if kind == 'tate_line' else '字数'}。0 にしたいときは count ではなく density: 0）")
             return float(c)
         lv = item.get("density")
         if isinstance(lv, bool) or not isinstance(lv, int) or not 0 <= lv <= 3:
@@ -232,6 +237,8 @@ def parse_track(spec, kind, where):
 def check_track(ts, cs, where):
     """字数の増減の速さの規則（仕様 §3-6）：増減は 0.5 秒以上かける／0 フレームの切り替えは前の切り替えから 2 秒以上空ける／
     切り替えた後 1 秒以内に逆向きに戻さない"""
+    if UNSAFE_SKIP_TRACK_RULES:
+        return
     changes = []
     for i in range(len(ts) - 1):
         if abs(cs[i + 1] - cs[i]) > 1e-9:
@@ -244,6 +251,36 @@ def check_track(ts, cs, where):
             _err(f"direction: {where}：一気に切り替える（{a:.2f}秒）のは、前の切り替えの終わり（{changes[k - 1][1]:.2f}秒）から {MIN_FLASH_GAP} 秒以上空けてください")
         if k and changes[k - 1][2] != s and a - changes[k - 1][1] < REVERSE_SEC - 1e-9:
             _err(f"direction: {where}：切り替えた後 {REVERSE_SEC} 秒以内（{changes[k - 1][1]:.2f}→{a:.2f}秒）に逆向きに戻しています（点滅になる）")
+
+
+def check_edges(ts, cs, dur, where, head=EDGE_FADE_SEC, tail=EDGE_FADE_SEC):
+    """区間の頭・尻の出入りも字数の増減として数える（仕様 §3-6）。区間の頭で 0 から増え、尻で 0 へ減るのを
+    それぞれ1回の増減として、track の増減との間隔・逆向きの規則（check_track と同じ値）に掛ける。ts は区間の頭からの秒。
+    head・tail は出入りの長さ（既定 EDGE_FADE_SEC。shape は 現れる長さ A と disperse を渡す）"""
+    if UNSAFE_SKIP_TRACK_RULES:
+        return
+    changes = []
+    if cs[0] > 1e-9:
+        changes.append((0.0, head, 1))
+    for i in range(len(ts) - 1):
+        if abs(cs[i + 1] - cs[i]) > 1e-9:
+            changes.append((ts[i], ts[i + 1], 1 if cs[i + 1] > cs[i] else -1))
+    if cs[-1] > 1e-9:
+        changes.append((dur - tail, dur, -1))
+    changes.sort()
+    label = f"{EDGE_FADE_SEC} 秒" if head == tail == EDGE_FADE_SEC else f"頭 {head:.2f} 秒・尻 {tail:.2f} 秒"
+    for k in range(1, len(changes)):
+        a0, b0, s0 = changes[k - 1]
+        a, b, s = changes[k]
+        if s0 != s and a - b0 < REVERSE_SEC - 1e-9:
+            _err(f"direction: {where}：区間の頭・尻の出入り（{label}）と字数の増減が {REVERSE_SEC} 秒以内（{b0:.2f}→{a:.2f}秒）に逆向きになります（点滅になる）")
+
+
+def shape_appear_sec(gather, draw_on):
+    """shape の字が現れきるまでの長さ A（秒）＝ 字ごとの遅れの広がり（draw_on×gather）＋ 各字の現れ（移動の最初の 25%）。
+    _init_shape・_at_shape の式と同じ（移動の長さは max(gather − draw_on×gather, 0.1)）。描画の式は変えず、この長さを検査する"""
+    span = draw_on * gather
+    return span + 0.25 * max(gather - span, 0.1)
 
 
 def _check_shape(sh, where, size_hi):
@@ -385,6 +422,13 @@ def validate_points(points, n_lines, theme):
 
 
 def _check_tate(sp, where, hi_size, nmax):
+    if "dir" in sp:
+        if sp["dir"] not in TATE_DIRS:
+            _err(f"direction: {where}.dir は {', '.join(TATE_DIRS)} のどれかで書いてください")
+        if sp.get("motion", "flow") != "flow":
+            _err(f"direction: {where}.dir は motion: flow の線だけに書けます（switch の線は動かないので向きを持ちません）")
+    if nmax < 1:
+        _err(f"direction: {where}（tate_line）の本数が全部 0 です。線を出さない点の層は書かないでください（density／count を 1 以上に）")
     if "speed_px_s" in sp:
         v = sp["speed_px_s"]
         if _num(v):
@@ -410,14 +454,119 @@ def _check_shape_item(sp, where):
         _err(f"direction: {where}.from は {', '.join(FROM_MODES)} のどれかで書いてください")
     if sp.get("orient", "upright") not in ORIENTS:
         _err(f"direction: {where}.orient は {', '.join(ORIENTS)} のどちらかで書いてください")
-    for k, lo, hi in (("gather", 0.2, 3.0), ("draw_on", 0.0, 1.0), ("disperse", 0.0, 1.5), ("flow", 0.0, 0.5), ("wobble_px", 0.0, 12.0)):
+    for k, lo, hi in (("gather", GATHER_MIN_SEC, 3.0), ("draw_on", 0.0, 1.0), ("disperse", DISPERSE_MIN_SEC, 1.5), ("flow", 0.0, 0.5), ("wobble_px", 0.0, 12.0)):
         if k in sp and (not _num(sp[k]) or not lo <= sp[k] <= hi):
             _err(f"direction: {where}.{k} は {lo}〜{hi} の数値で書いてください")
+    # 既定値のまま通る組み合わせでも、現れる長さ・散りが 0.5 秒未満なら止める（仕様 §3-6「0.5 秒以上かけて増減」）
+    disperse = sp.get("disperse", SHAPE_DEFAULTS["disperse"])
+    if disperse < DISPERSE_MIN_SEC - 1e-9:
+        _err(f"direction: {where}.disperse（散り）が {disperse} 秒です。{DISPERSE_MIN_SEC}〜1.5 秒で書いてください（書かないときの既定 {SHAPE_DEFAULTS['disperse']} 秒は範囲の外です。0 は区間の尻で一気に消えます）")
+    a_in = shape_appear_sec(sp.get("gather", SHAPE_DEFAULTS["gather"]), sp.get("draw_on", SHAPE_DEFAULTS["draw_on"]))
+    if a_in < EDGE_FADE_SEC - 1e-9:
+        _err(f"direction: {where}（shape）の字が現れきるまでが {a_in:.2f} 秒です。{EDGE_FADE_SEC} 秒以上にしてください"
+             f"（現れる長さ ＝ draw_on×gather ＋ 0.25×max(gather − draw_on×gather, 0.1)。gather を長く／draw_on を大きく）")
     if "big" in sp:
         b = sp["big"]
         if not isinstance(b, dict) or set(b) != {"ratio", "size_px"} or not _num(b["ratio"]) or not 0 < b["ratio"] <= 0.3:
             _err(f"direction: {where}.big は {{\"ratio\": 0〜0.3、\"size_px\": [最小, 最大]}} で書いてください（大きめの字を少数混ぜる）")
         _check_pair(b["size_px"], f"{where}.big", 12, 60, "size_px")
+
+
+# ---------------------------------------------------------------------------
+# 読み字の周りの空け（画素ごとの被覆の頭打ち）
+#
+# 点の層の字は重なる。字ごとに不透明度を 0.25 以下にしても、重なると被覆は 0.44・0.58 と積み上がり、読み字の比（4.5:1）が崩れる。
+# そこで空けの範囲にかかる字は、いったん被覆（'L'）に「上に重ねる」式で貼り、画素ごとに上限で頭打ちしてから、色を1回だけ貼る。
+# 空けの外の字は今までどおり frame に直接貼る（見え方を変えない）。色は全層で同じ（その時刻の本文色）なので、全層を1枚の被覆に集める。
+
+def clear_zones(rects, t):
+    """時刻 t に効いている空けの範囲。[{"w": 効き具合 0〜1（行の出入り 0.2 秒）, "box": 広げた矩形, "roi": 縁の戻り幅を足した矩形}]。
+    rects: 読み字の外接矩形（[{"ts","te","box","h"}]。PointLayer.rects。層をまたいで足してよい）"""
+    out = []
+    for r in rects:
+        ts, te = r["ts"], r["te"]
+        w = min((t - (ts - CLEAR_RAMP)) / CLEAR_RAMP, ((te + CLEAR_RAMP) - t) / CLEAR_RAMP, 1.0)
+        if w <= 0:
+            continue
+        x0, y0, x1, y1 = r["box"]
+        pad = r["h"] * CLEAR_PAD_RATIO
+        box = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+        out.append({"w": float(_smooth(w)), "box": box,
+                    "roi": (box[0] - CLEAR_SOFT, box[1] - CLEAR_SOFT, box[2] + CLEAR_SOFT, box[3] + CLEAR_SOFT)})
+    return out
+
+
+def _hits_zone(zones, pos, size):
+    x, y = pos
+    w, h = size
+    for z in zones:
+        r = z["roi"]
+        if x < r[2] and x + w > r[0] and y < r[3] and y + h > r[1]:
+            return True
+    return False
+
+
+def _cap_roi(z):
+    """空けの範囲 z の、被覆の上限（0〜255 の整数）を画素ごとに持つ小さな配列と、その左上（画面の座標）"""
+    r = z["roi"]
+    X0, Y0 = max(int(math.floor(r[0])), 0), max(int(math.floor(r[1])), 0)
+    X1, Y1 = min(int(math.ceil(r[2])), W), min(int(math.ceil(r[3])), H)
+    if X1 <= X0 or Y1 <= Y0:
+        return None
+    xs = np.arange(X0, X1) + 0.5
+    ys = np.arange(Y0, Y1) + 0.5
+    bx0, by0, bx1, by1 = z["box"]
+    dx = np.maximum(np.maximum(bx0 - xs, xs - bx1), 0.0)[None, :]
+    dy = np.maximum(np.maximum(by0 - ys, ys - by1), 0.0)[:, None]
+    d = np.hypot(dx, dy)
+    cap = 1.0 - z["w"] * (1.0 - CLEAR_OPACITY) * (1.0 - np.clip(d / CLEAR_SOFT, 0.0, 1.0))
+    return X0, Y0, np.rint(cap * 255.0).astype(np.uint8)
+
+
+def composite_cov(frame, cov, color, zones):
+    """被覆 cov（'L'）を空けの範囲ごとに頭打ちして、色を1回だけ frame に貼る。frame が None なら貼らず、
+    空けの範囲の核（広げた矩形の中）の被覆の最大（0〜1。頭打ちの後の値）だけ返す。全層で色が同じことが前提（層ごとに色が違う場合は使えない）"""
+    bb = cov.getbbox()
+    if bb is None:
+        return 0.0
+    arr = np.array(cov)
+    for z in zones:
+        c = _cap_roi(z)
+        if c is None:
+            continue
+        X0, Y0, cap = c
+        sub = arr[Y0:Y0 + cap.shape[0], X0:X0 + cap.shape[1]]
+        np.minimum(sub, cap, out=sub)
+    core = 0
+    for z in zones:
+        if z["w"] < 1.0 - 1e-9:              # 行の出入りの 0.2 秒は上限が段階的に戻る途中なので、核の検査に入れない
+            continue
+        bx0, by0, bx1, by1 = z["box"]
+        X0, Y0 = max(int(math.ceil(bx0)), 0), max(int(math.ceil(by0)), 0)
+        X1, Y1 = min(int(math.floor(bx1)), W), min(int(math.floor(by1)), H)
+        if X1 > X0 and Y1 > Y0:
+            core = max(core, int(arr[Y0:Y1, X0:X1].max()))
+    if frame is not None:
+        frame.paste(color, (0, 0), Image.fromarray(arr, "L"))
+    return core / 255.0
+
+
+def render_points(frame, t, color, items, sprites, rects):
+    """点の層（items: [(PointLayer, font_ref)]）を貼る。frame が None なら、被覆だけ作って空けの核の最大を測る（検査用）。
+    戻り値: (貼った字数, 60px を超える字数, 空けの核の被覆の最大 0〜1。頭打ちの後の値＝コードの自己確認で、測定ではない)
+    前提：全層で色が同じ（その時刻の本文色 1 色）。被覆を全層で 1 枚に集めて 1 色で貼るため、層ごとに色が違う場合は使えない。
+    色を分ける変更が来たら、R0-3 の決定（被覆の持ち方）に戻る"""
+    zones = clear_zones(rects, t)
+    cov = Image.new("L", (W, H), 0) if zones else None
+    total = big = 0
+    for L, font_ref in items:
+        if t < L.t0 - 1e-9 or t > L.t1 + 1e-9:
+            continue
+        n, b = L.draw(frame, t, color, sprites, font_ref, zones=zones, cov=cov)
+        total += n
+        big += b
+    cmax = composite_cov(frame, cov, color, zones) if zones else 0.0
+    return total, big, cmax
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +675,11 @@ class PointLayer:
                 t[i] = t[i - 1] + 1e-6
         self.tr_t, self.tr_c = t, np.array(cs, dtype=np.float64)
         self.nmax = int(max(cs))
+        if self.kind in ("tsubu", "tate_line"):      # 区間の頭・尻の出入り（EDGE_FADE_SEC）も増減として数える
+            check_edges(ts, cs, self.dur, f"points[{self.index}]")
+        elif self.kind == "shape":                   # shape は 頭＝現れる長さ A、尻＝散り（disperse）
+            d = {k: float(spec.get(k, v)) for k, v in SHAPE_DEFAULTS.items()}
+            check_edges(ts, cs, self.dur, f"points[{self.index}]", head=shape_appear_sec(d["gather"], d["draw_on"]), tail=d["disperse"])
 
     def _rank_vis(self, tau):
         """順位が N(t) より小さい点の見え方（0〜1）。字ごとに RANK_FADE_SEC かけて出入りする（箱形の平均）"""
@@ -536,27 +690,9 @@ class PointLayer:
     def _edge_env(self, t):
         return float(_smooth(min(t - self.t0, self.t1 - t) / EDGE_FADE_SEC))
 
-    def _clear_cap(self, t, x, y, size):
-        """読み字の周りの不透明度の上限（点ごと）。1.0＝制限なし、読み字の外接矩形＋字高の 0.5 倍の中は 0.25"""
-        cap = np.ones_like(x)
-        for r in self.rects:
-            ts, te = r["ts"], r["te"]
-            w = min((t - (ts - CLEAR_RAMP)) / CLEAR_RAMP, ((te + CLEAR_RAMP) - t) / CLEAR_RAMP, 1.0)
-            if w <= 0:
-                continue
-            w = float(_smooth(w))
-            x0, y0, x1, y1 = r["box"]
-            pad = r["h"] * CLEAR_PAD_RATIO + size / 2.0
-            dx = np.maximum(np.maximum(x0 - pad - x, x - (x1 + pad)), 0.0)
-            dy = np.maximum(np.maximum(y0 - pad - y, y - (y1 + pad)), 0.0)
-            d = np.hypot(dx, dy)
-            c = 1.0 - w * (1.0 - CLEAR_OPACITY) * (1.0 - np.clip(d / CLEAR_SOFT, 0.0, 1.0))
-            cap = np.minimum(cap, c)
-        return cap
-
     def points_at(self, t):
         """時刻 t の点。{"ch": 字の配列, "x","y": 中心（px）, "size": 段階, "op": 不透明度（1/16 刻みへ丸める前）, "ang": 角度（15°刻み）}。
-        区間の外・何も出ない時刻は 空の配列。読み字の空けは掛け済み"""
+        区間の外・何も出ない時刻は 空の配列。読み字の空け（不透明度の上限）はここでは掛けない：貼るときに画素ごとに掛ける（render_points）"""
         if t < self.t0 - 1e-9 or t > self.t1 + 1e-9:
             return self._empty()
         d = getattr(self, "_at_" + self.kind)(t, t - self.t0)
@@ -565,7 +701,6 @@ class PointLayer:
         idx, x, y, size, op, ang = d
         if len(idx) == 0:
             return self._empty()
-        op = np.minimum(op, self._clear_cap(t, x, y, size))
         keep = op >= (0.5 / 16.0)
         if not keep.all():
             idx, x, y, size, op, ang = idx[keep], x[keep], y[keep], size[keep], op[keep], ang[keep]
@@ -577,8 +712,10 @@ class PointLayer:
         z = np.zeros(0)
         return {"ch": np.array([], dtype="U1"), "x": z, "y": z, "size": z.astype(int), "op": z, "ang": z.astype(int)}
 
-    def draw(self, frame, t, color, sprites, font_ref):
-        """frame（PIL RGB）に貼る。color: (r,g,b)。貼った字数と、60px を超える字数を返す"""
+    def draw(self, frame, t, color, sprites, font_ref, zones=None, cov=None):
+        """frame（PIL RGB）に貼る。color: (r,g,b)。貼った字数と、60px を超える字数を返す。
+        zones（読み字の空けの範囲。clear_zones）がある場合、空けの範囲にかかる字は frame でなく cov（'L' の被覆）に貼る
+        （空けの範囲の頭打ちを、重なりを含めた画素の被覆で掛けるため。composite_cov で1回だけ色を貼る）。frame が None なら cov だけ作る"""
         p = self.points_at(t)
         n = len(p["x"])
         if n == 0:
@@ -588,7 +725,6 @@ class PointLayer:
         ys = np.rint(p["y"]).astype(int)
         seed = self.seed
         ink = self.ink
-        paste = frame.paste
         big = 0
         for ch, x, y, sz, o, a in zip(p["ch"].tolist(), xs.tolist(), ys.tolist(), p["size"].tolist(), op16.tolist(), p["ang"].tolist()):
             if o <= 0:
@@ -596,7 +732,11 @@ class PointLayer:
             if sz > BIG_PX:
                 big += 1
             m = sprites.mask(font_ref, ch, sz, o, a, ink, seed)
-            paste(color, (x - m.width // 2, y - m.height // 2), m)
+            pos = (x - m.width // 2, y - m.height // 2)
+            if zones and _hits_zone(zones, pos, m.size):
+                cov.paste(255, pos, m)
+            elif frame is not None:
+                frame.paste(color, pos, m)
         return n, big
 
     # --- nominal（検査用の字数）---
@@ -663,7 +803,13 @@ class PointLayer:
             self.l_len = lo_len + r.rand(L) * (hi_len - lo_len)
             sp = spec.get("speed_px_s", [80, 240])
             slo, shi = (sp, sp) if _num(sp) else sp
-            self.l_v = (slo + r.rand(L) * (shi - slo)) * np.where(r.rand(L) < 0.5, 1.0, -1.0)
+            speed = slo + r.rand(L) * (shi - slo)
+            sign = np.where(r.rand(L) < 0.5, 1.0, -1.0)      # 乱数は dir に関係なく必ず引く（後ろの乱数をずらさない）
+            if spec.get("dir") == "down":
+                sign = np.ones(L)
+            elif spec.get("dir") == "up":
+                sign = -np.ones(L)
+            self.l_v = speed * sign                          # 符号＝向き（＋は下へ）、絶対値＝速さ
             self.l_s0 = r.rand(L) * (H + self.l_len)
             self.l_op = self.op_lo + r.rand(L) * (self.op_hi - self.op_lo)
             self.l_off = r.randint(0, 997, L)
@@ -753,10 +899,10 @@ class PointLayer:
         size = self.l_size[ln]
         pitch = size * 1.05
         span_len = H + self.l_len[ln]
-        head = (self.l_s0[ln] + self.l_v[ln] * tau) % span_len          # 線の頭の位置（下向きなら下端）
+        head = (self.l_s0[ln] + np.abs(self.l_v[ln]) * tau) % span_len   # 進んだ距離（向きによらず増える）
         down = self.l_v[ln] > 0
         d = k * pitch + pitch / 2
-        y = np.where(down, head - d, H - (head - d))
+        y = np.where(down, head - d, H - head + d)                       # 頭（k＝0・濃い側）が進む向きの先、尾が後ろ
         frac = k * pitch / self.l_len[ln]
         tail = np.where(frac <= 0.7, 1.0, np.clip((1.0 - frac) / 0.3, 0.0, 1.0))
         keep = (y > -size) & (y < H + size) & (tail > 0)
@@ -818,9 +964,9 @@ class PointLayer:
         n = self.nmax
         sh = spec["shape"]
         typ = sh["type"]
-        self.gather = float(spec.get("gather", 0.6))
-        self.draw_on = float(spec.get("draw_on", 0.6))
-        self.disperse = float(spec.get("disperse", 0.45))
+        self.gather = float(spec.get("gather", SHAPE_DEFAULTS["gather"]))
+        self.draw_on = float(spec.get("draw_on", SHAPE_DEFAULTS["draw_on"]))
+        self.disperse = float(spec.get("disperse", SHAPE_DEFAULTS["disperse"]))
         self.flow = float(spec.get("flow", 0.1))
         self.wob = float(spec.get("wobble_px", 3.0))
         self.orient = spec.get("orient", "upright")

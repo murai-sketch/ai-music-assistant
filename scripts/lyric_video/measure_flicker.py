@@ -252,7 +252,25 @@ def decode_frames(path, t0=None, t1=None, fps=30):
         raise RuntimeError(f"ffmpeg が失敗しました（終了コード {p.returncode}）。動画は 1080×1920 にしてください")
 
 
+def check_video_size(path):
+    """動画の大きさが 1080×1920 か確かめる（違う大きさを 1080×1920 として読むと、画が崩れて誤った警告・合格が出る。
+    例：2 本を横に並べた 2160 幅の動画）。違えば RuntimeError。ffprobe で読めないときも RuntimeError（黙って測らない）"""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                            "-of", "csv=p=0:s=x", str(path)], capture_output=True, text=True)
+    except OSError as e:
+        raise RuntimeError(f"ffprobe が使えません（動画の大きさを確かめられないので測りません）: {e}")
+    out = r.stdout.strip().splitlines()
+    try:
+        w, h = (int(v) for v in out[0].split("x"))
+    except (IndexError, ValueError):
+        raise RuntimeError(f"動画の大きさを読めません（ffprobe 終了コード {r.returncode}）: {path}")
+    if (w, h) != (SMALL_W * SCALE, SMALL_H * SCALE):
+        raise RuntimeError(f"動画の大きさが {w}×{h} です。1080×1920 の動画だけ測れます（並べた動画・縮小した動画は、元の1本ずつを測ってください）")
+
+
 def measure_video(path, t0=None, t1=None, fps=30, strict_g12=False):
+    check_video_size(path)
     m = FlickerMeter(fps, strict_g12)
     for frame in decode_frames(path, t0, t1, fps):
         m.add(frame)
