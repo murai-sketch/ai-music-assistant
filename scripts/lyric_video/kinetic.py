@@ -115,6 +115,38 @@ EXIT_RATIO, EXIT_MIN_SEC, EXIT_MAX_SEC = 0.3, 0.14, 0.55
 # 保持（行が止まっている間の小さな動き）。入りの直後に 0.25 秒かけて立ち上がる
 HOLD_MOTIONS = ("breathe", "wave", "jitter")
 HOLD_RAMP_SEC = 0.25
+# carry（行全体を一定の速さで動かす保持。direction で hold: carry と carry を書いた行だけ。T35 C1）。HOLD_MOTIONS には入れない
+# （HOLD_MOTIONS の保持は入りの後 0.25 秒で立ち上がり退場で消える小さな動きで、移動しない。carry は行の頭から一定の速さで動き続ける）
+CARRY = "carry"
+# carry で動いた後の読み字の上下の余白の下限（px）。計画 T35 §7 の値（左右の余白 SIDE_MARGIN と同じ 92px）。slam 等の上下の検査（VERTICAL_MARGIN＝70）より
+# 厳しい安全側の値。92 を採った理由は計画の指定で、画面の上下の UI の帯に入らない根拠の実測は無い（要検証）。変えるときは計画と合わせる
+CARRY_MARGIN = 92
+
+
+def carry_spec(cut, row):
+    """行 cut の、段 row（縦組みの列。横組みは段の番号を使わない）の carry の指定 (px_s, 向き符号)。無ければ None。
+    向き符号：down＝+1（画面の下へ）、up＝-1"""
+    if cut.get("hold") != CARRY or not cut.get("carry"):
+        return None
+    spec = cut["carry"]
+    if "px_s" not in spec:
+        spec = spec.get(str(row))
+        if spec is None:
+            return None
+    return float(spec["px_s"]), (1 if spec["dir"] == "down" else -1)
+
+
+def carry_extent(cut):
+    """carry で動く範囲（上へ・下へ、px）。行の表示の長さ（end − start）の間、速さ × 長さだけ動く。縦組みで列ごとに向きが違うときは、
+    列ごとの最大を取った保守的な値（空けの矩形・余白の検査用）"""
+    if cut.get("hold") != CARRY or not cut.get("carry"):
+        return 0.0, 0.0
+    dur = max(cut["end"] - cut["start"], 0.0)
+    spec = cut["carry"]
+    specs = [spec] if "px_s" in spec else list(spec.values())
+    up = max([s_["px_s"] * dur for s_ in specs if s_["dir"] == "up"] + [0.0])
+    down = max([s_["px_s"] * dur for s_ in specs if s_["dir"] == "down"] + [0.0])
+    return float(up), float(down)
 MIN_FLASH_GAP = 2.0
 MIN_BG_SWITCH_GAP = 0.5
 GAP_FOR_REST = 1.2  # これ以上の無歌詞区間は「間」として背景を画像に戻す
@@ -720,7 +752,7 @@ def plan_to_markdown(plan, header=None):
     sung = any("sung_end" in c for c in plan)
     voiced = any("voice" in c for c in plan)
     looked = any("font_role" in c for c in plan)
-    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset"))
+    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset", "carry", "stack_group"))
     head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     if voiced:
@@ -769,6 +801,12 @@ def plan_to_markdown(plan, header=None):
                 bits.append("solo")
             if c.get("vertical_typeset"):
                 bits.append(f"縦組み(vert) {len(c['rows'])}段 {c.get('vertical_size')}px")
+            if c.get("carry"):
+                cs = c["carry"]
+                bits.append("carry " + (f"{cs['px_s']:g}px/秒 {cs['dir']}" if "px_s" in cs else
+                                        ",".join(f"段{k}:{v['px_s']:g}px/秒 {v['dir']}" for k, v in sorted(cs.items()))))
+            if c.get("stack_group") is not None:
+                bits.append(f"列積み(dim {c['stack_dim']:g}・行{c['stack_clear_line']}の開始で全部消す・x {c.get('stack_dx', 0):+.1f}px)")
             bits.extend(c.get("marks") or [])
             row += " " + "；".join(bits) + " |"
         if sung:
@@ -1375,7 +1413,7 @@ class _Cut:
         elif cut["layout"] == "right":
             self.anchor = (VIDEO_SIZE[0] * ANCHOR_X["right"], VIDEO_SIZE[1] * (ty + ANCHOR_DY))
         elif vt:
-            self.anchor = (VIDEO_SIZE[0] / 2, float(cut.get("vertical_top", kinetic_vertical.DEFAULT_TOP))
+            self.anchor = (VIDEO_SIZE[0] / 2 + float(cut.get("stack_dx", 0.0)), float(cut.get("vertical_top", kinetic_vertical.DEFAULT_TOP))
                            + float(cut.get("vertical_h", kinetic_vertical.DEFAULT_H)) / 2)
         elif cut["layout"] == "vertical":
             self.anchor = (VIDEO_SIZE[0] * (0.68 if cut["index"] % 2 else 0.32), VIDEO_SIZE[1] * (ty - 0.04))
@@ -1853,6 +1891,8 @@ class _Cut:
             dy += hdy
             scale *= hscale
             angle += hangle
+        if cut.get("hold") == CARRY:
+            dy += self.carry_dy(g, tl, dur)
         scale *= g.get("gscale", 1.0)
 
         # 退場
@@ -1888,6 +1928,15 @@ class _Cut:
             alpha *= q
             scale *= _lerp(0.9, 1.0, q)
         return dx, dy, scale, angle, alpha, crop_top, crop_right
+
+    def carry_dy(self, g, tl, dur):
+        """carry の移動量（px。下が正）。行の開始（tl＝0）から一定の速さ × 経過時間。表示の長さ（dur）で止める（延ばした間は止めた状態）。
+        carry の無い行・指定の無い列は 0.0（足しても出力は変わらない）"""
+        sp = carry_spec(self.cut, g["row"])
+        if sp is None:
+            return 0.0
+        # 整数 px に丸めてから足す（小数のまま字ごとに int() で切り捨てると、同じ列の字が別々のフレームで1px ずつ動く。T35 C1 レビュー 中-1）
+        return float(math.floor(sp[1] * sp[0] * min(max(tl, 0.0), dur) + 0.5))
 
     def _plain_exit_alpha(self, remain):
         """下敷き・重ね物の、既定の退場の不透明度。swap（退場なし）と fade:<秒> は glyph_state と同じ扱い"""
@@ -1999,7 +2048,8 @@ class _Cut:
             for k in range(6, 0, -1):
                 frame.paste(im, (int(px + step * k), int(py + step * k)), im)
 
-    def draw(self, frame, t, sprites, cam=(1.0, 0.0, 0.0, 0.0)):
+    def draw(self, frame, t, sprites, cam=(1.0, 0.0, 0.0, 0.0), dim=1.0):
+        """dim：残した列（stack。T35 C2）として描くときの不透明度の掛け率（0〜1）。1.0 は今までと同じ（掛けない・刻みも変えない）"""
         cut = self.cut
         tl = t - cut["start"]
         dur = cut["end"] - cut["start"]
@@ -2040,7 +2090,7 @@ class _Cut:
 
         if self.glow is not None and self.glyphs:
             # 文字の後ろの光。入りと同時に出て行の間は保持（明滅なし）。退場は文字と同じ掛け率
-            ga = self.glyph_state(self.glyphs[0], tl, dur)[4]
+            ga = self.glyph_state(self.glyphs[0], tl, dur)[4] * dim
             if ga > 0.02:
                 gim = sprites.transformed(("glow", cut["index"]), self.glow, 1.0, 0, ga, 0.0, 0.0)
                 if gim is not None:
@@ -2049,6 +2099,8 @@ class _Cut:
 
         for g in self.glyphs:
             dx, dy, scale, angle, alpha, crop_top, crop_right = self.glyph_state(g, tl, dur)
+            if dim != 1.0:
+                alpha *= dim
             if alpha <= 0.02:
                 continue
             if self.karaoke:
@@ -2105,7 +2157,10 @@ class _Cut:
                     if mim is not None:
                         frame.paste(mim, (int(gcx - mim.size[0] / 2 + ox),
                                           int(gcy - mim.size[1] / 2 + oy)), mim)
-                im = sprites.transformed(g["key"], g["img"], scale, total_angle, a, crop_top, crop_right)
+                if dim != 1.0:
+                    im = sprites.transformed(g["key"], g["img"], scale, total_angle, a, crop_top, crop_right, alpha_step=20)   # 0.05 刻み（0.55 を 0.6 に丸めない）
+                else:
+                    im = sprites.transformed(g["key"], g["img"], scale, total_angle, a, crop_top, crop_right)
                 if im is None:
                     continue
                 px = gcx - im.size[0] / 2
@@ -2612,6 +2667,10 @@ class KineticRenderer:
         self._compute_shown()
         if getattr(self, "_strict", False):
             self._check_no_blank_frames()
+        self._stack_prev = {}       # 行 j（0 始まり）を描くとき、一緒に薄く残す前の列 [(行, 不透明度)]。stack の無い曲は空
+        if self.themed:
+            self._check_carry()
+            self._setup_stack()
         self.counter = None
         self.counter_skipped = 0
         self._cut_rects = {}
@@ -2627,6 +2686,65 @@ class KineticRenderer:
             self._check_points()
         for note in self.look_notes + self.impact_notes:
             print(f"      [書体] {note}")
+
+    def _check_carry(self):
+        """検査（止める）：carry で動いた後の読み字が、上下の余白（CARRY_MARGIN＝92px）に収まる（動く範囲は carry_extent。縦組みで列ごとに
+        向きが違うときは列ごとの最大を全体に足した保守的な値）。段ごとの指定の段番号が段の数を超えない。T35 C1"""
+        from look import LookError
+
+        H = VIDEO_SIZE[1]
+        for c, o in zip(self.plan, self.cuts):
+            if c.get("hold") != CARRY or not o.glyphs:
+                continue
+            if c.get("accent_mode") == "glow":
+                raise LookError(f"direction: 行{c['index']} の hold: carry は accent: glow と一緒に使えません（光の位置が動かない。未対応）")
+            if c.get("layout") == "grid":      # layout を書かない4字・1段の行は自動で grid になる（枠が固定位置で、字だけ動く）
+                raise LookError(f"direction: 行{c['index']} の hold: carry は自動の構図 grid（4字・1段の行）と一緒に使えません"
+                                f"（枠が字に付いて行かない。layout: center などを書いてください）")
+            if c.get("entrance") in ("stamp", "slash"):
+                raise LookError(f"direction: 行{c['index']} の hold: carry は entrance: {c['entrance']} と一緒に使えません（枠・斜線が字に付いて行かない。未対応）")
+            spec = c["carry"]
+            if "px_s" not in spec:
+                bad = [k for k in spec if int(k) >= len(c["rows"])]
+                if bad:
+                    raise LookError(f"direction: 行{c['index']} の carry の段番号 {', '.join(bad)} が、段の数（{len(c['rows'])}）以上です")
+            _X0, Y0, _X1, Y1 = self._screen_rect(o)
+            up, down = carry_extent(c)
+            if Y0 - up < CARRY_MARGIN - 1e-6 or Y1 + down > H - CARRY_MARGIN + 1e-6:
+                raise LookError(f"行{c['index']}: carry で動いた後の読み字が上下の余白 {CARRY_MARGIN}px に収まりません"
+                                f"（上端 {Y0 - up:.1f}px・下端の余白 {H - Y1 - down:.1f}px。動く範囲は上へ {up:.1f}px・下へ {down:.1f}px）。"
+                                f"速さ・表示の長さ・構図を見直してください。黙って止めずに止めました")
+
+    def _setup_stack(self):
+        """stack（前の列を残して薄くする。T35 C2）の検査と、描くときの対応表 self._stack_prev。検査（止める）：
+        ①積んだ全部の列が左右の余白（SIDE_MARGIN）に収まる（黙って縮めない）②残した列（不透明度 dim）の比が、最悪の背景で 4.5 以上
+        （副要素。COUNTER_MIN_CONTRAST）。残す列は行 j の表示の間、その行の前の積んだ行を、最後の状態のまま dim で描く（clear_at_line の行が
+        描かれる最初のフレームから、残した列は描かない＝0 フレームで全部消える）"""
+        import look as look_mod
+        from look import LookError
+
+        groups = {}
+        for j, c in enumerate(self.plan):
+            if c.get("stack_group") is not None:
+                groups.setdefault(c["stack_group"], []).append(j)
+        W = VIDEO_SIZE[0]
+        for gi, members in sorted(groups.items()):
+            c0 = self.plan[members[0]]
+            dim, clear = c0["stack_dim"], c0["stack_clear_line"]
+            rects = [self._screen_rect(self.cuts[j]) for j in members if self.cuts[j].glyphs]
+            x0, x1 = min(r[0] for r in rects), max(r[2] for r in rects)
+            if x0 < SIDE_MARGIN - 1e-6 or x1 > W - SIDE_MARGIN + 1e-6:
+                raise LookError(f"stack[{gi}]：積んだ全部の列の外接矩形が左右の余白 {SIDE_MARGIN}px に収まりません"
+                                f"（左 {x0:.1f}px・右の余白 {W - x1:.1f}px。幅 {x1 - x0:.1f}px、使える幅 {W - 2 * SIDE_MARGIN}px）。"
+                                f"字の大きさ（max_px）・列の数を見直してください。黙って縮めず止めました")
+            for j in members:
+                pal = self.theme["palettes"][self.plan[j]["bg"]]
+                ratio = look_mod.worst_contrast(pal["text"], pal["bg"], round(dim * 20) / 20)   # 描くときの刻み（0.05）に揃える
+                if ratio < look_mod.COUNTER_MIN_CONTRAST:
+                    raise LookError(f"stack[{gi}]：行{self.plan[j]['index']} の残した列（不透明度 {dim}）の比が、最悪の背景で {ratio:.2f} になり、"
+                                    f"{look_mod.COUNTER_MIN_CONTRAST} を割ります。dim を上げてください")
+            for j in range(members[0] + 1, clear - 1):          # 積む行の2行目から、clear_at_line の行の手前まで
+                self._stack_prev[j] = [(p, dim) for p in members if p < j]
 
     def _screen_rect(self, o):
         """カットの文字の外接矩形（アンカーを足した画面の座標）。回転（diagonal 等）は両向きの角を取って広いほうを採る"""
@@ -2869,9 +2987,18 @@ class KineticRenderer:
             if not o.glyphs:
                 continue
             X0, Y0, X1, Y1 = self._screen_rect(o)
+            up, down = carry_extent(c)     # carry で動く範囲を含める（含めないと、動いた先で点が読み字に重なる。T35 C1）
+            Y0, Y1 = Y0 - up, Y1 + down
             z = 1.0 + self.impact_zoom.get(c["index"], 0.0)
             clip = (W / 2 + (X0 - W / 2) * z, H / 2 + (Y0 - H / 2) * z, W / 2 + (X1 - W / 2) * z, H / 2 + (Y1 - H / 2) * z)
             self._cut_rects[j] = clip
+
+    def _stack_end(self, j):
+        """残した列（stack）を保つ区間の終わり（clear_at_line の行の開始）。積んだ行でなければ None"""
+        c = self.plan[j]
+        if c.get("stack_group") is None:
+            return None
+        return self.plan[c["stack_clear_line"] - 1]["start"]
 
     def _counter_rects(self, t):
         """t に出ている文字の外接矩形（余白込み・余白なし）。slam の入りの拡大中は含めない（読ませる時間ではない）"""
@@ -2879,7 +3006,7 @@ class KineticRenderer:
         m = self._counter_margin
         for j, b in self._cut_rects.items():
             c = self.plan[j]
-            if c["start"] <= t <= max(c["end"], self.shown_until[j]):   # 延ばした間（次の行の見え始めまで）の前の行も含める
+            if c["start"] <= t <= max(c["end"], self.shown_until[j], self._stack_end(j) or 0.0):   # 延ばした間（次の行の見え始めまで）の前の行も含める
                 avoid.append((b[0] - m, b[1] - m, b[2] + m, b[3] + m))
                 clip.append(b)
         return avoid, clip
@@ -2932,7 +3059,10 @@ class KineticRenderer:
             for j in range(len(self.plan)):
                 if j not in self._cut_rects or self.plan[j]["start"] > t1 + 1.0 or shown[j] < t0 - 1.0:
                     continue
-                rects.append({"ts": self.plan[j]["start"], "te": max(self.plan[j]["end"], shown[j]),
+                te = max(self.plan[j]["end"], shown[j])
+                if self._stack_end(j) is not None:      # 残した列（stack）は clear_at_line の行の開始まで空けを保つ
+                    te = max(te, self._stack_end(j))
+                rects.append({"ts": self.plan[j]["start"], "te": te,
                               "box": self._cut_rects[j], "h": float(self.cuts[j].size)})
             anchor = None
             if rows and rows[0] in self._cut_rects:
@@ -3081,6 +3211,7 @@ class KineticRenderer:
                     ok = True
                     for g in o.glyphs:
                         dx, dy, sc, ang, _a, _ct, _cr = o.glyph_state(g, tl, dur)
+                        dy -= o.carry_dy(g, tl, dur)      # carry の一定の移動は「止まっている」の判定から除く（carry の無い行は 0.0）
                         if (abs(dx) > 1.0 or abs(dy) > 1.0 or abs(sc - 1.0) > 0.02 or abs(ang) > 1.0
                                 or o.glyph_opacity(g, tl, dur) < thr):
                             ok = False
@@ -3675,6 +3806,10 @@ class KineticRenderer:
             self.counter_skipped += self.counter.draw(frame, t, avoid, clip, shatter_pieces)   # 外の層。文字の下
         grain = 0.0
         for j in active:
+            for p, dim in self._stack_prev.get(j, ()):
+                # 残した列（stack）。前の行の最後の状態（表示の終わりの1フレーム前。退場は swap だけなので掛け率は 1）を dim で描く
+                cp = self.plan[p]
+                self.cuts[p].draw(frame, cp["start"] + max(cp["end"] - cp["start"] - 1.0 / FPS, 0.0), self.sprites, bg_cam, dim=dim)
             self.cuts[j].draw(frame, self._cut_time(j, t), self.sprites, bg_cam)
             c = self.plan[j]
             if c.get("texture") == "grain":
@@ -4039,9 +4174,11 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                 if it.get("max_col_chars") is not None:
                     c["max_col_chars"] = it["max_col_chars"]
         if it.get("hold") is not None:
-            if it["hold"] not in HOLD_MOTIONS + ("heartbeat",):
+            if it["hold"] not in HOLD_MOTIONS + ("heartbeat", CARRY):
                 raise RuntimeError(f"direction 行{c['index']}: 保持 '{it['hold']}' は未対応です")
             c["hold"] = it["hold"]
+            if it["hold"] == CARRY:
+                c["carry"] = json.loads(json.dumps(it["carry"]))      # 書き込み先（プラン）と direction を共有しない
         if it.get("decor") is not None:
             c["decor"] = it["decor"]
         if it.get("text_y") is not None:
@@ -4136,6 +4273,15 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                         mark(c, f"break_after[{key}]＝{pos}：単語の途中で切っています（段 {key} の {pos} 字目の後）")
                 else:
                     mark(c, f"break_after[{key}]＝{pos}：単語の途中かは判定できません（隣の字が単語に対応していない）")
+    for gi, st in enumerate(direction.get("stack") or []):
+        a, b = st["lines"]
+        for k in range(a, b + 1):
+            c = plan[k - 1]
+            nxt = plan[k] if k < len(plan) else None
+            if nxt is None or c["end"] < nxt["start"] - 0.0015:
+                raise look.LookError(f"direction: stack[{gi}] の行{k} の表示が、次の行の開始まで続きません（終わり {c['end']:.2f}秒）。"
+                                     f"積んだ列を残すには、行に tail（行の長さより大きい値）か end を書いて、次の行の開始まで表示してください")
+            c["stack_group"], c["stack_dim"], c["stack_clear_line"] = gi, float(st["dim"]), st["clear_at_line"]
     for i, (c, it) in enumerate(zip(plan, items)):
         nxt = plan[i + 1] if i + 1 < len(plan) else None
         name = it.get("exit")
@@ -4143,6 +4289,8 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             name = "swap" if nxt is not None and c["end"] >= nxt["start"] - 0.0015 else "fade"
         elif not (name in _DIRECTION_EXITS or _exit_fade_sec(name) is not None):
             raise RuntimeError(f"direction 行{c['index']}: 消え方 '{name}' は未対応です")
+        if c.get("stack_group") is not None:
+            name = "swap"          # 積んだ列は消え方の動きを持たない（残した列を最後の状態のまま描くため）
         c["exit"] = name
         _fit_exit_to_tail(c)
     return plan
@@ -4205,6 +4353,21 @@ def arrange_vertical(plan, direction, theme, vdefaults, words=None, use_lcs=Fals
         c["vertical_h"] = height
         if vspec.get("kana_shift"):
             c["vertical_kana_shift"] = float(vspec["kana_shift"])
+
+
+def arrange_stack(plan, direction):
+    """stack（前の列を残して薄くする。T35 C2）の、列の位置。積む行（lines の最初〜最後）の全部の列を右から順に並べ、**積んだ全部の幅の中央を
+    画面の中央に置く**（後の行が来ても前の列が動かない）。行ごとの横のずれ stack_dx（px。その行の組版の中央の位置からの差）をプランに書く。
+    列の送りは行の字の大きさ × COL_PITCH。収まるか（左右の余白）はカットを組んだ後の検査（KineticRenderer._setup_stack）"""
+    for st in (direction or {}).get("stack") or []:
+        a, b = st["lines"]
+        cuts = [plan[k - 1] for k in range(a, b + 1)]
+        widths = [len(c["rows"]) * c["vertical_size"] * kinetic_vertical.COL_PITCH for c in cuts]
+        right = sum(widths) / 2
+        off = 0.0
+        for c, w in zip(cuts, widths):
+            c["stack_dx"] = round(right - off - w / 2, 2)
+            off += w
 
 
 def extract_key_word(plan, spec):
@@ -4385,6 +4548,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
         if direction is not None:
             vnotes = []
             arrange_vertical(plan, direction, theme, vdefaults, words=words, use_lcs=use_lcs, notes=vnotes)
+            arrange_stack(plan, direction)
             if not quiet:
                 for note in vnotes:
                     print(f"      [警告] {note}")

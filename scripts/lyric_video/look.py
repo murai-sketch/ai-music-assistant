@@ -264,12 +264,16 @@ def direction_path(cache_dir):
 # direction の行の項目（許可リスト）。別名は読み込み時に正式名へ直す（動き §2 R2 は余韻を tail_sec と書く）。
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
-                  "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y"}
+                  "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
+                  "carry"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow")
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
-                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points"}
+                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack"}
+CARRY_DIRS = ("down", "up")          # carry（行全体を一定の速さで動かす保持）の向き
+CARRY_KEYS = {"px_s", "dir"}
+STACK_KEYS = {"lines", "dim", "clear_at_line"}   # stack（前の列を残して薄くする）
 VERTICAL_KEYS = {"height", "top", "kana_shift"}   # kana_shift: 小書きの仮名を右上へ寄せる量（字の大きさの割合。既定 0＝寄せない）
 import kinetic_vertical as _kv   # noqa: E402（定数だけ。kinetic_vertical は look を遅延 import するので循環しない）
 
@@ -329,12 +333,35 @@ def _normalize_item(item, allowed, where):
             kinetic_points.check_ink(v, where, read=True)
         if name == "break_after":
             _check_break_after(v, where)
+        if name == "carry":
+            _check_carry_item(v, where)
         if name == "counter":
             _check_counter_item(v, where)
         if name == "accent" and v not in ACCENT_MODES:
             raise LookError(f"direction: {where} の accent '{v}' は {', '.join(ACCENT_MODES)} のどれかで書いてください")
         out[name] = v
     return out
+
+
+def _check_carry_item(v, where):
+    """carry：{"px_s": 正の数, "dir": "down"|"up"}。縦組みの行は列ごとに {"<段番号>": {"px_s", "dir"}} も書ける（2つの書き方の併記はしない）"""
+    def one(spec, w):
+        if not isinstance(spec, dict) or set(spec) != CARRY_KEYS:
+            raise LookError(f'direction: {w} は {{"px_s": 1秒あたりのpx, "dir": "down"|"up"}} の形で書いてください')
+        if isinstance(spec["px_s"], bool) or not isinstance(spec["px_s"], (int, float)) or spec["px_s"] <= 0:
+            raise LookError(f"direction: {w} の px_s は 0 より大きい数値で書いてください")
+        if spec["dir"] not in CARRY_DIRS:
+            raise LookError(f"direction: {w} の dir '{spec['dir']}' は {', '.join(CARRY_DIRS)} のどれかで書いてください")
+
+    if not isinstance(v, dict) or not v:
+        raise LookError(f"direction: {where} の carry はオブジェクトで書いてください")
+    if "px_s" in v or "dir" in v:
+        one(v, f"{where} の carry")
+        return
+    for key, spec in v.items():
+        if not re.fullmatch(r"\d+", str(key)):
+            raise LookError(f"direction: {where} の carry の段番号 '{key}' は 0 以上の整数で書いてください（全体なら px_s・dir を直接書く）")
+        one(spec, f"{where} の carry[{key}]")
 
 
 def _check_break_after(v, where):
@@ -392,6 +419,41 @@ def parse_line_keys(keys, n_lines):
     return out
 
 
+def _validate_stack(stack, n_lines, by_line, theme):
+    """stack：前の列を残して薄くする。[{"lines": [最初の行, 最後の行], "dim": 0〜1（残した列の不透明度）, "clear_at_line": 全部消す行}]。
+    積む行はすべて layout: vertical（exit は swap のみ）。区間（最初の行〜消す行の手前）は重ねない。残した列の比は kinetic 側（テーマの配色）で検査する"""
+    if not isinstance(stack, list) or not stack:
+        raise LookError('direction: stack は [{"lines": [a, b], "dim": 不透明度, "clear_at_line": N}] の形で書いてください')
+    if theme is None:
+        raise LookError("direction: stack はテーマを使う曲でだけ使えます（残した列の比をテーマの配色から検査する）")
+    spans = []
+    for i, st in enumerate(stack):
+        where = f"stack[{i}]"
+        if not isinstance(st, dict) or set(st) != STACK_KEYS:
+            raise LookError(f"direction: {where} は {', '.join(sorted(STACK_KEYS))} をすべて書いたオブジェクトで書いてください")
+        ln = st["lines"]
+        if (not isinstance(ln, list) or len(ln) != 2 or any(isinstance(x, bool) or not isinstance(x, int) for x in ln)
+                or not 1 <= ln[0] < ln[1] <= n_lines):
+            raise LookError(f"direction: {where}.lines は [最初の行, 最後の行]（1〜{n_lines} の整数で、最初 < 最後）で書いてください")
+        dim = st["dim"]
+        if isinstance(dim, bool) or not isinstance(dim, (int, float)) or not 0 < dim < 1:
+            raise LookError(f"direction: {where}.dim は 0 より大きく 1 より小さい数値で書いてください")
+        n = st["clear_at_line"]
+        if isinstance(n, bool) or not isinstance(n, int) or n != ln[1] + 1 or n > n_lines:
+            raise LookError(f"direction: {where}.clear_at_line は、最後の行の次の行（{ln[1] + 1}。{n_lines} 以下）だけ書けます（間に積まない行を挟むと、重なる・列が早く消える）")
+        for k in range(ln[0], ln[1] + 1):
+            it = by_line.get(k, {})
+            if it.get("layout") != "vertical":
+                raise LookError(f"direction: {where} の行{k} は layout: vertical ではありません（積む行はすべて縦組み）")
+            if it.get("exit", "swap") != "swap":
+                raise LookError(f"direction: {where} の行{k} の exit は swap だけです（積んだ列は消え方の動きを持たない）")
+        spans.append((ln[0], n, where))
+    spans.sort()
+    for (a0, n0, w0), (a1, _n1, w1) in zip(spans, spans[1:]):
+        if a1 < n0:
+            raise LookError(f"direction: {w0} と {w1} の区間（最初の行〜消す行の手前）が重なっています")
+
+
 def validate_direction(direction, n_lines, vdefaults, theme=None):
     """direction の中身の検査（書き間違いを黙って既定値に戻さない）。未知の項目・存在しない声は LookError で止める。
     vdefaults は voice_defaults の結果（テーマ・direction の voices の和）"""
@@ -425,6 +487,15 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
             if item.get("entrance", "cut") not in VERTICAL_ENTRANCES:
                 raise LookError(f"direction: 行{n} は縦組みですが、入り '{item.get('entrance')}' は縦組みでは使えません"
                                 f"（使える入り: {', '.join(VERTICAL_ENTRANCES)}）。横向きの動き・slam は止めました")
+        if (item.get("hold") == "carry") != (item.get("carry") is not None):
+            raise LookError(f"direction: 行{n} の carry は hold: carry の行だけに書けます（hold: carry には carry の指定が要ります）")
+        if item.get("hold") == "carry":
+            if theme is None:
+                raise LookError(f"direction: 行{n} の hold: carry はテーマを使う曲でだけ使えます（動いた後の余白の検査をテーマ使用時の検査と同じ経路で行う。stack と同じ扱い）")
+            if item.get("entrance", "cut") in ("mask", "stamp", "slash"):
+                raise LookError(f"direction: 行{n} の hold: carry は entrance: {item.get('entrance', 'cut')} と一緒に使えません（切り抜き・枠・斜線が動く前の位置に残る）")
+            if "px_s" not in item["carry"] and item.get("layout") != "vertical":
+                raise LookError(f"direction: 行{n} の carry を段ごとに書けるのは layout: vertical の行だけです")
         if item.get("ink") is not None and item.get("entrance") == "karaoke":
             raise LookError(f"direction: 行{n} の ink（読み字の質感）は karaoke の行には掛けません（未点灯の濃さの基準が崩れる）")
         if item.get("entrance") == "karaoke":
@@ -439,6 +510,8 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} の impact '{item['impact']}' が impacts にありません"
                                 f"（{', '.join(sorted(direction.get('impacts') or {})) or 'impacts なし'}）")
     _validate_stage3(direction, by_line, theme)
+    if direction.get("stack") is not None:
+        _validate_stack(direction["stack"], n_lines, by_line, theme)
     if direction.get("points") is not None:
         import kinetic_points   # 遅延 import
 

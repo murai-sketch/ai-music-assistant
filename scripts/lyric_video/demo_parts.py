@@ -17,6 +17,8 @@ demo_parts.py
   python3 demo_parts.py D3R           # D3 の候補C（流れ・240px/秒）を流れの向き違いで作り直す（暗い地。混在／全部下向き／全部上向き）
   python3 demo_parts.py D6-P          # 検査器の確認の対照（同じ字数を 0.6 秒で1回だけ増やす。明るい地・純白の2本）
   python3 demo_parts.py D6-N --unsafe-flicker-demo   # 検査器の確認（わざと点滅させた見本。**人に見せない・再生しない**。静止画と数値だけを使う）
+  python3 demo_parts.py C1            # carry（行全体を一定の速さで動かす保持）。あり・なし × 横組み3行（流れの線つき）・縦組み2列（T35 C1）
+  python3 demo_parts.py C2            # 列を積む（前の列を残して薄くする）。あり・なし（T35 C2）
   python3 demo_parts.py D1 --stills   # 静止画一覧も作る
 
 出力は _work/_demo_T33/<名前>/（Git に入らない）。--out で変える。
@@ -394,9 +396,45 @@ def d6p(out_dir=None, stills=False):
     return _flicker_cases("P", out_dir, stills)
 
 
+# --- 新しい動き2つのデモ（T35 C1・C2）。曲の direction には書かない。ユーザーが見て決める。歌詞ではない汎用の文だけ ---
+
+C1_FLOW = {"kind": "tate_line", "span": {"start": 0, "end": 16}, "source": "line", "size_px": [20, 28], "opacity": [0.4, 0.7],
+           "motion": "flow", "speed_px_s": 240, "dir": "down", "track": [{"at": 0, "density": 3}, {"at": 16, "density": 3}]}
+
+
+def c1(out_dir=None, stills=False):
+    """carry。横組み3行（下へ 8px/秒。背後に流れの線）・縦組み2列（右の列は上へ・左の列は下へ 6px/秒）。それぞれ carry なしの対照つき。暗い地。
+    行は次の行の開始まで表示（tail を大きく）。ユーザーに見せるときは速さの数字を並べない"""
+    made = []
+    h_lines = [(S1, 1.0, 5.2, 4.8), (S4, 5.5, 9.7, 9.3), (S2, 10.0, 14.2, 13.8)]
+    v_lines = [(S2, 1.0, 9.0, 8.6)]
+    for tag, carry in (("あり", {"hold": "carry", "carry": {"px_s": 8, "dir": "down"}}), ("なし", {})):
+        item = dict({"layout": "center", "role": "heavy", "entrance": "cut", "tail": 60}, **carry)    # 構図は自動に任せず中央（弧・斜めにしない）
+        direction = {"look": "demo-dark", "lines": {"1-3": item}, "points": [dict(C1_FLOW)]}
+        made.append(make_case(f"C1_{tag}_横組み", h_lines, 15.0, direction, out_dir=out_dir, stills=stills))
+    for tag, carry in (("あり", {"hold": "carry", "carry": {"0": {"px_s": 6, "dir": "up"}, "1": {"px_s": 6, "dir": "down"}}}), ("なし", {})):
+        item = dict({"layout": "vertical", "role": "heavy", "entrance": "cut", "tail": 60, "break_after": {"0": 6}}, **carry)
+        direction = {"look": "demo-dark", "lines": {"1": item}}
+        made.append(make_case(f"C1_{tag}_縦組み", v_lines, 10.0, direction, out_dir=out_dir, stills=stills))
+    return made
+
+
+def c2(out_dir=None, stills=False):
+    """列を積む。縦組み4行（6〜10字）を右から積み、5行目（横組み）で全部消す。なし＝同じ4行を1行ずつ（今の縦組み）。暗い地"""
+    lines = [(S1, 1.0, 3.8, 3.4), (S3, 4.0, 6.8, 6.4), ("駅までの|坂道を", 7.0, 9.8, 9.4), (S4, 10.0, 12.8, 12.4), (S2, 13.0, 15.6, 15.2)]
+    made = []
+    for tag, with_stack in (("あり", True), ("なし", False)):
+        vert = {"layout": "vertical", "role": "heavy", "entrance": "cut", "tail": 60, "max_px": 100}
+        direction = {"look": "demo-dark", "lines": {"1-4": vert, "5": {"role": "heavy", "entrance": "cut"}}}
+        if with_stack:
+            direction["stack"] = [{"lines": [1, 4], "dim": 0.55, "clear_at_line": 5}]
+        made.append(make_case(f"C2_{tag}", lines, 16.0, direction, out_dir=out_dir, stills=stills))
+    return made
+
+
 def main():
     ap = argparse.ArgumentParser(description="部品のデモ動画を作る（本番と同じ描画の経路）")
-    ap.add_argument("demo", choices=["D1", "D2", "D1o", "D2o", "D3", "D3R", "D4", "D5", "D6", "D6-N", "D6-P"])
+    ap.add_argument("demo", choices=["D1", "D2", "D1o", "D2o", "D3", "D3R", "D4", "D5", "D6", "D6-N", "D6-P", "C1", "C2"])
     ap.add_argument("--out", help="出力先（既定: _work/_demo_T33/<名前>/。D6-N・D6-P は _work/_demo_T33/_test_再生しない/<名前>/）")
     ap.add_argument("--stills", action="store_true", help="静止画一覧も作る")
     ap.add_argument("--unsafe-flicker-demo", action="store_true",
@@ -410,7 +448,7 @@ def main():
     if args.unsafe_flicker_demo:
         kinetic_points.UNSAFE_SKIP_TRACK_RULES = True
     for p in {"D1": d1, "D2": d2, "D1o": d1o, "D2o": d2o, "D3": d3, "D3R": d3r, "D4": d4, "D5": d5, "D6": d6,
-              "D6-N": d6n, "D6-P": d6p}[args.demo](args.out, args.stills):
+              "D6-N": d6n, "D6-P": d6p, "C1": c1, "C2": c2}[args.demo](args.out, args.stills):
         print(f"[DEMO] {p}")
 
 
