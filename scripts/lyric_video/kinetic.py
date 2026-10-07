@@ -755,7 +755,7 @@ def plan_to_markdown(plan, header=None):
     sung = any("sung_end" in c for c in plan)
     voiced = any("voice" in c for c in plan)
     looked = any("font_role" in c for c in plan)
-    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset", "carry", "stack_group"))
+    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset", "carry", "stack_group", "row_lengths"))
     head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     if voiced:
@@ -809,6 +809,8 @@ def plan_to_markdown(plan, header=None):
                 bits.append(f"縦組み(vert) {len(c['rows'])}段 {c.get('vertical_size')}px")
                 if c.get("row_roles"):
                     bits.append("段の役 " + ",".join(f"段{k}:{v}" for k, v in sorted(c["row_roles"].items(), key=lambda kv: int(kv[0]))))
+            if c.get("row_lengths"):
+                bits.append("段の字数 " + ",".join(str(x) for x in c["row_lengths"]))
             if c.get("carry"):
                 cs = c["carry"]
                 bits.append("carry " + (f"{cs['px_s']:g}px/秒 {cs['dir']}" if "px_s" in cs else
@@ -1201,10 +1203,10 @@ class _Cut:
             # 全段を同じ大きさにする（段ごとの大きさの差は使わない）
             plan_rows = len(rows)
             rows, size_each, self.look_notes = self._fit_look_rows(rows, look, cut, sprites)
-            if cut.get("accent_mode") == "rows" and len(rows) != plan_rows and look.get("strict"):
+            if (cut.get("accent_mode") == "rows" or cut.get("row_lengths")) and len(rows) != plan_rows and look.get("strict"):
                 from look import LookError
-                raise LookError(f"行{cut['index']}: accent: rows の行の段が、描くときに {plan_rows} 段から {len(rows)} 段に増えました"
-                                f"（幅・下限 px のため）。accent_rows の段番号が画面の段とずれるので止めました。break_after で段を決めるか、max_px・min_px を見直してください")
+                raise LookError(f"行{cut['index']}: accent: rows／row_lengths の行の段が、描くときに {plan_rows} 段から {len(rows)} 段に増えました"
+                                f"（幅・下限 px のため）。段が指定とずれるので止めました。max_px・min_px・字数を見直してください")
             sizes = [size_each] * len(rows)
         elif vertical or cut.get("profile_kids"):
             # 段ごとに大きさが変わると、2文字の段だけ巨大になって落ち着かない
@@ -1581,7 +1583,7 @@ class _Cut:
                 notes.append(f"行{cut['index']}: 段を増やしても下限 {min_px}px を割る（{size}px で描く）【要確認】")
         if strict and len(rows) * size * look["leading"] > usable_h:
             raise LookError(f"行{cut['index']}: {len(rows)}段 × {size}px で、画面の高さ（上下の余白 70px と、寄り・揺れの分を除く）に収まりません。"
-                            f"break_after を見直してください")
+                            f"break_after・row_lengths を見直してください")
         return rows, size, notes
 
     def _build_glow(self, look, font_path, accent):
@@ -4294,8 +4296,8 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                     else:
                         land = max(w0, floor)
             c["land"] = round(land, digits)
-        # --- karaoke と break_after の単語の途中の警告（同じ対応表を使う）
-        need_match = entrance == "karaoke" or it.get("break_after")
+        # --- karaoke と break_after・row_lengths の単語の途中の警告（同じ対応表を使う）
+        need_match = entrance == "karaoke" or it.get("break_after") or it.get("row_lengths")
         match_result = None
         if need_match:
             if words is None:
@@ -4345,6 +4347,17 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                         mark(c, f"break_after[{key}]＝{pos}：単語の途中で切っています（段 {key} の {pos} 字目の後）")
                 else:
                     mark(c, f"break_after[{key}]＝{pos}：単語の途中かは判定できません（隣の字が単語に対応していない）")
+        if it.get("row_lengths"):
+            # 段の切れ目（先頭からの字数の和）が単語の途中なら、break_after と同じ印（T-6b）
+            _time_of, word_of, _n = match_result
+            off = 0
+            for k_, n_ in enumerate(it["row_lengths"][:-1]):
+                off += n_
+                if off in word_of and off - 1 in word_of:
+                    if word_of[off] == word_of[off - 1]:
+                        mark(c, f"row_lengths[{k_}]＝{n_}：単語の途中で切っています（先頭から {off} 字目の後）")
+                else:
+                    mark(c, f"row_lengths[{k_}]＝{n_}：単語の途中かは判定できません（隣の字が単語に対応していない）")
     for gi, st in enumerate(direction.get("stack") or []):
         a, b = st["lines"]
         for k in range(a, b + 1):
@@ -4513,6 +4526,23 @@ def apply_look(plan, theme, direction, vdefaults):
         for key in ("max_px", "tracking", "min_px"):
             if key in it:
                 c[key] = it[key]
+        if it.get("row_lengths"):
+            # 自動の段（build_plan の「最後の2字」の切れ目など）を捨てて、行の字を先頭から指定の字数ずつの段にする（T35 U5。字は増減しない）
+            if c.get("vertical_typeset"):      # direction に書いた縦組みは look 側の検査が先に止める。自動で縦組みになった行は apply_look が center に戻すので通す
+                raise look.LookError(f"direction: 行{c['index']} の row_lengths は横組みの行だけに書けます")
+            if c.get("latin") or any(ch.isspace() for ch in c["text"]):
+                raise look.LookError(f"direction: 行{c['index']} の row_lengths は、空白（半角・全角）を含む行・欧文の行には書けません"
+                                     f"（段を字数で組み直すと空白が消えて語がくっつく。break_after を使ってください）")
+            flat_rl = "".join(c["rows"])
+            if sum(it["row_lengths"]) != len(flat_rl):
+                raise look.LookError(f"direction: 行{c['index']} の row_lengths {it['row_lengths']} の合計 {sum(it['row_lengths'])} が、"
+                                     f"行の字数 {len(flat_rl)} と違います")
+            pos, new_rows = 0, []
+            for n_ in it["row_lengths"]:
+                new_rows.append(flat_rl[pos:pos + n_])
+                pos += n_
+            c["rows"] = new_rows
+            c["row_lengths"] = list(it["row_lengths"])
         if it.get("break_after") and not c.get("vertical_typeset"):   # 縦組み（vert）の段は arrange_vertical が切る
             c["rows"] = split_rows_after(c["rows"], it["break_after"], c["index"])
             c["break_after"] = it["break_after"]

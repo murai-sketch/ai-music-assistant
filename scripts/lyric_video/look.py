@@ -33,7 +33,7 @@ look.py
     "lines": {"1": {...}, "5-8": {...}}  # 行番号（1始まり）または範囲。同じ行に複数当たれば後勝ち
   }
   行の項目: voice / tail（秒）/ end（絶対時刻で固定）/ exit（swap・fade・fade:<秒>・fall 等）/ entrance / layout / hold / decor /
-            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ max_px / tracking（役の値の行ごとの上書き）
+            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ row_lengths（横組みの行だけ。段の字数。空白・欧文の行には書けない）/ max_px / tracking（役の値の行ごとの上書き）
   key_word: {"from_line": N, "rule": "first_bracket"}   N 行目の最初の「」の中の語を実行時に取り出す（歌詞は書かない）
   bg_transitions: [{"from": 配色, "to": 配色, "start"|"after_line", "seconds"|"until_line"}]   背景色を時間で線形に補間する
 
@@ -265,7 +265,7 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles"}
+                  "carry", "accent_rows", "row_roles", "row_lengths"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
@@ -335,6 +335,9 @@ def _normalize_item(item, allowed, where):
             _check_break_after(v, where)
         if name == "carry":
             _check_carry_item(v, where)
+        if name == "row_lengths":
+            if (not isinstance(v, list) or len(v) < 2 or any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in v)):
+                raise LookError(f"direction: {where} の row_lengths は、段の字数（正の整数）を2つ以上並べた配列で書いてください（例 [4, 3]）")
         if name == "accent_rows":
             if (not isinstance(v, list) or not v or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in v)
                     or len(set(v)) != len(v)):
@@ -472,7 +475,7 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         v = item.get("voice")
         if v is not None and v not in vdefaults:
             raise LookError(f"direction: 行{n} の声 '{v}' が voices にありません（{', '.join(sorted(vdefaults)) or 'なし'}）")
-        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after", "accent_rows", "row_roles") if k in item]
+        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after", "accent_rows", "row_roles", "row_lengths") if k in item]
         if look_keys and theme is None:
             raise LookError(f"direction: 行{n} に見た目の項目（{', '.join(look_keys)}）がありますが、テーマが指定されていません"
                             f"（direction の look か --look）")
@@ -485,6 +488,11 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} は accent: glow ですが、テーマに parts.glow がありません")
         if (item.get("accent") == "rows") != (item.get("accent_rows") is not None):
             raise LookError(f"direction: 行{n} の accent_rows は accent: rows の行だけに書けます（accent: rows には accent_rows の指定が要ります）")
+        if item.get("row_lengths") is not None:
+            if item.get("break_after") is not None:
+                raise LookError(f"direction: 行{n} の row_lengths は break_after と一緒に書けません（段の切り方は片方だけ）")
+            if item.get("layout") == "vertical":
+                raise LookError(f"direction: 行{n} の row_lengths は横組みの行だけに書けます（縦組みの段は break_after と自動の組版で決まる）")
         if item.get("row_roles") is not None:
             if item.get("layout") != "vertical":
                 raise LookError(f"direction: 行{n} の row_roles は layout: vertical の行だけに書けます（横組みは段の幅の計算が書体で変わる）")
