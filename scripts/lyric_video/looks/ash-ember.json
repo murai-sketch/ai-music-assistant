@@ -1,0 +1,186 @@
+{
+ "look": "ash-ember",
+ "fonts": {
+  "drift": {
+   "family": "Noto Sans CJK JP",
+   "style": "Light",
+   "index": 0,
+   "tracking": 0.1,
+   "leading": 1.25,
+   "min_px": 96,
+   "max_px": 150,
+   "layer_outline": {
+    "px": 4
+   }
+  },
+  "drift_mid": {
+   "family": "Noto Sans CJK JP",
+   "style": "DemiLight",
+   "index": 0,
+   "tracking": 0.08,
+   "leading": 1.25,
+   "min_px": 96,
+   "max_px": 150,
+   "layer_outline": {
+    "px": 4
+   }
+  },
+  "screen": {
+   "family": "Osaka",
+   "style": "Regular-Mono",
+   "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/37b7a41df590ab4ef2d6826c6ec7c69f0fd7379f.asset/AssetData/OsakaMono.ttf",
+   "index": 0,
+   "tracking": 0.0,
+   "leading": 1.2,
+   "min_px": 96,
+   "max_px": 130,
+   "layer_outline": {
+    "px": 4
+   }
+  },
+  "floor": {
+   "family": "Noto Sans CJK JP",
+   "style": "Thin",
+   "index": 0,
+   "tracking": 0.12,
+   "leading": 1.3,
+   "min_px": 100,
+   "max_px": 140,
+   "layer_outline": {
+    "px": 4
+   }
+  },
+  "split": {
+   "family": "Noto Sans CJK JP",
+   "style": "Medium",
+   "index": 0,
+   "tracking": 0.0,
+   "leading": 1.25,
+   "min_px": 100,
+   "max_px": 140
+  },
+  "thaw": {
+   "family": "Noto Sans CJK JP",
+   "style": "Regular",
+   "index": 0,
+   "tracking": 0.04,
+   "leading": 1.22,
+   "min_px": 96,
+   "max_px": 170,
+   "layer_outline": {
+    "px": 4
+   }
+  },
+  "ignite": {
+   "family": "Noto Sans CJK JP",
+   "style": "Bold",
+   "index": 0,
+   "tracking": -0.02,
+   "leading": 1.12,
+   "min_px": 96,
+   "max_px": 160,
+   "layer_outline": {
+    "px": 4
+   }
+  },
+  "ignite_peak": {
+   "family": "Noto Sans CJK JP",
+   "style": "Black",
+   "index": 0,
+   "tracking": -0.04,
+   "leading": 1.12,
+   "min_px": 120,
+   "max_px": 240,
+   "layer_outline": {
+    "px": 6
+   }
+  },
+  "flow": {
+   "family": "Noto Sans CJK JP",
+   "style": "DemiLight",
+   "index": 0,
+   "tracking": 0.0,
+   "leading": 1.05,
+   "min_px": 20,
+   "max_px": 28
+  },
+  "ring_inner": {
+   "family": "Noto Sans CJK JP",
+   "style": "Bold",
+   "index": 0,
+   "tracking": 0.0,
+   "leading": 1.05,
+   "min_px": 40,
+   "max_px": 48
+  },
+  "ring_outer": {
+   "family": "Noto Sans CJK JP",
+   "style": "Regular",
+   "index": 0,
+   "tracking": 0.0,
+   "leading": 1.05,
+   "min_px": 28,
+   "max_px": 36
+  }
+ },
+ "palettes": {
+  "drift": {
+   "bg": "#161616",
+   "text": "#E6E6E6",
+   "sub": "#9A9A9A",
+   "stroke": "#161616",
+   "accent": "#E6E6E6"
+  },
+  "screen": {
+   "bg": "#101010",
+   "text": "#DCDCDC",
+   "sub": "#9A9A9A",
+   "stroke": "#101010",
+   "accent": "#DCDCDC"
+  },
+  "morning": {
+   "bg": "#1C1C1C",
+   "text": "#E8E8E8",
+   "sub": "#9A9A9A",
+   "stroke": "#1C1C1C",
+   "accent": "#E8E8E8"
+  },
+  "floor": {
+   "bg": "#0B0B0B",
+   "text": "#EDEDED",
+   "sub": "#9A9A9A",
+   "stroke": "#0B0B0B",
+   "accent": "#EDEDED"
+  },
+  "thaw": {
+   "bg": "#1D1915",
+   "text": "#E8E8E8",
+   "sub": "#9A9A9A",
+   "stroke": "#1D1915",
+   "accent": "#E8E8E8"
+  },
+  "ignite": {
+   "bg": "#121212",
+   "text": "#F2F2F2",
+   "sub": "#9A9A9A",
+   "stroke": "#121212",
+   "accent": "#FF8A5C"
+  },
+  "ember_end": {
+   "bg": "#0E0E0E",
+   "text": "#E6E6E6",
+   "sub": "#9A9A9A",
+   "stroke": "#0E0E0E",
+   "accent": "#FF8A5C"
+  }
+ },
+ "default_role": "drift",
+ "default_palette": "drift",
+ "layout": {
+  "text_width": 896
+ },
+ "texture": {
+  "paper": "plain",
+  "bg_image": false
+ }
+}
