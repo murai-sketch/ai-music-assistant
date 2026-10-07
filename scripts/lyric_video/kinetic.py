@@ -32,6 +32,8 @@ _work/<hash>/kinetic_plan.json を手で書き換えれば、その内容で描�
 """
 
 import bisect
+import copy
+import hashlib
 import json
 import math
 import shutil
@@ -48,6 +50,7 @@ import kinetic_vertical
 
 VIDEO_SIZE = (1080, 1920)
 FPS = 30
+_SCAN_MEMO = {}   # 点の層の走査の結果（同じ入力・同じ範囲なら再利用。T35 R0-12）
 IMPACT_P_EPS = 1e-3   # slam（衝撃の段階をもつカット）の p ＝ 0 の判定の許容（フレーム。land の丸め 1e-6 秒 ≒ 3e-5 フレームより十分大きい）
 
 FONT_HEAVY = "/System/Library/Fonts/ヒラギノ角ゴシック W9.ttc"
@@ -2596,9 +2599,12 @@ def camera_move(name, u, since_land, index):
 # ---------------------------------------------------------------------------
 
 class KineticRenderer:
-    def __init__(self, image_path, plan, beats, style, duration=None, backgrounds=None, look=None):
+    def __init__(self, image_path, plan, beats, style, duration=None, backgrounds=None, look=None, scan_range=None):
         """look: prepare_plan が返す runtime。テーマ（名前付きの配色・書体の役）を使う曲だけ渡す。
-        渡さない（または theme が None）なら、従来の経路（添字のパレット・背景画像）のまま。"""
+        渡さない（または theme が None）なら、従来の経路（添字のパレット・背景画像）のまま。
+        scan_range: 点の層の全フレームの走査（_scan_points）をかける秒の範囲 (from, to)。None ＝ 全区間（従来。全編の書き出し・direction の登録）。
+        描くフレームだけ走査すればよい経路（部分書き出し・GUI のプレビュー）が渡す。to < from なら走査しない（T35 R0-12）"""
+        self._scan_range = scan_range
         self.plan = plan
         self.theme = (look or {}).get("theme")
         self.themed = self.theme is not None
@@ -3160,15 +3166,26 @@ class KineticRenderer:
         hi = max(p_["t1"] for p_ in self.points)
         rects = self._point_rects()
         items = [(p_["layer"], p_["font_ref"]) for p_ in self.points]
-        for k in range(int(math.ceil(lo * FPS - 1e-9)), int(hi * FPS) + 1):
+        k0, k1 = int(math.ceil(lo * FPS - 1e-9)), int(hi * FPS)
+        if self._scan_range is not None:        # 描くフレームだけ走査する（前後 1 フレームの余裕。範囲の外は走査しない）
+            a, b = self._scan_range
+            k0 = max(k0, int(math.floor(a * FPS)) - 1)
+            k1 = min(k1, int(math.ceil(b * FPS)) + 1)
+        memo_key = self._scan_memo_key(k0, k1)
+        if memo_key in _SCAN_MEMO:               # 同じ入力を同じ範囲で走査済み（direction の登録の検査で作った描画器の直後に作る本番の描画器）
+            self._points_scan = copy.deepcopy(_SCAN_MEMO[memo_key])
+            return
+        for k in range(k0, k1 + 1):
             t = k / FPS
             total = big = 0
             live = []
+            pre = {}
             for pt in self.points:
                 L = pt["layer"]
                 if t < L.t0 - 1e-9 or t > L.t1 + 1e-9:
                     continue
                 d = L.points_at(t)
+                pre[L.index] = d          # 被覆の測定（render_points）に渡して、同じ時刻の points_at を二重に計算しない
                 n = len(d["x"])
                 total += n
                 big += int((d["size"] > P.BIG_PX).sum())
@@ -3179,7 +3196,7 @@ class KineticRenderer:
                 live.append(st)
             if live and total and any(r["ts"] - P.CLEAR_RAMP <= t <= r["te"] + P.CLEAR_RAMP for r in rects):
                 # 空けの範囲の被覆を、重なりを含めた画素で測る（字ごとの不透明度ではなく）
-                _n, _b, m = P.render_points(None, t, None, items, self.point_sprites, rects)
+                _n, _b, m = P.render_points(None, t, None, items, self.point_sprites, rects, pre=pre)
                 for st in live:
                     st["clear_max"] = max(st["clear_max"], m)
                 if m > P.CLEAR_OPACITY + 1.0 / 255 + 1e-9:
@@ -3187,6 +3204,20 @@ class KineticRenderer:
             if total > P.MAX_CHARS or big > P.MAX_BIG_CHARS:
                 raise LookError(f"{t:.2f}秒：点の層の字数が {total}（60px を超える字 {big}）で、上限（{P.MAX_CHARS}字・60px 超は {P.MAX_BIG_CHARS}字）を超えます。止めました")
         self._points_scan = stats
+        if len(_SCAN_MEMO) >= 8:
+            _SCAN_MEMO.clear()
+        _SCAN_MEMO[memo_key] = copy.deepcopy(stats)
+
+    def _scan_memo_key(self, k0, k1):
+        """走査の結果を覚えておく鍵：走査が読む入力（各層の指定・区間・字・読み字の矩形・出発点・拍・書体）と走査するフレームの範囲。
+        プラン・direction・テーマからこれらが決まるので、同じ入力なら走査の結果（最大字数・平均字数・被覆の最大）は同じ（止まる場合は覚えない）"""
+        parts = []
+        for pt in self.points:
+            L = pt["layer"]
+            parts.append([L.spec, L.index, L.t0, L.t1, [(a, "".join(c.tolist())) for a, c in L.variants], L.rects,
+                          list(L.anchor), L.beats, str(pt["font_ref"]), L.seed])
+        raw = json.dumps([parts, k0, k1, kinetic_points.__file__], ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _point_rects(self):
         """全層の読み字の矩形（空けの範囲）。層をまたいで足す（色が同じなので被覆は1枚に集める）"""
@@ -3249,7 +3280,14 @@ class KineticRenderer:
         """look_report に足す節（点の層があるときだけ）"""
         P = kinetic_points
         stats = self._points_scan or {}
-        out = ["", "## 点の層", "",
+        scan_note = []
+        if self._scan_range is not None:
+            a, b = self._scan_range
+            if b >= a:
+                scan_note = ["", f"（走査の範囲：{a:.2f}〜{b:.2f} 秒のフレームだけ。部分書き出し・プレビューの描画器。全編の値ではない）"]
+            else:
+                scan_note = ["", "（走査なし：プレビューの描画器。この表の字数・被覆は空）"]
+        out = scan_note + ["", "## 点の層", "",
                "字は実行時に行から取る（歌詞は書かない）。空けの中の被覆（頭打ち後）は、頭打ちを掛けた後の値の全フレーム走査の最大（重なりを含めた画素。全層を合わせた値。上限 0.25＋1/255）。**測定ではなく、頭打ちのコードの自己確認。この列を合格の根拠にしない（独立の測定は書き出したフレームの画素からの逆算）。**"
                "点滅の検査（§6）は書き出した mp4 に measure_flicker.py を掛ける（この表には入らない）。", "",
                "| 点 | 種類 | 区間 | 内容 | 役 | 最大字数 | 平均字数 | 被覆（頭打ち後・自己確認） | 最大の字 | ink |",
@@ -3502,9 +3540,10 @@ class KineticRenderer:
             out += self.points_report_lines()
         return "\n".join(out) + "\n"
 
-    def write_look_report(self, cache_dir):
-        """direction のある曲の look_report.md を cache_dir（_work/<hash>/）に書く。Git の外"""
-        path = Path(cache_dir) / "look_report.md"
+    def write_look_report(self, cache_dir, part=False):
+        """direction のある曲の look_report.md を cache_dir（_work/<hash>/）に書く。Git の外。
+        part＝True（部分書き出し。走査が描く区間だけの値）は look_report.part.md に書き、全編の look_report.md を上書きしない"""
+        path = Path(cache_dir) / ("look_report.part.md" if part else "look_report.md")
         path.write_text(self.look_report_text(), encoding="utf-8")
         return path
 
@@ -3870,13 +3909,16 @@ def render_kinetic(image_path, audio_path, plan, beats, style, output_path, prog
     audio = AudioFileClip(str(audio_path))
     # subclipped の後は audio.duration が切り出した長さになるので、曲全体の長さは先に控える
     song_duration = audio.duration
-    renderer = KineticRenderer(image_path, plan, beats, style, duration=song_duration, backgrounds=backgrounds, look=look)
-    if renderer.themed and (look or {}).get("direction") and (look or {}).get("cache_dir"):
-        renderer.write_look_report(look["cache_dir"])
     t0 = max(float(t_start or 0.0), 0.0)
     t1 = min(float(t_end), song_duration) if t_end is not None else song_duration
     if t1 - t0 < 0.1:
         raise ValueError(f"書き出す区間が短すぎます: {t0:.2f}〜{t1:.2f}秒")
+    partial = t0 > 0 or t1 < song_duration
+    # 部分書き出しは、描く区間のフレームだけ点の層を走査する（全編の書き出しは全区間。T35 R0-12）
+    renderer = KineticRenderer(image_path, plan, beats, style, duration=song_duration, backgrounds=backgrounds, look=look,
+                               scan_range=(t0, t1) if partial else None)
+    if renderer.themed and (look or {}).get("direction") and (look or {}).get("cache_dir"):
+        renderer.write_look_report(look["cache_dir"], part=partial)   # 部分書き出しは別ファイル（全編の報告を部分区間の値で上書きしない）
     if t0 > 0 or t1 < song_duration:
         audio = audio.subclipped(t0, t1)
     total = t1 - t0

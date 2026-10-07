@@ -575,8 +575,28 @@ def _hits_zone(zones, pos, size):
     return False
 
 
+_CAP_MEMO = {}
+_CAP_MEMO_MAX = 256
+
+
 def _cap_roi(z):
-    """空けの範囲 z の、被覆の上限（0〜255 の整数）を画素ごとに持つ小さな配列と、その左上（画面の座標）"""
+    """空けの範囲 z の、被覆の上限（0〜255 の整数）を画素ごとに持つ小さな配列と、その左上（画面の座標）。
+    入力（roi・box・効き具合 w）が同じなら結果は同じ（純関数）なので、覚えておく（行の途中の w＝1 の間は毎フレーム同じ。T35 R0-12）。
+    返した配列は読むだけ（呼び出し側は上限として使い、書き換えない）"""
+    if z["w"] < 1.0:        # 行の出入りの 0.2 秒は w が毎フレーム違うので覚えない（覚えると 1 件約 0.9MB が積もる）
+        return _cap_roi_calc(z)
+    key = (z["roi"], z["box"])
+    hit = _CAP_MEMO.get(key)
+    if hit is not None:
+        return hit
+    out = _cap_roi_calc(z)
+    if len(_CAP_MEMO) >= _CAP_MEMO_MAX:
+        _CAP_MEMO.clear()
+    _CAP_MEMO[key] = out
+    return out
+
+
+def _cap_roi_calc(z):
     r = z["roi"]
     X0, Y0 = max(int(math.floor(r[0])), 0), max(int(math.floor(r[1])), 0)
     X1, Y1 = min(int(math.ceil(r[2])), W), min(int(math.ceil(r[3])), H)
@@ -592,20 +612,28 @@ def _cap_roi(z):
     return X0, Y0, np.rint(cap * 255.0).astype(np.uint8)
 
 
-def composite_cov(frame, cov, color, zones):
+def composite_cov(frame, cov, color, zones, bb=None):
     """被覆 cov（'L'）を空けの範囲ごとに頭打ちして、色を1回だけ frame に貼る。frame が None なら貼らず、
-    空けの範囲の核（広げた矩形の中）の被覆の最大（0〜1。頭打ちの後の値）だけ返す。全層で色が同じことが前提（層ごとに色が違う場合は使えない）"""
-    bb = cov.getbbox()
+    空けの範囲の核（広げた矩形の中）の被覆の最大（0〜1。頭打ちの後の値）だけ返す。全層で色が同じことが前提（層ごとに色が違う場合は使えない）。
+    bb：cov に貼った字の外接の和 [x0, y0, x1, y1]（画面内に切った範囲。cov のうち 0 でない画素は必ずこの中）。渡されると、全面でなくこの範囲だけを
+    複製・頭打ち・貼り付けする（結果の画素は全面で処理したときと同じ。T35 R0-12）。None なら cov の 0 でない範囲を調べる（従来）"""
+    if bb is None:
+        bb = cov.getbbox()
     if bb is None:
         return 0.0
-    arr = np.array(cov)
+    bx0_, by0_, bx1_, by1_ = [int(v) for v in bb]
+    arr = np.array(cov.crop((bx0_, by0_, bx1_, by1_)))      # 範囲だけの複製。arr[y - by0_, x - bx0_] が画面の (x, y)
     for z in zones:
         c = _cap_roi(z)
         if c is None:
             continue
         X0, Y0, cap = c
-        sub = arr[Y0:Y0 + cap.shape[0], X0:X0 + cap.shape[1]]
-        np.minimum(sub, cap, out=sub)
+        ix0, iy0 = max(X0, bx0_), max(Y0, by0_)
+        ix1, iy1 = min(X0 + cap.shape[1], bx1_), min(Y0 + cap.shape[0], by1_)
+        if ix1 <= ix0 or iy1 <= iy0:
+            continue          # 範囲の外は被覆 0（頭打ちしても 0）
+        sub = arr[iy0 - by0_:iy1 - by0_, ix0 - bx0_:ix1 - bx0_]
+        np.minimum(sub, cap[iy0 - Y0:iy1 - Y0, ix0 - X0:ix1 - X0], out=sub)
     core = 0
     for z in zones:
         if z["w"] < 1.0 - 1e-9:              # 行の出入りの 0.2 秒は上限が段階的に戻る途中なので、核の検査に入れない
@@ -613,28 +641,34 @@ def composite_cov(frame, cov, color, zones):
         bx0, by0, bx1, by1 = z["box"]
         X0, Y0 = max(int(math.ceil(bx0)), 0), max(int(math.ceil(by0)), 0)
         X1, Y1 = min(int(math.floor(bx1)), W), min(int(math.floor(by1)), H)
-        if X1 > X0 and Y1 > Y0:
-            core = max(core, int(arr[Y0:Y1, X0:X1].max()))
+        ix0, iy0, ix1, iy1 = max(X0, bx0_), max(Y0, by0_), min(X1, bx1_), min(Y1, by1_)
+        if X1 > X0 and Y1 > Y0 and ix1 > ix0 and iy1 > iy0:     # 範囲の外は 0（最大に影響しない）
+            core = max(core, int(arr[iy0 - by0_:iy1 - by0_, ix0 - bx0_:ix1 - bx0_].max()))
     if frame is not None:
-        frame.paste(color, (0, 0), Image.fromarray(arr, "L"))
+        frame.paste(color, (bx0_, by0_), Image.fromarray(arr, "L"))
     return core / 255.0
 
 
-def render_points(frame, t, color, items, sprites, rects):
+def render_points(frame, t, color, items, sprites, rects, pre=None):
     """点の層（items: [(PointLayer, font_ref)]）を貼る。frame が None なら、被覆だけ作って空けの核の最大を測る（検査用）。
     戻り値: (貼った字数, 60px を超える字数, 空けの核の被覆の最大 0〜1。頭打ちの後の値＝コードの自己確認で、測定ではない)
     前提：全層で色が同じ（その時刻の本文色 1 色）。被覆を全層で 1 枚に集めて 1 色で貼るため、層ごとに色が違う場合は使えない。
-    色を分ける変更が来たら、R0-3 の決定（被覆の持ち方）に戻る"""
+    色を分ける変更が来たら、R0-3 の決定（被覆の持ち方）に戻る。
+    pre：{層の番号: その時刻の points_at の結果}（走査が同じ時刻の points_at を二重に計算しないため。無ければ層が自分で計算する）"""
     zones = clear_zones(rects, t)
     cov = Image.new("L", (W, H), 0) if zones else None
+    bb = [W, H, 0, 0] if zones else None          # cov に貼った字の外接の和（空 ＝ x0 ≧ x1）
     total = big = 0
     for L, font_ref in items:
         if t < L.t0 - 1e-9 or t > L.t1 + 1e-9:
             continue
-        n, b = L.draw(frame, t, color, sprites, font_ref, zones=zones, cov=cov)
+        n, b = L.draw(frame, t, color, sprites, font_ref, zones=zones, cov=cov, cov_bb=bb,
+                      pts=(pre or {}).get(L.index))
         total += n
         big += b
-    cmax = composite_cov(frame, cov, color, zones) if zones else 0.0
+    cmax = 0.0
+    if zones and bb[2] > bb[0] and bb[3] > bb[1]:
+        cmax = composite_cov(frame, cov, color, zones, bb=tuple(bb))
     return total, big, cmax
 
 
@@ -786,11 +820,11 @@ class PointLayer:
         z = np.zeros(0)
         return {"ch": np.array([], dtype="U1"), "x": z, "y": z, "size": z.astype(int), "op": z, "ang": z.astype(int)}
 
-    def draw(self, frame, t, color, sprites, font_ref, zones=None, cov=None):
+    def draw(self, frame, t, color, sprites, font_ref, zones=None, cov=None, cov_bb=None, pts=None):
         """frame（PIL RGB）に貼る。color: (r,g,b)。貼った字数と、60px を超える字数を返す。
         zones（読み字の空けの範囲。clear_zones）がある場合、空けの範囲にかかる字は frame でなく cov（'L' の被覆）に貼る
         （空けの範囲の頭打ちを、重なりを含めた画素の被覆で掛けるため。composite_cov で1回だけ色を貼る）。frame が None なら cov だけ作る"""
-        p = self.points_at(t)
+        p = pts if pts is not None else self.points_at(t)
         n = len(p["x"])
         if n == 0:
             return 0, 0
@@ -809,6 +843,11 @@ class PointLayer:
             pos = (x - m.width // 2, y - m.height // 2)
             if zones and _hits_zone(zones, pos, m.size):
                 cov.paste(255, pos, m)
+                if cov_bb is not None:        # 貼った字の外接を、画面内に切って和に足す（composite_cov が全面でなくこの範囲だけ処理する）
+                    cov_bb[0] = min(cov_bb[0], max(pos[0], 0))
+                    cov_bb[1] = min(cov_bb[1], max(pos[1], 0))
+                    cov_bb[2] = max(cov_bb[2], min(pos[0] + m.width, W))
+                    cov_bb[3] = max(cov_bb[3], min(pos[1] + m.height, H))
             elif frame is not None:
                 frame.paste(color, pos, m)
         return n, big

@@ -251,6 +251,7 @@ def _preview_jpeg(alignment, t, style_name):
             _PREVIEW["renderer"] = KineticRenderer(
                 STATE["image_path"], plan, _beats(), rt["style"],
                 duration=_get_audio_duration(STATE["audio_path"]), backgrounds=_backgrounds(), look=rt,
+                scan_range=(0.0, -1.0),    # プレビューは点の層を走査しない（表示するフレームだけ描く。書き出しは全編・描く区間を走査する。T35 R0-12）
             )
             _PREVIEW["key"] = key
         frame = _PREVIEW["renderer"].frame_at(t)
