@@ -546,7 +546,7 @@ def _check_shape_item(sp, where):
 #
 # 点の層の字は重なる。字ごとに不透明度を 0.25 以下にしても、重なると被覆は 0.44・0.58 と積み上がり、読み字の比（4.5:1）が崩れる。
 # そこで空けの範囲にかかる字は、いったん被覆（'L'）に「上に重ねる」式で貼り、画素ごとに上限で頭打ちしてから、色を1回だけ貼る。
-# 空けの外の字は今までどおり frame に直接貼る（見え方を変えない）。色は全層で同じ（その時刻の本文色）なので、全層を1枚の被覆に集める。
+# 空けの外の字は今までどおり frame に直接貼る（見え方を変えない）。色は全層で同じ（その時刻の points_color の色）なので、全層を1枚の被覆に集める。
 
 def clear_zones(rects, t):
     """時刻 t に効いている空けの範囲。[{"w": 効き具合 0〜1（行の出入り 0.2 秒）, "box": 広げた矩形, "roi": 縁の戻り幅を足した矩形}]。
@@ -560,7 +560,7 @@ def clear_zones(rects, t):
         x0, y0, x1, y1 = r["box"]
         pad = r["h"] * CLEAR_PAD_RATIO
         box = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
-        out.append({"w": float(_smooth(w)), "box": box,
+        out.append({"w": float(_smooth(w)), "box": box, "cap": float(r.get("cap", CLEAR_OPACITY)),
                     "roi": (box[0] - CLEAR_SOFT, box[1] - CLEAR_SOFT, box[2] + CLEAR_SOFT, box[3] + CLEAR_SOFT)})
     return out
 
@@ -585,7 +585,7 @@ def _cap_roi(z):
     返した配列は読むだけ（呼び出し側は上限として使い、書き換えない）"""
     if z["w"] < 1.0:        # 行の出入りの 0.2 秒は w が毎フレーム違うので覚えない（覚えると 1 件約 0.9MB が積もる）
         return _cap_roi_calc(z)
-    key = (z["roi"], z["box"])
+    key = (z["roi"], z["box"], z["cap"])
     hit = _CAP_MEMO.get(key)
     if hit is not None:
         return hit
@@ -608,7 +608,7 @@ def _cap_roi_calc(z):
     dx = np.maximum(np.maximum(bx0 - xs, xs - bx1), 0.0)[None, :]
     dy = np.maximum(np.maximum(by0 - ys, ys - by1), 0.0)[:, None]
     d = np.hypot(dx, dy)
-    cap = 1.0 - z["w"] * (1.0 - CLEAR_OPACITY) * (1.0 - np.clip(d / CLEAR_SOFT, 0.0, 1.0))
+    cap = 1.0 - z["w"] * (1.0 - z["cap"]) * (1.0 - np.clip(d / CLEAR_SOFT, 0.0, 1.0))
     return X0, Y0, np.rint(cap * 255.0).astype(np.uint8)
 
 
@@ -652,7 +652,7 @@ def composite_cov(frame, cov, color, zones, bb=None):
 def render_points(frame, t, color, items, sprites, rects, pre=None):
     """点の層（items: [(PointLayer, font_ref)]）を貼る。frame が None なら、被覆だけ作って空けの核の最大を測る（検査用）。
     戻り値: (貼った字数, 60px を超える字数, 空けの核の被覆の最大 0〜1。頭打ちの後の値＝コードの自己確認で、測定ではない)
-    前提：全層で色が同じ（その時刻の本文色 1 色）。被覆を全層で 1 枚に集めて 1 色で貼るため、層ごとに色が違う場合は使えない。
+    前提：全層で色が同じ（その時刻の points_color の色 1 色）。被覆を全層で 1 枚に集めて 1 色で貼るため、層ごとに色が違う場合は使えない。
     色を分ける変更が来たら、R0-3 の決定（被覆の持ち方）に戻る。
     pre：{層の番号: その時刻の points_at の結果}（走査が同じ時刻の points_at を二重に計算しないため。無ければ層が自分で計算する）"""
     zones = clear_zones(rects, t)

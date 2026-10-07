@@ -17,7 +17,8 @@ look.py
                         "min_px": 72, "max_px": 150, "thicken": {...}, "layer_outline": {...}}},
     "palettes": {"<名前>": {"bg": "#RRGGBB", "text": "#RRGGBB", ...}},   # 名前 "image" は使えない
     "voices": {"<声>": {"role": "<役>", "tail": 0.3}},                     # 任意
-    "texture": {...}                                                        # 任意
+    "texture": {...},                                                       # 任意
+    "points_color": "text"|"sub"|"accent"                                   # 任意。点の層の色（全部の配色にそのキーが要る。既定 text）
   }
   役の中身: tracking（字間 em）・leading（行送り ×サイズ）・min_px／max_px（下限を割ったら改行を増やす）・
             thicken {below_px, px}（以下の大きさで同色の縁で太らせる）・layer_outline {px}（層が重なるときだけ背景色の縁）
@@ -33,7 +34,7 @@ look.py
     "lines": {"1": {...}, "5-8": {...}}  # 行番号（1始まり）または範囲。同じ行に複数当たれば後勝ち
   }
   行の項目: voice / tail（秒）/ end（絶対時刻で固定）/ exit（swap・fade・fade:<秒>・fall 等）/ entrance / layout / hold / decor /
-            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ row_lengths（横組みの行だけ。段の字数。空白・欧文の行には書けない）/ max_px / tracking（役の値の行ごとの上書き）
+            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ row_lengths（横組みの行だけ。段の字数。空白・欧文の行には書けない）/ clear_cap（読み字の周りの点の被覆の上限 0.05〜0.25。既定 0.25）/ max_px / tracking（役の値の行ごとの上書き）
   key_word: {"from_line": N, "rule": "first_bracket"}   N 行目の最初の「」の中の語を実行時に取り出す（歌詞は書かない）
   bg_transitions: [{"from": 配色, "to": 配色, "start"|"after_line", "seconds"|"until_line"}]   背景色を時間で線形に補間する
 
@@ -132,6 +133,13 @@ def validate_theme(theme, where="テーマ"):
         raise LookError(f"{where}: default_role '{theme['default_role']}' が fonts にありません")
     if theme.get("default_palette") is not None and theme["default_palette"] not in theme["palettes"]:
         raise LookError(f"{where}: default_palette '{theme['default_palette']}' が palettes にありません")
+    if "points_color" in theme:
+        pc = theme["points_color"]
+        if not isinstance(pc, str) or pc not in ("text", "sub", "accent"):
+            raise LookError(f"{where}: points_color '{pc}' は text・sub・accent のどれかで書いてください")
+        miss = [n for n, pal in theme["palettes"].items() if pc not in pal]
+        if miss:
+            raise LookError(f"{where}: points_color '{pc}' の色が、配色 {', '.join(miss)} にありません（全部の配色に必要）")
     tex = theme.get("texture") or {}
     for key, val in tex.items():
         if key == "paper" and val in ("plain", "none"):
@@ -265,7 +273,7 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
@@ -335,6 +343,8 @@ def _normalize_item(item, allowed, where):
             _check_break_after(v, where)
         if name == "carry":
             _check_carry_item(v, where)
+        if name == "clear_cap" and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.05 <= v <= 0.25):
+            raise LookError(f"direction: {where} の clear_cap は 0.05〜0.25 の数値で書いてください（読み字の周りの点の被覆の上限。既定 0.25）")
         if name == "row_lengths":
             if (not isinstance(v, list) or len(v) < 2 or any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in v)):
                 raise LookError(f"direction: {where} の row_lengths は、段の字数（正の整数）を2つ以上並べた配列で書いてください（例 [4, 3]）")
@@ -475,7 +485,7 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         v = item.get("voice")
         if v is not None and v not in vdefaults:
             raise LookError(f"direction: 行{n} の声 '{v}' が voices にありません（{', '.join(sorted(vdefaults)) or 'なし'}）")
-        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after", "accent_rows", "row_roles", "row_lengths") if k in item]
+        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after", "accent_rows", "row_roles", "row_lengths", "clear_cap") if k in item]
         if look_keys and theme is None:
             raise LookError(f"direction: 行{n} に見た目の項目（{', '.join(look_keys)}）がありますが、テーマが指定されていません"
                             f"（direction の look か --look）")

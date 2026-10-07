@@ -3082,7 +3082,8 @@ class KineticRenderer:
                 if self._stack_end(j) is not None:      # 残した列（stack）は clear_at_line の行の開始まで空けを保つ
                     te = max(te, self._stack_end(j))
                 rects.append({"ts": self.plan[j]["start"], "te": te,
-                              "box": self._cut_rects[j], "h": float(self.cuts[j].size)})
+                              "box": self._cut_rects[j], "h": float(self.cuts[j].size),
+                              "cap": float(self.plan[j].get("clear_cap", kinetic_points.CLEAR_OPACITY))})
             anchor = None
             if rows and rows[0] in self._cut_rects:
                 b = self._cut_rects[rows[0]]
@@ -3131,11 +3132,21 @@ class KineticRenderer:
                                     f"{P.READ_RATIO} 倍（{P.READ_RATIO * L.size_max:.0f}px）に足りません。点を小さくするか、読み字を大きくしてください")
                 pal = self.theme["palettes"][c["bg"]]
                 bg = look_mod.worst_bg(pal["text"], pal["bg"])
-                ratio = look_mod.contrast(pal["text"], look_mod.over(pal["text"], bg, P.CLEAR_OPACITY))
+                cap = float(c.get("clear_cap", P.CLEAR_OPACITY))
+                # 点（テーマの points_color の色）が読み字の周りの被覆 cap で重なった最悪の地（紙の微粒子 ＋10 込み）に対する、読み字の色すべての比の最悪：
+                # 本文色・karaoke の行の未点灯の色（本文色を未点灯の濃さで名目の地に重ねた色。字の真下には点が無く、すぐ隣の地にだけ点が cap まで重なる最悪。worst_contrast と同じ流儀）・差し色のある行の差し色（T35 U7）
+                base = look_mod.over(pal[self.theme.get("points_color", "text")], bg, cap)
+                kinds = [("本文色", pal["text"])]
+                if self.cuts[j].karaoke:
+                    kinds.append(("未点灯の色", look_mod.over(pal["text"], pal["bg"], self.cuts[j].unlit)))
+                if c.get("accent_mode") in ("fill", "key_word", "rows") and pal.get("accent"):
+                    kinds.append(("差し色", pal["accent"]))
+                rs = [(look_mod.contrast(col, base), name) for name, col in kinds]
+                ratio, worst_name = min(rs)
                 self._points_contrast[(L.index, c["index"])] = ratio
                 if ratio < 4.5:
-                    raise LookError(f"points[{L.index}]：行{c['index']} の読み字の比が、空けの範囲に点（不透明度 {P.CLEAR_OPACITY}）を重ねた最悪の背景で "
-                                    f"{ratio:.2f} になり、4.5 を割ります")
+                    raise LookError(f"points[{L.index}]：行{c['index']} の読み字の比（{worst_name}）が、空けの範囲に点（被覆の上限 {cap}）を重ねた最悪の背景で "
+                                    f"{ratio:.2f} になり、4.5 を割ります（clear_cap を下げる・点の色を暗くする・色を見直す）")
             if L.nominal_max() > P.MAX_CHARS:
                 raise LookError(f"points[{L.index}]：1フレームの字数が {L.nominal_max()} で、上限 {P.MAX_CHARS} を超えます（自動で減らさない）")
             w0, w1 = L.t0, L.t1
@@ -3201,7 +3212,8 @@ class KineticRenderer:
                 _n, _b, m = P.render_points(None, t, None, items, self.point_sprites, rects, pre=pre)
                 for st in live:
                     st["clear_max"] = max(st["clear_max"], m)
-                if m > P.CLEAR_OPACITY + 1.0 / 255 + 1e-9:
+                lim = max([r["cap"] for r in rects if r["ts"] - P.CLEAR_RAMP <= t <= r["te"] + P.CLEAR_RAMP] + [0.0])   # その時刻に効いている空けの上限の最大（行の clear_cap）
+                if m > lim + 1.0 / 255 + 1e-9:
                     raise LookError(f"{t:.2f}秒、読み字の空けの範囲の点の被覆が {m:.3f} です（上限 {P.CLEAR_OPACITY}）。止めました")
             if total > P.MAX_CHARS or big > P.MAX_BIG_CHARS:
                 raise LookError(f"{t:.2f}秒：点の層の字数が {total}（60px を超える字 {big}）で、上限（{P.MAX_CHARS}字・60px 超は {P.MAX_BIG_CHARS}字）を超えます。止めました")
@@ -3227,7 +3239,7 @@ class KineticRenderer:
             seen, out = set(), []
             for pt in self.points:
                 for r in pt["layer"].rects:
-                    key = (r["ts"], r["te"], r["box"], r["h"])
+                    key = (r["ts"], r["te"], r["box"], r["h"], r["cap"])
                     if key not in seen:
                         seen.add(key)
                         out.append(r)
@@ -3235,9 +3247,9 @@ class KineticRenderer:
         return self._point_rects_cache
 
     def _draw_points(self, frame, t):
-        """点の層を貼る（decor の後・カウンターと読み字の前）。色は その時刻の本文色。空けの範囲の字は被覆に集めて画素ごとに頭打ちし、
+        """点の層を貼る（decor の後・カウンターと読み字の前）。色は その時刻の、テーマの points_color の色（既定 text＝本文色）。空けの範囲の字は被覆に集めて画素ごとに頭打ちし、
         色を1回だけ貼る（kinetic_points.render_points）。貼った字数の上限は式の誤りの検出（通常は走査で止まっている）"""
-        color = tuple(int(round(v)) for v in self.text_color_at(t))
+        color = tuple(int(round(v)) for v in self.palette_color_at(t, self.theme.get("points_color", "text")))
         items = [(pt["layer"], pt["font_ref"]) for pt in self.points]
         total, big, _m = kinetic_points.render_points(frame, t, color, items, self.point_sprites, self._point_rects())
         if total > self.points_max:
@@ -3290,15 +3302,16 @@ class KineticRenderer:
             else:
                 scan_note = ["", "（走査なし：プレビューの描画器。この表の字数・被覆は空）"]
         out = scan_note + ["", "## 点の層", "",
-               "字は実行時に行から取る（歌詞は書かない）。空けの中の被覆（頭打ち後）は、頭打ちを掛けた後の値の全フレーム走査の最大（重なりを含めた画素。全層を合わせた値。上限 0.25＋1/255）。**測定ではなく、頭打ちのコードの自己確認。この列を合格の根拠にしない（独立の測定は書き出したフレームの画素からの逆算）。**"
+               "字は実行時に行から取る（歌詞は書かない）。空けの中の被覆（頭打ち後）は、頭打ちを掛けた後の値の全フレーム走査の最大（重なりを含めた画素。全層を合わせた値。上限は行の clear_cap（既定 0.25）＋1/255）。**測定ではなく、頭打ちのコードの自己確認。この列を合格の根拠にしない（独立の測定は書き出したフレームの画素からの逆算）。**"
                "点滅の検査（§6）は書き出した mp4 に measure_flicker.py を掛ける（この表には入らない）。", "",
-               "| 点 | 種類 | 区間 | 内容 | 役 | 最大字数 | 平均字数 | 被覆（頭打ち後・自己確認） | 最大の字 | ink |",
-               "|---|---|---|---|---|---|---|---|---|---|"]
+               f"点の色（テーマの points_color）：{self.theme.get('points_color', 'text')}（既定 text＝本文色）。", "",
+               "| 点 | 種類 | 区間 | 内容 | 役 | opacity | dir | count_fade | 最大字数 | 平均字数 | 被覆（頭打ち後・自己確認） | 最大の字 | ink |",
+               "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for pt in self.points:
             L = pt["layer"]
             st = stats.get(L.index, {})
             avg = (st["sum"] / st["n"]) if st.get("n") else 0.0
-            out.append(f"| {L.index} | {L.kind} | {L.t0:.2f}–{L.t1:.2f} | {L.describe()} | {pt['role']} | {st.get('max', 0)} | {avg:.0f} | "
+            out.append(f"| {L.index} | {L.kind} | {L.t0:.2f}–{L.t1:.2f} | {L.describe()} | {pt['role']} | {L.op_lo:g}〜{L.op_hi:g} | {L.spec.get('dir', '') if L.kind == 'tate_line' else ''} | {L.spec.get('count_fade', '') if L.kind == 'tate_line' else ''} | {st.get('max', 0)} | {avg:.0f} | "
                        f"{st.get('clear_max', 0.0):.2f} | {L.size_max}px | {(L.ink or {}).get('mode', '')} |")
         tracks = [(pt["layer"].index, pt["layer"]) for pt in self.points if hasattr(pt["layer"], "tr_t")]
         if tracks:
@@ -3603,7 +3616,8 @@ class KineticRenderer:
             t0, t1 = resolve_span(plan, tr)
             self._transitions.append((t0, max(t1, t0 + 1e-6), _hex(theme["palettes"][tr["from"]]["bg"]),
                                       _hex(theme["palettes"][tr["to"]]["bg"]),
-                                      _hex(theme["palettes"][tr["from"]]["text"]), _hex(theme["palettes"][tr["to"]]["text"])))
+                                      _hex(theme["palettes"][tr["from"]]["text"]), _hex(theme["palettes"][tr["to"]]["text"]),
+                                      tr["from"], tr["to"]))
         self._transitions.sort(key=lambda x: x[0])
         self._tr_starts = [x[0] for x in self._transitions]
         # 間奏・アウトロの効果（direction の interludes。指定した区間だけ。他の空きには出ない）
@@ -3658,7 +3672,7 @@ class KineticRenderer:
         return color
 
     def text_color_at(self, t):
-        """その時刻の本文色。背景色の補間と同じ進み具合で、補間の区間は 2 つの配色の本文色の間を線形に補間する"""
+        """その時刻の本文色（点の層の色は palette_color_at＝テーマの points_color）。背景色の補間と同じ進み具合で、補間の区間は 2 つの配色の本文色の間を線形に補間する"""
         k = self._switch_index(t)
         cut = self.plan[k]
         color = _hex(self.theme["palettes"][cut["bg"]]["text"])
@@ -3666,6 +3680,25 @@ class KineticRenderer:
         if j >= 0:
             t0, t1 = self._transitions[j][:2]
             ta, tb = self._transitions[j][4:6]
+            if cut["start"] <= t0:
+                u = min(max((t - t0) / (t1 - t0), 0.0), 1.0)
+                color = tuple(a + (b - a) * u for a, b in zip(ta, tb))
+        return color
+
+    def palette_color_at(self, t, key):
+        """その時刻の、配色の中のキー（text・sub・accent）の色。text_color_at と同じ進み（背景の補間の区間は 2 つの配色のそのキーの色の間を線形に補間）。
+        点の層の色（テーマの points_color）に使う。key が text のときは text_color_at と同じ値"""
+        if key == "text":
+            return self.text_color_at(t)
+        k = self._switch_index(t)
+        cut = self.plan[k]
+        pals = self.theme["palettes"]
+        color = _hex(pals[cut["bg"]][key])
+        j = bisect.bisect_right(self._tr_starts, t) - 1
+        if j >= 0:
+            t0, t1 = self._transitions[j][:2]
+            fa, fb = self._transitions[j][6:8]
+            ta, tb = _hex(pals[fa][key]), _hex(pals[fb][key])
             if cut["start"] <= t0:
                 u = min(max((t - t0) / (t1 - t0), 0.0), 1.0)
                 color = tuple(a + (b - a) * u for a, b in zip(ta, tb))
@@ -4523,7 +4556,7 @@ def apply_look(plan, theme, direction, vdefaults):
             c["accent_rows"] = list(it["accent_rows"])      # 字の位置（accent_idx）は段が確定した後（apply_accent_rows）
         if it.get("row_roles"):
             c["row_roles"] = dict(it["row_roles"])
-        for key in ("max_px", "tracking", "min_px"):
+        for key in ("max_px", "tracking", "min_px", "clear_cap"):
             if key in it:
                 c[key] = it[key]
         if it.get("row_lengths"):
