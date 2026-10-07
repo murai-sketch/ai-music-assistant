@@ -33,7 +33,7 @@ look.py
     "lines": {"1": {...}, "5-8": {...}}  # 行番号（1始まり）または範囲。同じ行に複数当たれば後勝ち
   }
   行の項目: voice / tail（秒）/ end（絶対時刻で固定）/ exit（swap・fade・fade:<秒>・fall 等）/ entrance / layout / hold / decor /
-            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline）/ max_px / tracking（役の値の行ごとの上書き）
+            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ max_px / tracking（役の値の行ごとの上書き）
   key_word: {"from_line": N, "rule": "first_bracket"}   N 行目の最初の「」の中の語を実行時に取り出す（歌詞は書かない）
   bg_transitions: [{"from": 配色, "to": 配色, "start"|"after_line", "seconds"|"until_line"}]   背景色を時間で線形に補間する
 
@@ -265,8 +265,8 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry"}
-ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow")
+                  "carry", "accent_rows", "row_roles"}
+ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
@@ -335,6 +335,13 @@ def _normalize_item(item, allowed, where):
             _check_break_after(v, where)
         if name == "carry":
             _check_carry_item(v, where)
+        if name == "accent_rows":
+            if (not isinstance(v, list) or not v or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in v)
+                    or len(set(v)) != len(v)):
+                raise LookError(f"direction: {where} の accent_rows は、段番号（0 以上の整数。0 始まり）を重ねずに並べた配列で書いてください")
+        if name == "row_roles":
+            if not isinstance(v, dict) or not v or any(not re.fullmatch(r"\d+", str(k)) or not isinstance(r, str) for k, r in v.items()):
+                raise LookError(f'direction: {where} の row_roles は {{"<段番号>": "<役>"}} の形で書いてください')
         if name == "counter":
             _check_counter_item(v, where)
         if name == "accent" and v not in ACCENT_MODES:
@@ -465,7 +472,7 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         v = item.get("voice")
         if v is not None and v not in vdefaults:
             raise LookError(f"direction: 行{n} の声 '{v}' が voices にありません（{', '.join(sorted(vdefaults)) or 'なし'}）")
-        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after") if k in item]
+        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after", "accent_rows", "row_roles") if k in item]
         if look_keys and theme is None:
             raise LookError(f"direction: 行{n} に見た目の項目（{', '.join(look_keys)}）がありますが、テーマが指定されていません"
                             f"（direction の look か --look）")
@@ -476,6 +483,15 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} の palette '{item['palette']}' がテーマの palettes にありません")
             if item.get("accent") == "glow" and "glow" not in (theme.get("parts") or {}):
                 raise LookError(f"direction: 行{n} は accent: glow ですが、テーマに parts.glow がありません")
+        if (item.get("accent") == "rows") != (item.get("accent_rows") is not None):
+            raise LookError(f"direction: 行{n} の accent_rows は accent: rows の行だけに書けます（accent: rows には accent_rows の指定が要ります）")
+        if item.get("row_roles") is not None:
+            if item.get("layout") != "vertical":
+                raise LookError(f"direction: 行{n} の row_roles は layout: vertical の行だけに書けます（横組みは段の幅の計算が書体で変わる）")
+            if theme is not None:
+                bad = [r for r in item["row_roles"].values() if r not in theme["fonts"]]
+                if bad:
+                    raise LookError(f"direction: 行{n} の row_roles の役 '{bad[0]}' がテーマの fonts にありません")
         if item.get("decor") is not None:
             import kinetic_fx   # 遅延 import（kinetic_fx → look の向きを作らない）
 

@@ -779,7 +779,10 @@ def plan_to_markdown(plan, header=None):
         if voiced:
             row += f" {c.get('voice') or ''} | {_fmt(c.get('tail'))} |"
         if looked:
-            row += f" {c.get('font_role') or ''} | {c.get('accent_mode') or ''} |"
+            acc = c.get("accent_mode") or ""
+            if acc == "rows":
+                acc = "rows 段" + ",".join(str(x) for x in c.get("accent_rows") or [])
+            row += f" {c.get('font_role') or ''} | {acc} |"
         if staged:
             bits = []
             if c.get("impact"):
@@ -801,6 +804,8 @@ def plan_to_markdown(plan, header=None):
                 bits.append("solo")
             if c.get("vertical_typeset"):
                 bits.append(f"縦組み(vert) {len(c['rows'])}段 {c.get('vertical_size')}px")
+                if c.get("row_roles"):
+                    bits.append("段の役 " + ",".join(f"段{k}:{v}" for k, v in sorted(c["row_roles"].items(), key=lambda kv: int(kv[0]))))
             if c.get("carry"):
                 cs = c["carry"]
                 bits.append("carry " + (f"{cs['px_s']:g}px/秒 {cs['dir']}" if "px_s" in cs else
@@ -1191,7 +1196,12 @@ class _Cut:
         elif look is not None:
             # 役の書体：字間・行送り・上限下限 px。下限を割ったら改行を増やして組み直す（縮小で収めない）。
             # 全段を同じ大きさにする（段ごとの大きさの差は使わない）
+            plan_rows = len(rows)
             rows, size_each, self.look_notes = self._fit_look_rows(rows, look, cut, sprites)
+            if cut.get("accent_mode") == "rows" and len(rows) != plan_rows and look.get("strict"):
+                from look import LookError
+                raise LookError(f"行{cut['index']}: accent: rows の行の段が、描くときに {plan_rows} 段から {len(rows)} 段に増えました"
+                                f"（幅・下限 px のため）。accent_rows の段番号が画面の段とずれるので止めました。break_after で段を決めるか、max_px・min_px を見直してください")
             sizes = [size_each] * len(rows)
         elif vertical or cut.get("profile_kids"):
             # 段ごとに大きさが変わると、2文字の段だけ巨大になって落ち着かない
@@ -1306,7 +1316,7 @@ class _Cut:
                 if look is not None:
                     # テーマの差し色の付け方（accent_mode）。段の最後・末尾2文字を差し色にする既存の規則は使わない
                     mode = cut.get("accent_mode", "none")
-                    is_accent = mode == "fill" or (mode == "key_word" and any((flat_i + d) in cut_accent_idx for d in range(len(ch))))
+                    is_accent = mode == "fill" or (mode in ("key_word", "rows") and any((flat_i + d) in cut_accent_idx for d in range(len(ch))))
                 elif emphasis:
                     is_accent = flat_i in emph_idx
                 else:
@@ -1325,12 +1335,13 @@ class _Cut:
                 gsw = max(gsize // 24, 3) if palette_bg is None else max(gsize // 40, 2)
                 if look is not None:
                     stroke, gsw = self._look_stroke(look, cut, gsize, fill, accent, palette_bg)
-                g, key = make_glyph(draw_ch, font_path, gsize, fill, stroke, gsw)
+                fpath = ((look or {}).get("row_fonts") or {}).get(ri, font_path)
+                g, key = make_glyph(draw_ch, fpath, gsize, fill, stroke, gsw)
                 alt = None
                 if self.karaoke and is_accent:
                     # 差し色の字は、未点灯のあいだ本文色で描くので、本文色のスプライトも持つ（点灯の 3 フレームで入れ替える）
                     st2, gsw2 = self._look_stroke(look, cut, gsize, text_color, accent, palette_bg)
-                    alt_g, alt_key = make_glyph(draw_ch, font_path, gsize, text_color, st2, gsw2)
+                    alt_g, alt_key = make_glyph(draw_ch, fpath, gsize, text_color, st2, gsw2)
                     alt = (alt_key, alt_g[0])
                 img, l, t, adv = g
                 w, h = img.size
@@ -3068,6 +3079,14 @@ class KineticRenderer:
             if rows and rows[0] in self._cut_rects:
                 b = self._cut_rects[rows[0]]
                 anchor = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+            elif not rows and sp.get("kind") == "shape" and sp.get("from") == "line":
+                # 区間に重なる行が無いとき、出発点は直前の行（区間の頭より前に始まった最後の行。source: line の字を取る選び方と同じ）の読み字の中心（T35 R10）
+                prev_rows = [j for j, c in enumerate(self.plan) if c["start"] <= t0 and j in self._cut_rects]
+                if prev_rows:
+                    b = self._cut_rects[prev_rows[-1]]
+                    anchor = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+            # track の at_line・at_time を、区間の頭からの秒に直す（ここ1か所。直した後の秒で check_track を掛ける。T35 U3）
+            sp, _resolved = kinetic_points.resolve_track(sp, sp["kind"], [c["start"] for c in self.plan], t0, where)
             layer = kinetic_points.PointLayer(sp, i, t0, t1, variants, rects, beats=beats, anchor=anchor)
             role = sp.get("role") or ("tsubu" if "tsubu" in self.theme["fonts"] else self.theme.get("default_role"))
             ref = self._fonts.get(role)
@@ -3241,6 +3260,11 @@ class KineticRenderer:
             avg = (st["sum"] / st["n"]) if st.get("n") else 0.0
             out.append(f"| {L.index} | {L.kind} | {L.t0:.2f}–{L.t1:.2f} | {L.describe()} | {pt['role']} | {st.get('max', 0)} | {avg:.0f} | "
                        f"{st.get('clear_max', 0.0):.2f} | {L.size_max}px | {(L.ink or {}).get('mode', '')} |")
+        tracks = [(pt["layer"].index, pt["layer"]) for pt in self.points if hasattr(pt["layer"], "tr_t")]
+        if tracks:
+            out += ["", "字数・本数の変化（track。秒に直した後。区間の頭からの秒 → 字数・本数）：", "", "| 点 | 区間の頭（秒） | track |", "|---|---|---|"]
+            for idx, L in tracks:
+                out.append(f"| {idx} | {L.t0:.2f} | " + "、".join(f"{t:.2f}→{c:g}" for t, c in zip(L.tr_t, L.tr_c)) + " |")
         out += ["", "| 点 | 行 | 読み字 | 読める時間（秒） | 区間 | 読み字の比（空けに点を重ねた最悪） |", "|---|---|---|---|---|---|"]
         short = []
         for pt in self.points:
@@ -3273,7 +3297,7 @@ class KineticRenderer:
             if c.get("accent_mode") in ("glow", "fill") and pal.get("accent") == gcol:
                 green.append((c["start"], self._shown_end(c), c["accent_mode"], c["index"]))
             if c.get("accent_idx"):
-                amber.append((c["start"], self._shown_end(c), "鍵語", c["index"]))
+                amber.append((c["start"], self._shown_end(c), "段の差し色" if c.get("accent_mode") == "rows" else "鍵語", c["index"]))
         return green, amber
 
     def _shown_end(self, c):
@@ -3318,7 +3342,7 @@ class KineticRenderer:
             k0 = int(math.ceil(nx["start"] * FPS - 1e-9))
             k1 = int(math.ceil(self.seen_at[j + 1] * FPS - 1e-9))
             cols = [self.cuts[j].colors[0]]
-            if c.get("accent_mode") in ("fill", "key_word"):
+            if c.get("accent_mode") in ("fill", "key_word", "rows"):
                 cols.append(self.cuts[j].colors[2])
             ratios = [look_mod.contrast(col, self.effective_bg(k / FPS, 10 * look_mod.worst_sign(col, self.effective_bg(k / FPS, 0))))
                       for k in range(k0, k1) for col in cols]
@@ -3448,7 +3472,7 @@ class KineticRenderer:
             w0, w1 = c["start"], self._shown_end(c)
             gs = [f"{why}{max(g0, w0):.2f}–{min(g1, w1):.2f}" for g0, g1, why, gn in green
                   if min(g1, w1) - max(g0, w0) > 1e-6]
-            am = f"鍵語 {w0:.2f}–{w1:.2f}" if c.get("accent_idx") else ""
+            am = f"{'段の差し色' if c.get('accent_mode') == 'rows' else '鍵語'} {w0:.2f}–{w1:.2f}" if c.get("accent_idx") else ""
             clash = ""
             if am:
                 clash = "重なる" if any(frame_overlap(w0, w1, g0, g1) for g0, g1, _y, _n in green) else "なし"
@@ -3561,7 +3585,13 @@ class KineticRenderer:
         ref = self._fonts.get(c["font_role"])
         if ref is None:
             raise RuntimeError(f"役 '{c['font_role']}' の書体が解決されていません")
-        return {"font": look_mod.FontRef(ref["path"], ref["index"]),
+        row_fonts = {}
+        for k, role in (c.get("row_roles") or {}).items():     # 縦組みの段ごとの書体（T35 L2）
+            rr = self._fonts.get(role)
+            if rr is None:
+                raise RuntimeError(f"段の役 '{role}' の書体が解決されていません")
+            row_fonts[int(k)] = look_mod.FontRef(rr["path"], rr["index"])
+        return {"font": look_mod.FontRef(ref["path"], ref["index"]), "row_fonts": row_fonts,
                 "tracking": float(spec.get("tracking", 0.0)), "leading": float(spec.get("leading", 1.2)),
                 "min_px": spec.get("min_px", 60), "max_px": spec.get("max_px", 150),
                 "thicken": spec.get("thicken"), "layer_outline": spec.get("layer_outline"),
@@ -4324,8 +4354,12 @@ def arrange_vertical(plan, direction, theme, vdefaults, words=None, use_lcs=Fals
             vd = vdefaults.get(c.get("voice")) or {}
             role = c.get("font_role") or it.get("role") or vd.get("role") or theme.get("default_role")
             spec = theme["fonts"][role]
-            cap = int(c.get("max_px") or spec.get("max_px", 150))
-            min_px = int(c.get("min_px") or spec.get("min_px", 60))
+            cap_role, min_role = spec.get("max_px", 150), spec.get("min_px", 60)
+            for rr in (c.get("row_roles") or {}).values():      # 段ごとの役がある行は、行の役と段の役のうち厳しい方（上限は小さい方、下限は大きい方。T35 L2）
+                cap_role = min(cap_role, theme["fonts"][rr].get("max_px", 150))
+                min_role = max(min_role, theme["fonts"][rr].get("min_px", 60))
+            cap = int(c.get("max_px") or cap_role)
+            min_px = int(c.get("min_px") or min_role)
         else:
             cap, min_px = (320 if c["tier"] == 1 else 220), 60
         forced = None
@@ -4370,6 +4404,27 @@ def arrange_stack(plan, direction):
             off += w
 
 
+def apply_accent_rows(plan):
+    """accent: rows の行の accent_rows（段番号。0 始まり）を、差し色にする字の位置 accent_idx（段を連ねた中の位置。key_word と同じ持ち方）に直す。
+    段が確定した後（break_after・縦組みの段の切り方の後）に呼ぶ。段番号が段の数以上なら止める（T35 L1）"""
+    import look
+
+    for c in plan:
+        for k in (c.get("row_roles") or {}):       # 段ごとの書体の役（L2）の段番号の範囲
+            if int(k) >= len(c["rows"]):
+                raise look.LookError(f"direction: 行{c['index']} の row_roles の段番号 {k} が、段の数（{len(c['rows'])}）以上です")
+        if c.get("accent_mode") != "rows":
+            continue
+        rows = c["rows"]
+        idx = []
+        for ri in c["accent_rows"]:
+            if ri >= len(rows):
+                raise look.LookError(f"direction: 行{c['index']} の accent_rows の段番号 {ri} が、段の数（{len(rows)}）以上です")
+            off = sum(len(r) for r in rows[:ri])
+            idx.extend(range(off, off + len(rows[ri])))
+        c["accent_idx"] = idx
+
+
 def extract_key_word(plan, spec):
     """鍵語を、実行時に歌詞から取り出す。rule == first_bracket: from_line 行目の最初の「」の中の文字列。
     歌詞の文字列は direction にもテーマにも書かない（ここで取り出すだけ）"""
@@ -4409,6 +4464,10 @@ def apply_look(plan, theme, direction, vdefaults):
         c["bg"] = palette
         mode = it.get("accent", "none")
         c["accent_mode"] = mode
+        if mode == "rows":
+            c["accent_rows"] = list(it["accent_rows"])      # 字の位置（accent_idx）は段が確定した後（apply_accent_rows）
+        if it.get("row_roles"):
+            c["row_roles"] = dict(it["row_roles"])
         for key in ("max_px", "tracking", "min_px"):
             if key in it:
                 c[key] = it[key]
@@ -4549,6 +4608,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
             vnotes = []
             arrange_vertical(plan, direction, theme, vdefaults, words=words, use_lcs=use_lcs, notes=vnotes)
             arrange_stack(plan, direction)
+            apply_accent_rows(plan)
             if not quiet:
                 for note in vnotes:
                     print(f"      [警告] {note}")

@@ -62,7 +62,7 @@ SPAN_KEYS = {"lines", "section", "start", "after_line", "start_at", "seconds", "
 COMMON_KEYS = {"kind", "span", "source", "density", "count", "track", "size_px", "opacity", "ink", "seed", "role"}
 KIND_KEYS = {
     "tsubu": COMMON_KEYS | {"drift_px_s"},
-    "tate_line": COMMON_KEYS | {"motion", "speed_px_s", "length_px", "on_sec", "beat_sync", "dir"},
+    "tate_line": COMMON_KEYS | {"motion", "speed_px_s", "length_px", "on_sec", "beat_sync", "dir", "count_fade"},
     "shape": COMMON_KEYS | {"shape", "from", "orient", "gather", "draw_on", "disperse", "flow", "wobble_px", "big"},
 }
 SHAPE_KEYS = {"disc": {"type", "center", "r0", "r"}, "spiral": {"type", "center", "r0", "turns", "r_max"},
@@ -193,9 +193,15 @@ def _check_pair(v, where, lo, hi, what, integer=False):
         _err(f"direction: {where} の {what} は [最小, 最大]（{lo}〜{hi}、最小≦最大）で書いてください")
 
 
-def parse_track(spec, kind, where):
+TRACK_TIME_KEYS = ("at", "at_line", "at_time")
+
+
+def parse_track(spec, kind, where, n_lines=None):
     """字数の時間変化 → (時刻の配列（区間の頭からの秒）, 字数の配列)。
-    density（0〜3）か count（字数・本数）の1つ、または track（[{"at": 秒, "density"|"count": 値}, ...]）。count が density より優先"""
+    density（0〜3）か count（字数・本数）の1つ、または track（[{時刻, "density"|"count": 値}, ...]）。count が density より優先。
+    時刻の書き方は3つ（1要素に1つだけ。T35 U3）：at（区間の頭からの秒）／at_line: N ＋ 任意の offset（行 N の開始からの秒、0 以上）／
+    at_time（曲の頭からの絶対時刻）。at_line・at_time の要素は、行の時刻が要るので検査の段階では秒に直せない：時刻の配列にその位置の None を入れて返す
+    （秒に直すのは resolve_track。直した後の秒で check_track・check_edges を掛ける）"""
     levels = LEVELS[kind]
     lo, hi = COUNT_RANGE[kind]
 
@@ -220,18 +226,75 @@ def parse_track(spec, kind, where):
         ts, cs, prev = [], [], -1.0
         for i, it in enumerate(tr):
             w = f"{where}.track[{i}]"
-            if not isinstance(it, dict) or not set(it) <= {"at", "density", "count"} or ("density" not in it and "count" not in it):
-                _err(f"direction: {w} は {{\"at\": 秒, \"density\" か \"count\"}} で書いてください")
-            at = it.get("at")
-            if not _num(at) or at < 0 or at < prev - 1e-12:
-                _err(f"direction: {w}.at は 0 以上で、前の値以上（昇順）の秒で書いてください")
-            prev = float(at)
-            ts.append(float(at))
+            if (not isinstance(it, dict) or not set(it) <= set(TRACK_TIME_KEYS) | {"offset", "density", "count"}
+                    or ("density" not in it and "count" not in it)):
+                _err(f"direction: {w} は {{時刻（at・at_line・at_time のどれか1つ）, \"density\" か \"count\"}} で書いてください")
+            kinds = [k for k in TRACK_TIME_KEYS if k in it]
+            if len(kinds) != 1:
+                _err(f"direction: {w} の時刻は at・at_line・at_time のどれか1つだけ書いてください（{'併記されています' if kinds else '時刻がありません'}）")
+            if "offset" in it and "at_line" not in it:
+                _err(f"direction: {w} の offset は at_line と一緒にだけ書けます")
+            if "at_line" in it:
+                n, off = it["at_line"], it.get("offset", 0)
+                if isinstance(n, bool) or not isinstance(n, int) or n < 1 or (n_lines is not None and n > n_lines):
+                    _err(f"direction: {w}.at_line が行番号（1〜{n_lines if n_lines is not None else '行数'}）ではありません")
+                if not _num(off) or off < 0:
+                    _err(f"direction: {w}.offset は 0 以上の秒で書いてください")
+                ts.append(None)
+                prev = -1.0
+            elif "at_time" in it:
+                if not _num(it["at_time"]) or it["at_time"] < 0:
+                    _err(f"direction: {w}.at_time は 0 以上の秒（曲の頭から）で書いてください")
+                ts.append(None)
+                prev = -1.0
+            else:
+                at = it["at"]
+                if not _num(at) or at < 0 or at < prev - 1e-12:
+                    _err(f"direction: {w}.at は 0 以上で、前の値以上（昇順）の秒で書いてください")
+                prev = float(at)
+                ts.append(float(at))
             cs.append(one(it, w))
         return ts, cs
     if "density" not in spec and "count" not in spec:
         _err(f"direction: {where} に density か count（か track）がありません")
     return [0.0], [one(spec, where)]
+
+
+def resolve_track(spec, kind, line_starts, t0, where):
+    """at_line・at_time を使った track を、区間の頭からの秒の at に直した spec を返す（使っていなければ spec のまま）。
+    line_starts：プランの各行の開始（秒。行番号 1 ＝ [0]）。t0：区間の頭（曲の頭からの秒）。直した後に昇順でなければ止める
+    （行の時刻を直して順番が入れ替わったときに、黙って並べ替えない）。直した後の秒で check_track を掛ける（at_line の経路で検査を飛ばさない）。
+    戻り値：(spec, 直したか)"""
+    tr = spec.get("track")
+    if not tr or not any(("at_line" in it or "at_time" in it) for it in tr):
+        return spec, False
+    out, prev = [], -1.0
+    for i, it in enumerate(tr):
+        w = f"{where}.track[{i}]"
+        if "at_line" in it:
+            n = it["at_line"]
+            if n > len(line_starts):
+                _err(f"direction: {w}.at_line {n} が行数（{len(line_starts)}）を超えています")
+            at = line_starts[n - 1] + float(it.get("offset", 0)) - t0
+        elif "at_time" in it:
+            at = float(it["at_time"]) - t0
+        else:
+            at = float(it["at"])
+        if at < -1e-9:
+            _err(f"direction: {w} の時刻が区間の頭（{t0:.2f}秒）より前になります（{at + t0:.2f}秒）")
+        at = max(at, 0.0)
+        if at < prev - 1e-9:
+            _err(f"direction: {w} の時刻（区間の頭から {at:.2f}秒）が前の要素（{prev:.2f}秒）より前になります。行の時刻・offset を見直してください（黙って並べ替えません）")
+        prev = at
+        new = {"at": at}
+        for k in ("density", "count"):
+            if k in it:
+                new[k] = it[k]
+        out.append(new)
+    sp2 = dict(spec, track=out)
+    ts, cs = parse_track(sp2, kind, where)
+    check_track(ts, cs, where)
+    return sp2, True
 
 
 def check_track(ts, cs, where):
@@ -408,8 +471,9 @@ def validate_points(points, n_lines, theme):
                 _err(f"direction: {where}（switch）は count（同時に出る本数 1〜3 の整数）だけで書いてください（density・track は使えません）")
             ts, cs = [0.0], [float(c)]
         else:
-            ts, cs = parse_track(sp, kind, where)
-            check_track(ts, cs, where)
+            ts, cs = parse_track(sp, kind, where, n_lines)
+            if None not in ts:       # at_line・at_time を含む track は、行の時刻が要るので秒に直した後（kinetic._setup_points）に check_track を掛ける
+                check_track(ts, cs, where)
         if kind == "shape" and max(cs) < 20:
             _err(f"direction: {where}（shape）の字数は 20 以上にしてください（形が分からない）")
         if kind == "tsubu":
@@ -422,6 +486,11 @@ def validate_points(points, n_lines, theme):
 
 
 def _check_tate(sp, where, hi_size, nmax):
+    if "count_fade" in sp:
+        if sp["count_fade"] not in ("rank", "linear"):
+            _err(f"direction: {where}.count_fade は rank か linear で書いてください")
+        if sp.get("motion", "flow") != "flow":
+            _err(f"direction: {where}.count_fade は motion: flow の線だけに書けます")
     if "dir" in sp:
         if sp["dir"] not in TATE_DIRS:
             _err(f"direction: {where}.dir は {', '.join(TATE_DIRS)} のどれかで書いてください")
@@ -669,6 +738,8 @@ class PointLayer:
 
     def _setup_track(self, spec):
         ts, cs = parse_track(spec, self.kind, f"points[{self.index}]")
+        if None in ts:
+            _err(f"points[{self.index}]：at_line・at_time が秒に直されていません（kinetic._setup_points の resolve_track を通してください）")
         t = np.array(ts, dtype=np.float64)
         for i in range(1, len(t)):                      # 同じ時刻（一気に切り替え）は 1e-6 秒ずらして補間を定義する
             if t[i] <= t[i - 1]:
@@ -682,7 +753,10 @@ class PointLayer:
             check_edges(ts, cs, self.dur, f"points[{self.index}]", head=shape_appear_sec(d["gather"], d["draw_on"]), tail=d["disperse"])
 
     def _rank_vis(self, tau):
-        """順位が N(t) より小さい点の見え方（0〜1）。字ごとに RANK_FADE_SEC かけて出入りする（箱形の平均）"""
+        """順位が N(t) より小さい点の見え方（0〜1）。字ごとに RANK_FADE_SEC かけて出入りする（箱形の平均）。
+        count_fade: "linear"（tate_line の flow）のときは、順位ごとの見え方 ＝ clip(本数(t) − 順位, 0, 1)（本数の変化にそのまま付いて、ゆっくり薄く・濃くなる。T35 R2）"""
+        if getattr(self, "_count_linear", False):
+            return np.clip(float(np.interp(tau, self.tr_t, self.tr_c)) - self.rank, 0.0, 1.0)
         ks = tau - (RANK_FADE_SEC / 8.0) * np.arange(9)
         ns = np.interp(ks, self.tr_t, self.tr_c)
         return (ns[:, None] > self.rank[None, :]).mean(axis=0)
@@ -794,6 +868,7 @@ class PointLayer:
         lo_len, hi_len = spec.get("length_px", [400, 1200]) if self.motion == "flow" else spec.get("length_px", [300, 900])
         steps = np.array(_steps_in(self.size_lo, self.size_hi))
         if self.motion == "flow":
+            self._count_linear = spec.get("count_fade", "rank") == "linear"
             self._setup_track(spec)
             L = self.nmax
             slot_w = (W - 2 * MARGIN) / L
