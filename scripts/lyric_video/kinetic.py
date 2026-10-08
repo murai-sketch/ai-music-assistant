@@ -4421,7 +4421,7 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                 c["karaoke_land"] = True
                 if match_result[0]:
                     c["karaoke_land_at"] = round(max(min(match_result[0].values()), c["start"]), 3)   # 最初の単語の開始
-            time_of, _word_of, n_units = match_result
+            time_of, word_of_k, n_units = match_result
             cover = len(time_of) / n_units if n_units else 0.0
             c["karaoke_cover"] = round(cover, 2)
             match = (alignment[i].get("match") if alignment else None)
@@ -4431,6 +4431,10 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             else:
                 # 点灯の上限は表示の終わり（direction の end で固定した行は sung_end が end より後になりうる）
                 cap = min(c["sung_end"], c["end"]) if c.get("sung_end") is not None else c["end"]
+                if it.get("karaoke_cap") == "word" and word_of_k:
+                    # karaoke_cap: word（T35 U9）：点灯の上限を、声の終わりでなく、最後に対応した単語の終わりにする（表示の終わりを超えない）
+                    win_k = _window_words(words, plan, i)
+                    cap = min(float(win_k[word_of_k[max(word_of_k)]]["end"]), c["end"])
                 c["char_times"] = _karaoke_times(len(flat), time_of, c["start"], cap)
         # --- 段3後半：カウンター（行の状態と、増える時刻の元になる単語の開始）・solo
         if direction.get("counter") is not None:

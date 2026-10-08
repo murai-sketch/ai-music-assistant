@@ -274,7 +274,7 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
@@ -344,6 +344,8 @@ def _normalize_item(item, allowed, where):
             _check_break_after(v, where)
         if name == "carry":
             _check_carry_item(v, where)
+        if name == "karaoke_cap" and v != "word":
+            raise LookError(f"direction: {where} の karaoke_cap は \"word\"（点灯の上限を、声の終わりでなく最後に対応した単語の終わりにする）だけです")
         if name == "clear_cap" and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.05 <= v <= 0.25):
             raise LookError(f"direction: {where} の clear_cap は 0.05〜0.25 の数値で書いてください（読み字の周りの点の被覆の上限。既定 0.25）")
         if name == "row_lengths":
@@ -521,6 +523,8 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} は accent: glow ですが、テーマに parts.glow がありません")
         if (item.get("accent") == "rows") != (item.get("accent_rows") is not None):
             raise LookError(f"direction: 行{n} の accent_rows は accent: rows の行だけに書けます（accent: rows には accent_rows の指定が要ります）")
+        if item.get("karaoke_cap") is not None and item.get("entrance") != "karaoke":
+            raise LookError(f"direction: 行{n} の karaoke_cap は entrance: karaoke の行だけに書けます")
         if item.get("row_lengths") is not None:
             if item.get("break_after") is not None:
                 raise LookError(f"direction: 行{n} の row_lengths は break_after と一緒に書けません（段の切り方は片方だけ）")

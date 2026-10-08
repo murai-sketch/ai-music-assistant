@@ -199,7 +199,7 @@ TRACK_TIME_KEYS = ("at", "at_line", "at_time")
 def parse_track(spec, kind, where, n_lines=None):
     """字数の時間変化 → (時刻の配列（区間の頭からの秒）, 字数の配列)。
     density（0〜3）か count（字数・本数）の1つ、または track（[{時刻, "density"|"count": 値}, ...]）。count が density より優先。
-    時刻の書き方は3つ（1要素に1つだけ。T35 U3）：at（区間の頭からの秒）／at_line: N ＋ 任意の offset（行 N の開始からの秒、0 以上）／
+    時刻の書き方は3つ（1要素に1つだけ。T35 U3）：at（区間の頭からの秒）／at_line: N ＋ 任意の offset（行 N の開始からの秒。負も可＝行の開始より前）／
     at_time（曲の頭からの絶対時刻）。at_line・at_time の要素は、行の時刻が要るので検査の段階では秒に直せない：時刻の配列にその位置の None を入れて返す
     （秒に直すのは resolve_track。直した後の秒で check_track・check_edges を掛ける）"""
     levels = LEVELS[kind]
@@ -238,8 +238,8 @@ def parse_track(spec, kind, where, n_lines=None):
                 n, off = it["at_line"], it.get("offset", 0)
                 if isinstance(n, bool) or not isinstance(n, int) or n < 1 or (n_lines is not None and n > n_lines):
                     _err(f"direction: {w}.at_line が行番号（1〜{n_lines if n_lines is not None else '行数'}）ではありません")
-                if not _num(off) or off < 0:
-                    _err(f"direction: {w}.offset は 0 以上の秒で書いてください")
+                if not _num(off) or not math.isfinite(off):
+                    _err(f"direction: {w}.offset は秒の数値で書いてください（負も書ける。行の開始より前を指す。区間の頭より前になる場合は秒に直すときに止まる）")
                 ts.append(None)
                 prev = -1.0
             elif "at_time" in it:
