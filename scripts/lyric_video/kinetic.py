@@ -809,6 +809,8 @@ def plan_to_markdown(plan, header=None):
                 bits.append(f"縦組み(vert) {len(c['rows'])}段 {c.get('vertical_size')}px")
                 if c.get("row_roles"):
                     bits.append("段の役 " + ",".join(f"段{k}:{v}" for k, v in sorted(c["row_roles"].items(), key=lambda kv: int(kv[0]))))
+            if c.get("align_to_prev"):
+                bits.append("前の行の先頭字にそろえる")
             if c.get("row_lengths"):
                 bits.append("段の字数 " + ",".join(str(x) for x in c["row_lengths"]))
             if c.get("carry"):
@@ -2683,6 +2685,8 @@ class KineticRenderer:
                 colors = (text, stroke, accent)
                 palette_bg = bg
             self.cuts.append(_Cut(c, self.sprites, colors, palette_bg, beats))
+        if self.themed:
+            self._apply_align_to_prev()
         self.decor = _shared_decor()
         self.impact_zoom = {}
         self.impact_cap = {}
@@ -2692,6 +2696,7 @@ class KineticRenderer:
         if getattr(self, "_strict", False):
             self._check_entry_margins()
         self._compute_shown()
+        self._note_align_vanished()
         if getattr(self, "_strict", False):
             self._check_no_blank_frames()
         self._stack_prev = {}       # 行 j（0 始まり）を描くとき、一緒に薄く残す前の列 [(行, 不透明度)]。stack の無い曲は空
@@ -2714,6 +2719,67 @@ class KineticRenderer:
             self._check_points()
         for note in self.look_notes + self.impact_notes:
             print(f"      [書体] {note}")
+
+    def _apply_align_to_prev(self):
+        """direction の align_to_prev：この行の先頭字の中心 x を、1つ前の行の先頭字の中心 x にそろえる（行全体の平行移動だけ。
+        大きさ・字間・y は変えない）。アンカーの x を動かすので、描画・外接・点の層の空け・安全域の検査は同じアンカーを読んで一緒に動く。
+        カットを組んだ直後に当てる（後続の検査・点の層は動いた後の位置で働く）。条件は解決後の構図に対して確かめ、外れたら止める：
+        この行と前の行がどちらも横組み・1段・center・入りが scatter でなく・同じ大きさ。書体だけが違うときは止めず注記する。
+        そろうのは静止位置だけ。入りの動き・slam の寄りの瞬間・前の行が動く場合（carry・踏み込みの沈みなど）は対象外。
+        傾いた行（stamp 等で base_angle が 0 でない）は、この行・前の行とも止める。y・字間・書体が違うときは止めず注記を出す。
+        前の行がこの行の開始より前に消えるときは、注記を出す（_compute_shown の後で足す）。"""
+        from look import LookError
+
+        for j, (c, o) in enumerate(zip(self.plan, self.cuts)):
+            if not c.get("align_to_prev"):
+                continue
+            n = c["index"]
+            if j == 0:
+                raise LookError(f"direction: 行{n} の align_to_prev は、前の行が無いので使えません")
+            pc, po = self.plan[j - 1], self.cuts[j - 1]
+            for tag, cc, oo in (("この行", c, o), ("前の行", pc, po)):
+                why = None
+                if cc.get("layout") != "center":
+                    why = f"構図が {cc.get('layout')} です（center の行だけ）"
+                elif cc.get("vertical_typeset") or len(cc["rows"]) != 1 or oo.n_rows != 1:
+                    why = "1段の横組みではありません"
+                elif cc.get("entrance") == "scatter":
+                    why = "入りが scatter です"
+                elif abs(oo.base_angle) > 1e-9:
+                    why = f"行が傾いています（base_angle {oo.base_angle}°。入りが stamp 等）"
+                elif not oo.glyphs:
+                    why = "字がありません"
+                if why:
+                    raise LookError(f"direction: 行{n} の align_to_prev は使えません（{tag}は{why}）")
+            if abs(o.size - po.size) > 1e-6:
+                raise LookError(f"direction: 行{n} の align_to_prev は使えません（字の大きさが前の行と違います：{o.size} と {po.size}。平行移動だけでは重ならない）")
+            dx = (po.anchor[0] + po.glyphs[0]["cx"]) - (o.anchor[0] + o.glyphs[0]["cx"])
+            o.anchor = (o.anchor[0] + dx, o.anchor[1])
+            o.align_dx = dx
+            note = f"行{n}：前の行の先頭字にそろえて x {dx:+.1f}px"
+            if c.get("font_role") != pc.get("font_role"):
+                note += "（書体が違うので先頭字以外は一致しない）"
+            # 先頭字以外の静止位置・y の比較（字間・書体・text_y の違いを拾う。止めない）
+            pairs = list(zip(po.glyphs, o.glyphs))[1:]
+            mx = max((abs(o.glyph_center(g, 1, 0, 0)[0] - po.glyph_center(pg, 1, 0, 0)[0]) for pg, g in pairs), default=0.0)
+            my = max((abs(o.glyph_center(g, 1, 0, 0)[1] - po.glyph_center(pg, 1, 0, 0)[1]) for pg, g in zip(po.glyphs, o.glyphs)), default=0.0)
+            if mx > 0.5 and "先頭字以外は一致しない" not in note:
+                note += f"（先頭字以外は一致しない：x 最大 {mx:.1f}px。字間・書体の違い）"
+            if my > 0.5:
+                note += f"（y は {my:.1f}px 違う。y はそろえない）"
+            self.look_notes.append(note)
+
+    @staticmethod
+    def _align_hint(o):
+        """止まる文に足す：その行が align_to_prev で x を動かした行なら原因として示す（L-3）"""
+        dx = getattr(o, "align_dx", None)
+        return "" if dx is None else f"（この行は align_to_prev で x を {dx:+.1f}px 動かした行です。そろえが原因の可能性があります）"
+
+    def _note_align_vanished(self):
+        """_compute_shown の後：align_to_prev の行で、前の行がこの行の開始までに消えているなら注記（止めない）"""
+        for j, c in enumerate(self.plan):
+            if j and c.get("align_to_prev") and self.shown_until[j - 1] < c["start"] - 1e-6:
+                self.look_notes.append(f"行{c['index']}：前の行はこの行の開始までに消えています（そろえは入れ替わりでは見えない。前の行の表示を開始まで残すには前の行の tail 等）")
 
     def _check_safe_area(self):
         """検査（止める）：direction の safe_area（暫定の枠。値は direction に書く）に、全フレーム（30fps）で、読み字の外接矩形（carry の移動・
@@ -2767,7 +2833,7 @@ class KineticRenderer:
                     over.append(f"右下の角へ（y＞{corner['y_from']} では x≦{corner['x_max']}。右へ {x1 - corner['x_max']:.1f}px、下端 {y1:.1f}px＝角の上端から {y1 - corner['y_from']:.1f}px）")
                 if over:
                     raise LookError(f"行{c['index']}・{t:.2f}秒：読み字が安全域（safe_area）からはみ出します（{'、'.join(over)}）。"
-                                    f"text_y・大きさ・carry・構図を見直してください。黙って縮めず止めました")
+                                    f"text_y・大きさ・carry・構図を見直してください。黙って縮めず止めました{self._align_hint(o)}")
 
     def _check_carry(self):
         """検査（止める）：carry で動いた後の読み字が、上下の余白（CARRY_MARGIN＝92px）に収まる（動く範囲は carry_extent。縦組みで列ごとに
@@ -2871,7 +2937,7 @@ class KineticRenderer:
                 m = min(X0, W - X1)
                 if m < SIDE_MARGIN - 1e-6:
                     raise LookError(f"行{c['index']}: 文字の外接矩形の左右の余白が {m:.2f}px で、{SIDE_MARGIN}px を割ります"
-                                    f"（左 {X0:.2f}px・右 {W - X1:.2f}px）。構図・max_px・break_after を見直してください。黙って縮めず止めました")
+                                    f"（左 {X0:.2f}px・右 {W - X1:.2f}px）。構図・max_px・break_after を見直してください。黙って縮めず止めました{self._align_hint(o)}")
             if not iv:
                 continue
             hx = max(W / 2 - X0, X1 - W / 2)
@@ -2965,7 +3031,7 @@ class KineticRenderer:
                 if k >= 3 and (mx < SIDE_MARGIN - 1e-6 or my < VERTICAL_MARGIN - 1e-6):
                     raise LookError(f"行{c['index']}: 入りの{k}フレーム目（{t:.3f}秒、p={p:.2f}）の外接矩形の余白が"
                                     f"左右 {mx:.1f}px・上下 {my:.1f}px で、左右 {SIDE_MARGIN}px・上下 {VERTICAL_MARGIN}px を割ります"
-                                    f"（入りの最初の2フレームは除く）。max_px・衝撃の段階（overshoot・ease・land_frames）を見直してください")
+                                    f"（入りの最初の2フレームは除く）。max_px・衝撃の段階（overshoot・ease・land_frames）を見直してください{self._align_hint(o)}")
             self.entry_log[c["index"]] = log
 
     # --- 表示区間（見え始め・表示の終わり）。direction のある曲だけ。無い曲は従来どおり（見え始め＝開始、表示の終わり＝end） ---
@@ -4375,6 +4441,8 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             c["decor"] = it["decor"]
         if it.get("text_y") is not None:
             c["text_y"] = float(it["text_y"])    # 文字の中心位置（画面の高さに対する割合。既定 0.5。点の層の下で読み字を下寄りに置く等）
+        if it.get("align_to_prev"):
+            c["align_to_prev"] = True            # 前の行の先頭字の x にそろえる（描画器が、カットを組んだ後に当てる）
         if it.get("ink") is not None:
             c["read_ink"] = dict(it["ink"])     # 読み字の質感（かすれ。_Cut が掛ける）
         if it.get("voice") is not None:

@@ -34,7 +34,7 @@ look.py
     "lines": {"1": {...}, "5-8": {...}}  # 行番号（1始まり）または範囲。同じ行に複数当たれば後勝ち
   }
   行の項目: voice / tail（秒）/ end（絶対時刻で固定）/ exit（swap・fade・fade:<秒>・fall 等）/ entrance / layout / hold / decor /
-            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ row_lengths（横組みの行だけ。段の字数＝全角スペースを除いた字数。全角スペースは段の中なら 0.5字の空き・切れ目なら無し。半角スペースなど・欧文の行には書けない）/ clear_cap（読み字の周りの点の被覆の上限 0.05〜0.25。既定 0.25）/ max_px / tracking（役の値の行ごとの上書き）
+            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ row_lengths（横組みの行だけ。段の字数＝全角スペースを除いた字数。全角スペースは段の中なら 0.5字の空き・切れ目なら無し。半角スペースなど・欧文の行には書けない）/ clear_cap（読み字の周りの点の被覆の上限 0.05〜0.25。既定 0.25）/ align_to_prev（true だけ。この行の先頭字の中心 x を前の行の先頭字の x にそろえる。両方が横組み・1段・center・傾いていない・同じ大きさのときだけ。そろうのは静止位置だけ：入りの動き・slam の寄りの瞬間・前の行が動く場合は対象外）/ max_px / tracking（役の値の行ごとの上書き）
   key_word: {"from_line": N, "rule": "first_bracket"}   N 行目の最初の「」の中の語を実行時に取り出す（歌詞は書かない）
   bg_transitions: [{"from": 配色, "to": 配色, "start"|"after_line", "seconds"|"until_line"}]   背景色を時間で線形に補間する
 
@@ -274,7 +274,7 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
@@ -346,6 +346,8 @@ def _normalize_item(item, allowed, where):
             _check_carry_item(v, where)
         if name == "karaoke_cap" and v != "word":
             raise LookError(f"direction: {where} の karaoke_cap は \"word\"（点灯の上限を、声の終わりでなく最後に対応した単語の終わりにする）だけです")
+        if name == "align_to_prev" and v is not True:
+            raise LookError(f"direction: {where} の align_to_prev は true だけを書けます（前の行の先頭字の x にそろえる。やめるときは項目ごと消す）")
         if name == "clear_cap" and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.05 <= v <= 0.25):
             raise LookError(f"direction: {where} の clear_cap は 0.05〜0.25 の数値で書いてください（読み字の周りの点の被覆の上限。既定 0.25）")
         if name == "row_lengths":
@@ -510,7 +512,7 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         v = item.get("voice")
         if v is not None and v not in vdefaults:
             raise LookError(f"direction: 行{n} の声 '{v}' が voices にありません（{', '.join(sorted(vdefaults)) or 'なし'}）")
-        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after", "accent_rows", "row_roles", "row_lengths", "clear_cap") if k in item]
+        look_keys = [k for k in ("role", "palette", "accent", "max_px", "tracking", "min_px", "break_after", "accent_rows", "row_roles", "row_lengths", "clear_cap", "align_to_prev") if k in item]
         if look_keys and theme is None:
             raise LookError(f"direction: 行{n} に見た目の項目（{', '.join(look_keys)}）がありますが、テーマが指定されていません"
                             f"（direction の look か --look）")
@@ -525,6 +527,11 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
             raise LookError(f"direction: 行{n} の accent_rows は accent: rows の行だけに書けます（accent: rows には accent_rows の指定が要ります）")
         if item.get("karaoke_cap") is not None and item.get("entrance") != "karaoke":
             raise LookError(f"direction: 行{n} の karaoke_cap は entrance: karaoke の行だけに書けます")
+        if item.get("align_to_prev"):
+            if n == 1:
+                raise LookError("direction: 行1 の align_to_prev は、前の行が無いので使えません")
+            if item.get("layout") is not None and item["layout"] != "center":
+                raise LookError(f"direction: 行{n} の align_to_prev は layout: center の行だけに書けます（書いたのは {item['layout']}）")
         if item.get("row_lengths") is not None:
             if item.get("break_after") is not None:
                 raise LookError(f"direction: 行{n} の row_lengths は break_after と一緒に書けません（段の切り方は片方だけ）")
