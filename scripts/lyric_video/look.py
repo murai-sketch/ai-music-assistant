@@ -274,12 +274,12 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step", "reveal", "bouten", "karaoke_at"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step", "reveal", "bouten", "karaoke_at", "rule_in", "keep_rows"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
-                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack", "safe_area", "halftone"}
+                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack", "safe_area", "halftone", "backdrops"}
 CARRY_DIRS = ("down", "up")          # carry（行全体を一定の速さで動かす保持）の向き
 CARRY_KEYS = {"px_s", "dir"}
 STACK_KEYS = {"lines", "dim", "clear_at_line"}   # stack（前の列を残して薄くする）
@@ -360,6 +360,10 @@ def _normalize_item(item, allowed, where):
         if name == "karaoke_at" and (not isinstance(v, dict) or not v or any(
                 not str(k).isdigit() or isinstance(t, bool) or not isinstance(t, (int, float)) or t < 0 for k, t in v.items())):
             raise LookError(f"direction: {where} の karaoke_at は {{\"<字の位置（0 から）>\": <点灯の秒>}} で書いてください（声の頭を実測して直す字だけ）")
+        if name == "keep_rows" and v is not True:
+            raise LookError(f"direction: {where} の keep_rows は true だけを書けます（縦組みの列を、歌詞の段のまま使う）")
+        if name == "rule_in" and v is not True:
+            raise LookError(f"direction: {where} の rule_in は true だけを書けます（reveal の行の下端に線を引き、そこから字が出る。線は字が出きった時に消える）")
         if name == "bouten" and v is not True:
             raise LookError(f"direction: {where} の bouten は true だけを書けます（karaoke の行で、点灯した字の上に点が灯って残る）")
         if name == "align_to_prev" and v is not True:
@@ -667,6 +671,12 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
             raise LookError('direction: key_word は {"from_line": 行番号, "rule": "first_bracket"} の形で書いてください')
         if kw["from_line"] in hidden:
             raise LookError(f"direction: key_word.from_line の行{kw['from_line']} は hidden（字幕に出さない行）なので、差し色の語の取り出し元にできません")
+    if direction.get("backdrops") is not None:
+        import kinetic_backdrop   # 遅延 import
+
+        if theme is None:
+            raise LookError("direction: backdrops がありますが、テーマが指定されていません")
+        kinetic_backdrop.validate(direction["backdrops"], n_lines, LookError)
     trs = direction.get("bg_transitions", [])
     if not isinstance(trs, list):
         raise LookError("direction: bg_transitions は配列で書いてください")

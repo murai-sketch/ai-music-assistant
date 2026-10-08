@@ -49,6 +49,7 @@ import kinetic_points
 import kinetic_vertical
 
 VIDEO_SIZE = (1080, 1920)
+WORK_DIR_BG = Path(__file__).resolve().parent / "_work"   # backdrops の画像は WORK_DIR_BG/backgrounds/ から読む
 FPS = 30
 _SCAN_MEMO = {}   # 点の層の走査の結果（同じ入力・同じ範囲なら再利用。T35 R0-12）
 IMPACT_P_EPS = 1e-3   # slam（衝撃の段階をもつカット）の p ＝ 0 の判定の許容（フレーム。land の丸め 1e-6 秒 ≒ 3e-5 フレームより十分大きい）
@@ -119,6 +120,8 @@ STEP_LEVELS = {"s": {"dive": 24, "over": 4, "zoom": 0.02, "shake": 0, "push": 8}
                "m": {"dive": 36, "over": 6, "zoom": 0.035, "shake": 2, "push": 16},
                "l": {"dive": 48, "over": 8, "zoom": 0.05, "shake": 4, "push": 24}}
 STEP_ZOOM_DELAY, STEP_ZOOM_SEC, STEP_SHAKE_SEC, STEP_GHOST_SEC = 0.1, 0.12, 0.15, 0.3
+# 線から字へ（rule_in）：行の下端の少し下に、字の外接矩形の幅の細い水平線を RULE_FRAMES で左から引き、字の入り（reveal）はその分だけ遅れて始まる。線は字が出きった時に消える
+RULE_FRAMES, RULE_PX, RULE_GAP = 2, 2, 8
 STEP_GHOST_ALPHA = (0.30, 0.15)     # 残像（足跡）。入りの高い位置（dive）と半分の高さに置き去りにして STEP_GHOST_SEC で消す
 
 
@@ -2125,6 +2128,24 @@ class _Cut:
             for k in range(6, 0, -1):
                 frame.paste(im, (int(px + step * k), int(py + step * k)), im)
 
+    def rule_in_box(self):
+        """線から字へ（rule_in）の線の位置：字が出きった後の、読み字の外接矩形（x0, x1）と、線の上端の y。字が無ければ None"""
+        dur = self.cut["end"] - self.cut["start"]
+        tl = min(RULE_FRAMES / FPS + self.cut["reveal"]["sec"] + 0.1, dur)
+        boxes = [b for b in (self.glyph_box(g, tl, dur) for g in self.glyphs) if b is not None]
+        if not boxes:
+            return None
+        return min(b[0] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes) + RULE_GAP
+
+    def _draw_rule_in(self, frame, tl, dur, k, dim):
+        box = self.rule_in_box()
+        if box is None:
+            return
+        x0, x1, y0 = box
+        d = ImageDraw.Draw(frame)
+        d.rectangle([int(round(x0)), int(round(y0)), int(round(x0 + (x1 - x0) * k)) - 1, int(round(y0)) + RULE_PX - 1],
+                    fill=_hex(self.colors[0]))
+
     def draw(self, frame, t, sprites, cam=(1.0, 0.0, 0.0, 0.0), dim=1.0):
         """dim：残した列（stack。T35 C2）として描くときの不透明度の掛け率（0〜1）。1.0 は今までと同じ（掛けない・刻みも変えない）"""
         cut = self.cut
@@ -2200,8 +2221,11 @@ class _Cut:
         reveal_q = 1.0
         if cut.get("reveal"):
             rsec_ = cut["reveal"]["sec"]
-            if tl < rsec_:
-                reveal_q = _ease_out(max(tl, 0.0) / rsec_)
+            rdelay_ = RULE_FRAMES / FPS if cut.get("rule_in") else 0.0   # 線から字へ：線を引き終えてから字が出る
+            if tl - rdelay_ < rsec_:
+                reveal_q = _ease_out(max(tl - rdelay_, 0.0) / rsec_)
+            if cut.get("rule_in") and 0 <= tl < rdelay_ + rsec_:
+                self._draw_rule_in(frame, tl, dur, min(tl * FPS / RULE_FRAMES, 1.0), dim)
         for g in self.glyphs:
             dx, dy, scale, angle, alpha, crop_top, crop_right = self.glyph_state(g, tl, dur)
             if dim != 1.0:
@@ -2873,6 +2897,7 @@ class KineticRenderer:
             self._check_carry()
             self._setup_stack()
             self._check_safe_area()
+            self._check_rule_in()
         self.counter = None
         self.counter_skipped = 0
         self._cut_rects = {}
@@ -3013,6 +3038,20 @@ class KineticRenderer:
                 if over:
                     raise LookError(f"行{c['index']}・{t:.2f}秒：読み字が安全域（safe_area）からはみ出します（{'、'.join(over)}）。"
                                     f"text_y・大きさ・carry・構図を見直してください。黙って縮めず止めました{self._align_hint(o)}")
+
+    def _check_rule_in(self):
+        """検査（止める）：rule_in の線（字の外接矩形の下端 + RULE_GAP から RULE_PX）が safe_area の下端に収まること。余白が足りない行には付けられない"""
+        from look import LookError
+
+        sa = self._dir.get("safe_area")
+        for c, o in zip(self.plan, self.cuts):
+            if not c.get("rule_in"):
+                continue
+            box = o.rule_in_box()
+            if box is None:
+                raise LookError(f"direction: 行{c['index']} の rule_in は、描く字のある行だけに書けます")
+            if sa and box[2] + RULE_PX > float(sa["bottom"]) + 1e-6:
+                raise LookError(f"direction: 行{c['index']} の rule_in の線の下端 {box[2] + RULE_PX:.1f}px が安全域の下端 {sa['bottom']} を超えます（余白が足りない行には付けられません）")
 
     def _check_carry(self):
         """検査（止める）：carry で動いた後の読み字が、上下の余白（CARRY_MARGIN＝92px）に収まる（動く範囲は carry_extent。縦組みで列ごとに
@@ -3982,6 +4021,16 @@ class KineticRenderer:
                                       tr["from"], tr["to"]))
         self._transitions.sort(key=lambda x: x[0])
         self._tr_starts = [x[0] for x in self._transitions]
+        # 背景の質感・下の帯の滲み（direction の backdrops。無い曲は None で、何も通らない）
+        self._backdrops = None
+        if self._dir.get("backdrops"):
+            import kinetic_backdrop
+            from look import LookError as _LE
+
+            self._backdrops = kinetic_backdrop.Backdrops(
+                self._dir["backdrops"],
+                lambda kind, n: float(plan_all[n - 1]["start" if kind == "start" else "end"]),
+                WORK_DIR_BG, _LE)
         # 間奏・アウトロの効果（direction の interludes。指定した区間だけ。他の空きには出ない）
         self.interlude_spans = []
         song_len = self.duration or look.get("duration")
@@ -4215,7 +4264,10 @@ class KineticRenderer:
     def frame_at(self, t):
         bg_cam, g_zoom, sx, sy = self.camera_at(t)
         if self.themed:
-            frame = self._themed_interlude(self._themed_background(t), t)
+            bgf = self._themed_background(t)
+            if self._backdrops is not None:
+                bgf = self._backdrops.apply(bgf, t)
+            frame = self._themed_interlude(bgf, t)
         else:
             frame = self._plain_background(t, bg_cam)
         return self._foreground(frame, t, bg_cam, g_zoom, sx, sy)
@@ -4730,6 +4782,10 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             if entrance not in ("karaoke", "cut"):
                 raise look.LookError(f"direction: 行{c['index']} の reveal（入りの切り抜き）は entrance: karaoke か cut の行だけに書けます")
             c["reveal"] = {"dir": it["reveal"]["dir"], "sec": float(it["reveal"]["sec"])}
+        if it.get("rule_in"):
+            if not c.get("reveal"):
+                raise look.LookError(f"direction: 行{c['index']} の rule_in（線から字へ）は reveal を書いた行だけに書けます")
+            c["rule_in"] = True
         if it.get("bouten"):
             if entrance != "karaoke":
                 raise look.LookError(f"direction: 行{c['index']} の bouten（傍点）は entrance: karaoke の行だけに書けます")
@@ -4885,6 +4941,8 @@ def arrange_vertical(plan, direction, theme, vdefaults, words=None, use_lcs=Fals
         else:
             cap, min_px = (320 if c["tier"] == 1 else 220), 60
         forced = None
+        if it.get("keep_rows") and not it.get("break_after"):
+            forced = [len(r) for r in c["rows"]]      # 縦組みの列を、歌詞の段（全角スペースで分けた段）のまま使う（字数で均さない）
         if it.get("break_after"):
             split = split_rows_after(c["rows"], it["break_after"], c["index"])
             forced = [len(r) for r in split]
