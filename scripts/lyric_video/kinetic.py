@@ -112,6 +112,28 @@ ENTRANCE_FRAMES = {
     "cut": 0,   # 動かない入り。開始の瞬間に全文が出る（開始より前は出ない）
     "karaoke": 4.5,   # 全文が 0.15 秒で未点灯の濃さまで出る。以後は字ごとの時刻で点灯（direction の曲だけ）
 }
+# 踏み込み（direction の行の step: s／m／l。karaoke の行だけ）。入りの頭で字が dive px 上にあり、3 フレームで定位置を over px 越えて下がり、3 フレームで戻る。
+# 画面の寄り zoom は着地の 0.1 秒後から 0.12 秒で戻し、縦の揺れ shake px は 0.15 秒で消す。push は流れの線と粒を下へ押す量（px。0.4 秒で戻す。kinetic_points.push_offset）。
+# 拡大の衝撃（slam）は使わない。step の無い行は何も変わらない
+STEP_LEVELS = {"s": {"dive": 24, "over": 4, "zoom": 0.02, "shake": 0, "push": 8},
+               "m": {"dive": 36, "over": 6, "zoom": 0.035, "shake": 2, "push": 16},
+               "l": {"dive": 48, "over": 8, "zoom": 0.05, "shake": 4, "push": 24}}
+STEP_ZOOM_DELAY, STEP_ZOOM_SEC, STEP_SHAKE_SEC, STEP_GHOST_SEC = 0.1, 0.12, 0.15, 0.3
+STEP_GHOST_ALPHA = (0.30, 0.15)     # 残像（足跡）。入りの高い位置（dive）と半分の高さに置き去りにして STEP_GHOST_SEC で消す
+
+
+def step_dy(level, p):
+    """踏み込みの字の縦のずれ（px。下が正）。p＝着地からのフレーム数（負なら入りの高い位置のまま）"""
+    v = STEP_LEVELS[level]
+    if p < 0:
+        return -float(v["dive"])
+    if p < 3:
+        return -v["dive"] + (v["dive"] + v["over"]) * p / 3
+    if p < 6:
+        return v["over"] * (1 - (p - 3) / 3)
+    return 0.0
+
+
 EXIT_FRAMES = 3
 # 間のある退場（fall / drift）の長さ。カットの3割、0.14〜0.55秒（JIZURA の目安）
 EXIT_RATIO, EXIT_MIN_SEC, EXIT_MAX_SEC = 0.3, 0.14, 0.55
@@ -1935,6 +1957,8 @@ class _Cut:
                 p = (cut["start"] + tl - cut.get("karaoke_land_at", ct[0])) * FPS
                 if 0 <= p < 3:
                     scale = _lerp(1.06, 1.0, p / 3)
+            if cut.get("step"):
+                dy += step_dy(cut["step"], (cut["start"] + tl - cut["step_at"]) * FPS)
 
         if cut.get("hold") == "heartbeat" and f > E:
             scale *= 1 + 0.08 * self._beat_pulse(cut["start"] + tl)
@@ -2149,6 +2173,29 @@ class _Cut:
                 if gim is not None:
                     gcx, gcy = self.glow_center
                     frame.paste(gim, (int(ax + gcx - gim.size[0] / 2), int(ay + gcy - gim.size[1] / 2)), gim)
+
+        if cut.get("step") and self.karaoke:
+            # 足跡の残像（step）：入りの高い位置（dive）と半分の高さに薄い像を置き去りにして STEP_GHOST_SEC で消す（字は動かない）。本物の字より先に描く
+            gt = cut["start"] + tl - cut["step_at"]
+            if 0 <= gt < STEP_GHOST_SEC:
+                dive = STEP_LEVELS[cut["step"]]["dive"]
+                fade = 1.0 - gt / STEP_GHOST_SEC
+                for g in self.glyphs:
+                    _dx, _dy, gscale, gangle, galpha, _ct, _cr = self.glyph_state(g, tl, dur)
+                    if galpha <= 0.02:
+                        continue
+                    gm, ga_ = self.karaoke_parts(g, tl)
+                    ghost_a = max(gm, ga_) * galpha * dim
+                    gtot = base_angle + gangle + g["angle"]
+                    for ga, gdy in ((STEP_GHOST_ALPHA[0], -dive), (STEP_GHOST_ALPHA[1], -dive * 0.5)):
+                        a_ = ghost_a * ga * fade
+                        if a_ <= 0.02:
+                            continue
+                        gcx, gcy = self.glyph_center(g, gscale, 0.0, gdy)
+                        key, img_ = (g["alt"][0], g["alt"][1]) if "alt" in g else (g["key"], g["img"])
+                        im = sprites.transformed(key, img_, gscale, gtot, a_, 0.0, 0.0, alpha_step=20)
+                        if im is not None:
+                            frame.paste(im, (int(gcx - im.size[0] / 2), int(gcy - im.size[1] / 2)), im)
 
         for g in self.glyphs:
             dx, dy, scale, angle, alpha, crop_top, crop_right = self.glyph_state(g, tl, dur)
@@ -2777,6 +2824,16 @@ class KineticRenderer:
         if self.themed:
             self._setup_counter(look, beats)
             self._check_stage3_late()
+        self.halftone = []          # 網点（direction の halftone）。無い曲は空のまま
+        if self.themed and self._dir.get("halftone"):
+            shown_all = [self._shown_end(c) for c in self.plan_all]
+            dur_ = self.duration or look.get("duration")
+            from look import LookError as LookError_
+            for k, it in enumerate(self._dir["halftone"]):
+                t0_, t1_ = resolve_span(self.plan_all, it["span"], dur_, where=f"halftone[{k}]", shown=shown_all)
+                if t1_ <= t0_ + 2 * float(it.get("fade", 1.0)):
+                    raise LookError_(f"direction: halftone[{k}] の区間が短すぎます（{t0_:.2f}〜{t1_:.2f}秒。出入り {it.get('fade', 1.0)} 秒×2 より長く）")
+                self.halftone.append({"t0": t0_, "t1": t1_, "fade": float(it.get("fade", 1.0)), "layers": it["layers"]})
         self.points = []            # 点の層（direction の points）。無い曲は空のまま（描画・検査・レポートに何も足さない）
         self.points_max = 0
         self._points_scan = None
@@ -3302,7 +3359,7 @@ class KineticRenderer:
                 te = max(self.plan[j]["end"], shown[j])
                 if self._stack_end(j) is not None:      # 残した列（stack）は clear_at_line の行の開始まで空けを保つ
                     te = max(te, self._stack_end(j))
-                rects.append({"ts": self.plan[j]["start"], "te": te,
+                rects.append({"ts": self.plan[j]["start"], "te": te, "line": self.plan[j]["index"],
                               "box": self._cut_rects[j], "h": float(self.cuts[j].size),
                               "cap": float(self.plan[j].get("clear_cap", kinetic_points.CLEAR_OPACITY))})
             anchor = None
@@ -3318,6 +3375,9 @@ class KineticRenderer:
             # track の at_line・at_time を、区間の頭からの秒に直す（ここ1か所。直した後の秒で check_track を掛ける。T35 U3）
             sp, _resolved = kinetic_points.resolve_track(sp, sp["kind"], [c["start"] for c in self.plan_all], t0, where)
             layer = kinetic_points.PointLayer(sp, i, t0, t1, variants, rects, beats=beats, anchor=anchor)
+            if sp["kind"] in ("tsubu", "tate_line"):
+                # 踏み込み（step）の着地で、流れの線と粒を一拍だけ下へ押す。step の行が無ければ空（何も変わらない）
+                layer.push_events = [(c["step_at"] + STEP_ZOOM_DELAY, float(STEP_LEVELS[c["step"]]["push"])) for c in self.plan if c.get("step")]
             role = sp.get("role") or ("tsubu" if "tsubu" in self.theme["fonts"] else self.theme.get("default_role"))
             ref = self._fonts.get(role)
             if ref is None:
@@ -4061,6 +4121,14 @@ class KineticRenderer:
             g_zoom += c.get("beat_zoom", 0.012) * (self.bg.pulse(t) - 1.0) / max(self.bg.pulse_scale - 1.0, 1e-3)
         elif c["level"] == 1:
             g_zoom = 1.0 + c.get("creep", 0.015) * uc
+        if c.get("step"):
+            # 踏み込み（step）：着地の 0.1 秒後から寄りが 0.12 秒で戻り、縦の揺れが 0.15 秒で消える。step の無い行は通らない
+            v = STEP_LEVELS[c["step"]]
+            tl_ = t - c["step_at"] - STEP_ZOOM_DELAY
+            if 0 <= tl_ < STEP_ZOOM_SEC:
+                g_zoom += v["zoom"] * (1 - tl_ / STEP_ZOOM_SEC)
+            if v["shake"] and 0 <= tl_ < STEP_SHAKE_SEC:
+                sy += v["shake"] * (1 - tl_ / STEP_SHAKE_SEC) * math.sin(tl_ * 2 * math.pi * 20)
         if self.themed and self.interlude_spans:
             g_zoom *= self.interlude_zoom(t)   # 間奏・アウトロの寄り引き（指定した区間だけ 1.0 以外）
         return bg_cam, g_zoom, sx, sy
@@ -4126,6 +4194,9 @@ class KineticRenderer:
         for j in active:
             text_color, _stroke, accent = self.cuts[j].colors
             self.decor.draw(frame, self.plan[j], self._cut_time(j, t), _hex(text_color), _hex(accent), bg_cam)
+        if self.halftone:
+            color_ = tuple(int(round(v)) for v in self.palette_color_at(t, self.theme.get("points_color", "text")))
+            kinetic_points.render_halftone(frame, t, color_, self.halftone)   # 網点。点の層の下
         if self.points:
             self._draw_points(frame, t)   # 点の層。decor の上、カウンターと読み字の下
         if self.counter is not None:
@@ -4572,6 +4643,10 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                 raise look.LookError(f"direction: 行{c['index']} の karaoke / break_after には単語時刻（whisper_words）が要ります")
             flat = "".join(c["rows"])
             match_result = _match_line(flat, _window_words(words, plan, i), use_lcs)
+        if it.get("step") is not None:
+            if entrance != "karaoke":
+                raise look.LookError(f"direction: 行{c['index']} の step（踏み込み）は entrance: karaoke の行だけに書けます")
+            c["step"] = it["step"]
         if entrance == "karaoke":
             c["karaoke"] = {"unlit_opacity": kcfg["unlit_opacity"], "light_frames": kcfg["light_frames"],
                             "keyword_unlit": kcfg.get("keyword_unlit", "text")}
@@ -4580,6 +4655,9 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                 if match_result[0]:
                     c["karaoke_land_at"] = round(max(min(match_result[0].values()), c["start"]), 3)   # 最初の単語の開始
             time_of, word_of_k, n_units = match_result
+            if c.get("step"):
+                # 踏み込みの着地は、最初の単語の開始（行の開始より前にならない）
+                c["step_at"] = round(max(min(time_of.values()), c["start"]), 3) if time_of else round(c["start"], 3)
             cover = len(time_of) / n_units if n_units else 0.0
             c["karaoke_cover"] = round(cover, 2)
             match = (alignment[i].get("match") if alignment else None)

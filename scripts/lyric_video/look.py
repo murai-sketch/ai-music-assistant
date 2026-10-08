@@ -274,12 +274,12 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
-                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack", "safe_area"}
+                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack", "safe_area", "halftone"}
 CARRY_DIRS = ("down", "up")          # carry（行全体を一定の速さで動かす保持）の向き
 CARRY_KEYS = {"px_s", "dir"}
 STACK_KEYS = {"lines", "dim", "clear_at_line"}   # stack（前の列を残して薄くする）
@@ -292,6 +292,7 @@ LIGHT_BAD_DECOR = ("tape",)                     # 字が暗い色で固定
 LIGHT_BAD_TEXTURES = ("misregister", "long_shadow")   # 色が要る
 MAX_COL_CHARS_RANGE = (2, 16)
 LAND_MODES = ("first_word", "start")
+STEP_LEVEL_NAMES = ("s", "m", "l")   # 踏み込みの段階（小・中・大。値は kinetic.STEP_LEVELS）
 COUNTER_STATES = ("hide", "resume", "off")
 COUNTER_KEYS = {"count", "state", "rate", "enter", "break"}
 COUNTER_TOP_KEYS = {"appear", "voices"}
@@ -348,6 +349,8 @@ def _normalize_item(item, allowed, where):
             _check_carry_item(v, where)
         if name == "karaoke_cap" and v != "word":
             raise LookError(f"direction: {where} の karaoke_cap は \"word\"（点灯の上限を、声の終わりでなく最後に対応した単語の終わりにする）だけです")
+        if name == "step" and v not in STEP_LEVEL_NAMES:
+            raise LookError(f"direction: {where} の step（踏み込みの段階）は {', '.join(STEP_LEVEL_NAMES)} のどれかで書いてください")
         if name == "align_to_prev" and v is not True:
             raise LookError(f"direction: {where} の align_to_prev は true だけを書けます（前の行の先頭字の x にそろえる。やめるときは項目ごと消す）")
         if name == "clear_cap" and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.05 <= v <= 0.25):
@@ -615,6 +618,12 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         import kinetic_points   # 遅延 import
 
         kinetic_points.validate_points(direction["points"], n_lines, theme, hidden=hidden)
+    if direction.get("halftone") is not None:
+        import kinetic_points   # 遅延 import
+
+        if theme is None:
+            raise LookError("direction: halftone はテーマ（look）を使う曲でだけ使えます（色をテーマの points_color から取ります）")
+        kinetic_points.validate_halftone(direction["halftone"], n_lines)
     vt = direction.get("vertical")
     if vt is not None:
         if not isinstance(vt, dict) or not vt or not set(vt) <= VERTICAL_KEYS:

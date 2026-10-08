@@ -61,12 +61,12 @@ KINDS = ("tsubu", "tate_line", "shape")
 SPAN_KEYS = {"lines", "section", "start", "after_line", "start_at", "seconds", "end", "until_line", "until"}
 COMMON_KEYS = {"kind", "span", "source", "density", "count", "track", "size_px", "opacity", "ink", "seed", "role"}
 KIND_KEYS = {
-    "tsubu": COMMON_KEYS | {"drift_px_s"},
-    "tate_line": COMMON_KEYS | {"motion", "speed_px_s", "length_px", "on_sec", "beat_sync", "dir", "count_fade"},
+    "tsubu": COMMON_KEYS | {"drift_px_s", "dir"},
+    "tate_line": COMMON_KEYS | {"motion", "speed_px_s", "length_px", "on_sec", "beat_sync", "dir", "count_fade", "x_px"},
     "shape": COMMON_KEYS | {"shape", "from", "orient", "gather", "draw_on", "disperse", "flow", "wobble_px", "big"},
 }
 SHAPE_KEYS = {"disc": {"type", "center", "r0", "r"}, "spiral": {"type", "center", "r0", "turns", "r_max"},
-              "concentric": {"type", "center", "rings", "r_min", "gap"}, "outline": {"type", "points", "closed", "mask"}}
+              "concentric": {"type", "center", "rings", "r_min", "gap"}, "outline": {"type", "points", "closed", "mask", "around", "pad"}}
 FROM_MODES = ("scatter", "line", "edge")
 ORIENTS = ("upright", "tangent")
 TATE_DIRS = ("mixed", "down", "up")   # 流れる線の向き：線ごとに乱数（既定）／全部上→下／全部下→上
@@ -74,6 +74,24 @@ TATE_DIRS = ("mixed", "down", "up")   # 流れる線の向き：線ごとに乱�
 
 # ---------------------------------------------------------------------------
 # 小さな道具
+PUSH_UP_SEC, PUSH_SEC = 0.1, 0.4     # 踏み込みの着地で、流れの線と粒を下へ押す（0.1 秒で押し、0.4 秒までに戻す）
+
+
+def push_offset(events, t):
+    """踏み込みの着地ごとに、流れの線と粒を一拍だけ下へ押した量（px）。events: [(着地の時刻, 押す px)]。時刻 t だけで決まる（積み上げない）"""
+    s = 0.0
+    for te, P in events:
+        dt = t - te
+        if 0 <= dt < PUSH_SEC:
+            if dt < PUSH_UP_SEC:
+                u = dt / PUSH_UP_SEC
+                s += P * u * u * (3 - 2 * u)
+            else:
+                u = (dt - PUSH_UP_SEC) / (PUSH_SEC - PUSH_UP_SEC)
+                s += P * (1 - u * u * (3 - 2 * u))
+    return s
+
+
 
 def _num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -380,7 +398,18 @@ def _check_shape(sh, where, size_hi):
         rmax = rmin + (k - 1) * gap
         if rmax > MAX_R:
             _err(f"direction: {where}.shape の最大の半径が {rmax:.0f}px で、{MAX_R}px を超えます")
+    elif "around" in sh:
+        # 行を囲む矩形の点列（読み字の外接矩形から実行時に作る。points とは同時に書けない）
+        if "points" in sh or "closed" in sh:
+            _err(f"direction: {where}.shape.around は points・closed と同時に書けません")
+        if isinstance(sh["around"], bool) or not isinstance(sh["around"], int) or sh["around"] < 1:
+            _err(f"direction: {where}.shape.around は行番号（1 以上の整数）で書いてください")
+        if "pad" in sh and (not _num(sh["pad"]) or not 0 <= sh["pad"] <= 120):
+            _err(f"direction: {where}.shape.pad は 0〜120（px。外接矩形から外へ離す量）で書いてください")
+        return
     else:
+        if "pad" in sh:
+            _err(f"direction: {where}.shape.pad は around と一緒にだけ書けます")
         pts = sh.get("points")
         if (not isinstance(pts, list) or len(pts) < 3 or not all(isinstance(p, list) and len(p) == 2 and all(_num(x) and 0 <= x <= 1 for x in p) for p in pts)):
             _err(f"direction: {where}.shape.points は [[x, y], ...]（0〜1 の割合、3点以上）で書いてください")
@@ -483,6 +512,8 @@ def validate_points(points, n_lines, theme, hidden=frozenset()):
         if kind == "shape" and max(cs) < 20:
             _err(f"direction: {where}（shape）の字数は 20 以上にしてください（形が分からない）")
         if kind == "tsubu":
+            if "dir" in sp and sp["dir"] != "up":
+                _err(f"direction: {where}.dir は \"up\"（上向きの漂い）だけです。書かなければ向きは乱数")
             if "drift_px_s" in sp:
                 _check_pair(sp["drift_px_s"], where, 0, 200, "drift_px_s")
         if kind == "tate_line":
@@ -502,6 +533,12 @@ def _check_tate(sp, where, hi_size, nmax):
             _err(f"direction: {where}.dir は {', '.join(TATE_DIRS)} のどれかで書いてください")
         if sp.get("motion", "flow") != "flow":
             _err(f"direction: {where}.dir は motion: flow の線だけに書けます（switch の線は動かないので向きを持ちません）")
+    if "x_px" in sp:
+        xs_ = sp["x_px"]
+        if sp.get("motion", "flow") != "flow":
+            _err(f"direction: {where}.x_px は motion: flow の線だけに書けます")
+        if (not isinstance(xs_, list) or len(xs_) < nmax or not all(_num(x) and MARGIN <= x <= W - MARGIN for x in xs_)):
+            _err(f"direction: {where}.x_px は、線の位置（px。{MARGIN}〜{W - MARGIN}）を本数（{nmax}）以上並べた配列で書いてください（書かなければ左右の余白の内側を等分した位置を乱数で割り当てる）")
     if nmax < 1:
         _err(f"direction: {where}（tate_line）の本数が全部 0 です。線を出さない点の層は書かないでください（density／count を 1 以上に）")
     if "speed_px_s" in sp:
@@ -679,6 +716,92 @@ def render_points(frame, t, color, items, sprites, rects, pre=None):
 
 
 # ---------------------------------------------------------------------------
+# 網点（止まった濃淡）。網の細かさ・角度の違う点の層を重ねる。direction の最上位 "halftone"（配列）を書いた曲だけ。
+# 字を使わない（円を格子に並べ、濃淡の場に応じて半径を変える）。時刻で形は変わらない（区間の頭・尻で濃さが出入りするだけ）。
+# 点の層（points）と違い、読み字の空けを作らない：読み字のある区間には置かない（置くなら読み字の比を測り直す）。
+
+HALFTONE_FIELDS = ("a", "b")                      # 濃淡の場（止まった波。a：粗い縦の波、b：斜めの波）
+HALFTONE_KEYS = {"span", "layers", "fade"}
+HALFTONE_LAYER_KEYS = {"field", "pitch", "angle", "max_r", "opacity"}
+HALFTONE_FADE = (0.5, 3.0)
+_ht_cache = {}
+
+
+def _ht_field(name, x, y):
+    if name == "a":
+        return np.clip(0.5 + 0.5 * np.sin(y / 330.0 + np.sin(x / 260.0) * 1.5), 0, 1) ** 1.5
+    return np.clip(0.5 + 0.5 * np.sin(x / 210.0 - y / 400.0 + 1.2), 0, 1) ** 2
+
+
+def validate_halftone(items, n_lines):
+    """direction の halftone を検査する（未知の項目・範囲外の値は止める）。span は points と同じ書き方（lines・start|after_line…）"""
+    if not isinstance(items, list) or not items:
+        _err("direction: halftone は [{...}, ...] の配列で書いてください")
+    for i, it in enumerate(items):
+        where = f"halftone[{i}]"
+        if not isinstance(it, dict) or set(it) - HALFTONE_KEYS or "span" not in it or "layers" not in it:
+            _err(f"direction: {where} は {{\"span\", \"layers\"（必須）, \"fade\"}} の形で書いてください")
+        sp = it["span"]
+        if not isinstance(sp, dict) or set(sp) - SPAN_KEYS:
+            _err(f"direction: {where}.span は points の span と同じ書き方で書いてください")
+        if "fade" in it and (not _num(it["fade"]) or not HALFTONE_FADE[0] <= it["fade"] <= HALFTONE_FADE[1]):
+            _err(f"direction: {where}.fade は {HALFTONE_FADE[0]}〜{HALFTONE_FADE[1]} 秒で書いてください（出入りの長さ。点滅を避ける）")
+        ls = it["layers"]
+        if not isinstance(ls, list) or not 1 <= len(ls) <= 3:
+            _err(f"direction: {where}.layers は 1〜3 枚の配列で書いてください")
+        for k, l in enumerate(ls):
+            w2 = f"{where}.layers[{k}]"
+            if not isinstance(l, dict) or set(l) != HALFTONE_LAYER_KEYS:
+                _err(f"direction: {w2} は {{{', '.join(sorted(HALFTONE_LAYER_KEYS))}}} をすべて書いてください")
+            if l["field"] not in HALFTONE_FIELDS:
+                _err(f"direction: {w2}.field は {', '.join(HALFTONE_FIELDS)} のどれかで書いてください")
+            for key, lo, hi in (("pitch", 8, 80), ("angle", -3.2, 3.2), ("max_r", 2, 40), ("opacity", 0.05, 0.5)):
+                if not _num(l[key]) or not lo <= l[key] <= hi:
+                    _err(f"direction: {w2}.{key} は {lo}〜{hi} の数値で書いてください")
+
+
+def _ht_mask(layer):
+    """1 枚の網の被覆（'L'。255＝その点の全面）。格子の点を、場の値に応じた半径の円で描く。2 倍で描いて縮める（縁をなめらかに）。区間の外でも使い回すのでキャッシュ"""
+    key = (layer["field"], layer["pitch"], layer["angle"], layer["max_r"])
+    m = _ht_cache.get(key)
+    if m is not None:
+        return m
+    S = 2
+    pitch, ang, maxr = float(layer["pitch"]), float(layer["angle"]), float(layer["max_r"])
+    ca, sa = math.cos(ang), math.sin(ang)
+    R = int(math.hypot(W, H) / pitch) + 1
+    ii, jj = np.meshgrid(np.arange(-R, R), np.arange(-R, R), indexing="ij")
+    u, v = ii.ravel() * pitch, jj.ravel() * pitch
+    x, y = W / 2 + u * ca - v * sa, H / 2 + u * sa + v * ca
+    ok = (x > -10) & (x < W + 10) & (y > -10) & (y < H + 10)
+    x, y = x[ok], y[ok]
+    r = maxr * _ht_field(layer["field"], x, y)
+    im = Image.new("L", (W * S, H * S), 0)
+    d = ImageDraw.Draw(im)
+    for xx, yy, rr in zip(x.tolist(), y.tolist(), r.tolist()):
+        if rr < 0.8:
+            continue
+        d.ellipse([(xx - rr) * S, (yy - rr) * S, (xx + rr) * S, (yy + rr) * S], fill=255)
+    m = im.resize((W, H), Image.LANCZOS)
+    _ht_cache[key] = m
+    return m
+
+
+def render_halftone(frame, t, color, items):
+    """網点を貼る。items: [{"t0","t1","fade","layers"}]（秒に直した後）。頭・尻の fade 秒で濃さが 0↔1（なめらかに）。区間の外は何もしない"""
+    for it in items:
+        if t < it["t0"] or t > it["t1"]:
+            continue
+        env = float(_smooth(min(t - it["t0"], it["t1"] - t) / it["fade"]))
+        if env <= 0:
+            continue
+        for l in it["layers"]:
+            k = l["opacity"] * env
+            m = _ht_mask(l).point(lambda v, k=k: int(v * k + 0.5))
+            frame.paste(color, (0, 0), m)
+
+
+# ---------------------------------------------------------------------------
 # 字の画像（点の層専用のキャッシュ）
 
 class PointSprites:
@@ -750,6 +873,7 @@ class PointLayer:
             _err(f"points[{index}]：区間が短すぎます（{self.t0:.2f}〜{self.t1:.2f}秒）")
         self.seed = int(spec.get("seed", index))
         self.rects = rects
+        self.push_events = []       # 踏み込みの押し（tsubu・tate_line だけ。kinetic._setup_points が入れる）。空なら何も変わらない
         self.anchor = anchor or (W / 2, H / 2)
         lo, hi = spec.get("size_px", list(BANDS[self.kind]))
         self.size_lo, self.size_hi = lo, hi
@@ -815,6 +939,12 @@ class PointLayer:
         idx, x, y, size, op, ang = d
         if len(idx) == 0:
             return self._empty()
+        if self.push_events:
+            push = push_offset(self.push_events, t)
+            if push:
+                y = y + push
+                if self.kind == "tsubu":
+                    y = y % H
         keep = op >= (0.5 / 16.0)
         if not keep.all():
             idx, x, y, size, op, ang = idx[keep], x[keep], y[keep], size[keep], op[keep], ang[keep]
@@ -879,6 +1009,9 @@ class PointLayer:
         ang = r.rand(n) * 2 * math.pi
         dlo, dhi = spec.get("drift_px_s", [20, 60])
         sp = dlo + r.rand(n) * (dhi - dlo)
+        if spec.get("dir") == "up":
+            # 上向きの漂い：同じ乱数の向きを、真上（画面の上＝−y）を中心とした ±0.45 rad の範囲へ写す（乱数の回数・順は変えない）
+            ang = -math.pi / 2 + (ang / (2 * math.pi) - 0.5) * 0.9
         self.vx, self.vy = np.cos(ang) * sp, np.sin(ang) * sp
         self.wa = 4 + 8 * r.rand(n)
         self.wp = 1.5 + 2.5 * r.rand(n)
@@ -919,6 +1052,8 @@ class PointLayer:
             slot_w = (W - 2 * MARGIN) / L
             perm = r.permutation(L)
             self.l_x = MARGIN + (perm + 0.5) * slot_w
+            if spec.get("x_px") is not None:      # 位置を指定した線（乱数の回数・順は変えない）。指定の無い線は今までどおり
+                self.l_x = np.array([float(x) for x in spec["x_px"][:L]])
             self.l_size = steps[r.randint(0, len(steps), L)]
             self.l_len = lo_len + r.rand(L) * (hi_len - lo_len)
             sp = spec.get("speed_px_s", [80, 240])
@@ -1131,7 +1266,16 @@ class PointLayer:
                 self.open_path = True
                 self.size_graded = True
             else:
-                pts = np.array(sh["points"], dtype=np.float64) * [W, H]
+                if "around" in sh:
+                    rc = [q for q in self.rects if q.get("line") == sh["around"]]
+                    if not rc:
+                        _err(f"points[{self.index}]：shape.around の行{sh['around']} の読み字の矩形がありません（区間の近くに無い行です）")
+                    x0, y0, x1, y1 = rc[0]["box"]
+                    pad = float(sh.get("pad", 24))
+                    x0, y0, x1, y1 = max(x0 - pad, 0.0), max(y0 - pad, 0.0), min(x1 + pad, float(W)), min(y1 + pad, float(H))
+                    pts = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float64)
+                else:
+                    pts = np.array(sh["points"], dtype=np.float64) * [W, H]
                 xy = pts
                 self.open_path = not sh.get("closed", True)
                 self.cx, self.cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
