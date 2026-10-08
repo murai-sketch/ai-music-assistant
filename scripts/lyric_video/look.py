@@ -34,7 +34,7 @@ look.py
     "lines": {"1": {...}, "5-8": {...}}  # 行番号（1始まり）または範囲。同じ行に複数当たれば後勝ち
   }
   行の項目: voice / tail（秒）/ end（絶対時刻で固定）/ exit（swap・fade・fade:<秒>・fall 等）/ entrance / layout / hold / decor /
-            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ row_lengths（横組みの行だけ。段の字数。空白・欧文の行には書けない）/ clear_cap（読み字の周りの点の被覆の上限 0.05〜0.25。既定 0.25）/ max_px / tracking（役の値の行ごとの上書き）
+            role（書体の役）/ palette（配色の名前）/ accent（none・key_word・fill・outline・glow・rows）/ accent_rows（rows のとき差し色にする段）/ row_roles（縦組みの行だけ。段ごとの書体の役）/ row_lengths（横組みの行だけ。段の字数＝全角スペースを除いた字数。全角スペースは段の中なら 0.5字の空き・切れ目なら無し。半角スペースなど・欧文の行には書けない）/ clear_cap（読み字の周りの点の被覆の上限 0.05〜0.25。既定 0.25）/ max_px / tracking（役の値の行ごとの上書き）
   key_word: {"from_line": N, "rule": "first_bracket"}   N 行目の最初の「」の中の語を実行時に取り出す（歌詞は書かない）
   bg_transitions: [{"from": 配色, "to": 配色, "start"|"after_line", "seconds"|"until_line"}]   背景色を時間で線形に補間する
 

@@ -1289,6 +1289,8 @@ class _Cut:
             vt_top = -max(kinetic_vertical.row_extent(r) for r in rows) * sizes[0] * kinetic_vertical.PITCH / 2   # 段の頭をそろえる
         for ri, row in enumerate(rows):
             rsize = sizes[ri]
+            rg_ = cut.get("row_gaps")
+            row_gap_idx = set(rg_[ri]) if (rg_ and ri < len(rg_) and not vertical) else set()
             stroke_w = max(rsize // 24, 3) if palette_bg is None else max(rsize // 40, 2)
             row_h = rsize * 1.12
             accent_row = len(rows) >= 2 and ri == len(rows) - 1
@@ -1305,6 +1307,7 @@ class _Cut:
                 row_w = sum(sprites.fonts.get(font_path, csize(ch)).getlength(ch) for ch in row)
                 if look is not None:
                     row_w += look["tracking"] * rsize * (len(row) - 1)
+                row_w += 0.5 * rsize * len(row_gap_idx)      # 段の中の全角スペース（0.5字。row_lengths。T35 U11）
                 # 弧に沿わせるときの半径。段が長いほど緩い弧にして、端が落ちすぎないようにする
                 arc_r = max(row_w * 1.5, 700.0) if cut["layout"] == "arc" else 0.0
                 if cut["layout"] == "left":
@@ -1318,6 +1321,8 @@ class _Cut:
             cells = kinetic_vertical.units_of(row) if vt else [(c_, i_) for i_, c_ in enumerate(row)]
             for ci, (ch, ci0) in enumerate(cells):
                 unit_first = flat_i
+                if row_gap_idx and ci0 in row_gap_idx:
+                    x += 0.5 * rsize          # 段の中の全角スペース分の空き（0.5字）
                 if look is not None:
                     # テーマの差し色の付け方（accent_mode）。段の最後・末尾2文字を差し色にする既存の規則は使わない
                     mode = cut.get("accent_mode", "none")
@@ -1516,9 +1521,12 @@ class _Cut:
             usable_h = (usable_h - 2 * shake) / (1.0 + z_nom) - 2 * gshake
             budget = min(budget, usable_w)
 
-        def width(row, s):
+        row_gaps = cut.get("row_gaps")
+
+        def width(row, s, ri=None):
             f = fonts.get(font, s)
-            return sum(f.getlength(ch) for ch in row) + track * s * (len(row) - 1)
+            extra = 0.5 * s * len(row_gaps[ri]) if (row_gaps and ri is not None and ri < len(row_gaps)) else 0.0   # 段の中の全角スペース（0.5字。T35 U11）
+            return sum(f.getlength(ch) for ch in row) + track * s * (len(row) - 1) + extra
 
         def row_budget(ri):
             if layout not in ("left", "right"):
@@ -1533,7 +1541,7 @@ class _Cut:
             lo, hi = 1, cap
             while lo < hi:
                 mid = (lo + hi + 1) // 2
-                if width(row, mid) <= bud:
+                if width(row, mid, ri) <= bud:
                     lo = mid
                 else:
                     hi = mid - 1
@@ -1545,7 +1553,7 @@ class _Cut:
                 # 回転（-8°）後の外接矩形の幅が収まるまで下げる
                 rad = math.radians(DIAGONAL_DEG)
                 while size > 1:
-                    w_max = max(width(r, size) for r in rs)
+                    w_max = max(width(r, size, i_) for i_, r in enumerate(rs))
                     h_all = len(rs) * size * look["leading"]
                     if w_max * math.cos(rad) + h_all * math.sin(rad) <= usable_w:
                         break
@@ -4465,8 +4473,16 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             # 段の切れ目（先頭からの字数の和）が単語の途中なら、break_after と同じ印（T-6b）
             _time_of, word_of, _n = match_result
             off = 0
+            sp_pos, pos_ = set(), 0                      # 全角スペースのある位置（次の字の通し番号）。切れ目がここと重なれば単語の途中ではない
+            for ch_ in c["text"]:
+                if ch_ == "\u3000":
+                    sp_pos.add(pos_)
+                else:
+                    pos_ += 1
             for k_, n_ in enumerate(it["row_lengths"][:-1]):
                 off += n_
+                if off in sp_pos:
+                    continue
                 if off in word_of and off - 1 in word_of:
                     if word_of[off] == word_of[off - 1]:
                         mark(c, f"row_lengths[{k_}]＝{n_}：単語の途中で切っています（先頭から {off} 字目の後）")
@@ -4645,10 +4661,12 @@ def apply_look(plan, theme, direction, vdefaults):
             # 自動の段（build_plan の「最後の2字」の切れ目など）を捨てて、行の字を先頭から指定の字数ずつの段にする（T35 U5。字は増減しない）
             if c.get("vertical_typeset"):      # direction に書いた縦組みは look 側の検査が先に止める。自動で縦組みになった行は apply_look が center に戻すので通す
                 raise look.LookError(f"direction: 行{c['index']} の row_lengths は横組みの行だけに書けます")
-            if c.get("latin") or any(ch.isspace() for ch in c["text"]):
-                raise look.LookError(f"direction: 行{c['index']} の row_lengths は、空白（半角・全角）を含む行・欧文の行には書けません"
+            if c.get("latin") or any(ch.isspace() and ch != "\u3000" for ch in c["text"]):
+                raise look.LookError(f"direction: 行{c['index']} の row_lengths は、半角スペースなど全角スペース以外の空白を含む行・欧文の行には書けません"
                                      f"（段を字数で組み直すと空白が消えて語がくっつく。break_after を使ってください）")
             flat_rl = "".join(c["rows"])
+            if flat_rl != c["text"].replace("\u3000", ""):
+                raise look.LookError(f"direction: 行{c['index']} の row_lengths：行の字（全角スペースを除く）がプランの段と一致しません。何も直さず止めました")
             if sum(it["row_lengths"]) != len(flat_rl):
                 raise look.LookError(f"direction: 行{c['index']} の row_lengths {it['row_lengths']} の合計 {sum(it['row_lengths'])} が、"
                                      f"行の字数 {len(flat_rl)} と違います")
@@ -4658,6 +4676,22 @@ def apply_look(plan, theme, direction, vdefaults):
                 pos += n_
             c["rows"] = new_rows
             c["row_lengths"] = list(it["row_lengths"])
+            # 全角スペース：段の中に来たものは 0.5字分の空きとして描く（row_gaps＝段ごとの、空きを置く字の段内の位置）。段の切れ目に来たものは描かない（T35 U11）
+            starts, acc = [], 0
+            for n_ in it["row_lengths"]:
+                starts.append(acc)
+                acc += n_
+            gaps = [[] for _ in new_rows]
+            pos = 0
+            for ch_ in c["text"]:
+                if ch_ == "\u3000":
+                    for ri_, n_ in enumerate(it["row_lengths"]):
+                        if starts[ri_] < pos < starts[ri_] + n_ and (pos - starts[ri_]) not in gaps[ri_]:   # 続いた全角スペースは1つの空き
+                            gaps[ri_].append(pos - starts[ri_])
+                else:
+                    pos += 1
+            if any(gaps):
+                c["row_gaps"] = gaps
         if it.get("break_after") and not c.get("vertical_typeset"):   # 縦組み（vert）の段は arrange_vertical が切る
             c["rows"] = split_rows_after(c["rows"], it["break_after"], c["index"])
             c["break_after"] = it["break_after"]
