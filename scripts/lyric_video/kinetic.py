@@ -567,7 +567,9 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
     duration は曲の長さ（最後の行の上限。無ければ alignment の end）。
     hiddens は行ごとの hidden（U13。真偽の配列、None なら全行が字幕に出る）。hidden の行は字幕に出さない：カットは残し（行番号・開始の時刻は
     そのまま）、end は開始と同じ。前の行の「次の開始」は次に字幕に出す行の開始（無ければ曲の長さ。渡されなければ alignment の最後の行の end）。
-    hidden の行は prev_gap・ショット・背景の切り替えの数えに入れない。"""
+    hidden の行は prev_gap・ショット・背景の切り替えの数えに入れない。
+    後ろがすべて hidden の行で、end が「プランの曲の長さ」（duration があればその長さ、無ければ alignment の最後の行の end）に届いたものには
+    印 until_song_end を付ける。値は届いた時刻（次の開始、数値）。描画器（KineticRenderer）が、曲の長さが渡されたときだけ end をそこまで延ばす。"""
     max_hold = style.get("max_hold_sec", 2.8)
     hold_mode = style.get("hold_mode", "cap")
     tail_sec = style.get("tail_sec", 0.6)
@@ -729,7 +731,10 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
         if hidden:
             plan[-1]["hidden"] = True          # 字幕に出さない行（U13）。hidden でない行にはこのキーを足さない（既存のプランを変えない）
         elif nv is None and i < len(alignment) - 1 and show_end >= next_start - 0.0015:
-            plan[-1]["until_song_end"] = True  # 後ろがすべて hidden で、表示の終わりが曲の長さに届いた行（U13a）。条件外はキーを書かない
+            # 後ろがすべて hidden で、表示の終わりが「プランの曲の長さ」に届いた行の印（U13a）。値は届いた時刻（次の開始。数値）。
+            # 「プランの曲の長さ」＝ duration が渡されていればその長さ、duration=None なら全行の最後の行の alignment の end（U14）。
+            # 描画器は end がこの値から許容内のときだけ、渡された曲の長さまで表示の終わりを延ばす。条件外はキーを書かない
+            plan[-1]["until_song_end"] = round(next_start, 3)
         if hold_mode == "sung_end":
             plan[-1]["sung_end"] = None if sung_e is None else round(sung_e, 3)
             plan[-1]["sung_w"] = None if sung_w is None else round(sung_w, 3)
@@ -2633,6 +2638,37 @@ def camera_move(name, u, since_land, index):
 # ---------------------------------------------------------------------------
 
 class KineticRenderer:
+    def _extend_last_cut(self, plan, duration):
+        """hidden の行がある曲で、字幕に出す最後のカットの表示の終わりを、描画器に渡された曲の長さまで延ばす（U14）。
+        延ばす条件は全部：印 until_song_end が数値／duration が渡されている／end ≥ 印 − 0.003／duration > end（hidden の行があることは呼び出し側で確認済み）。
+        新しい dict を作り、self.plan_all と（返す）字幕に出す行の両方で同じものに差し替える。渡されたリストと dict は書き換えない。
+        印が数値でない（古い形 true）・end が手で縮められている場合は、延ばさず注記を残す。プランの JSON の end は変えない"""
+        if not plan or duration is None:
+            return plan
+        last = plan[-1]
+        mark = last.get("until_song_end")
+        if mark is None:
+            return plan
+        note = None
+        if isinstance(mark, bool) or not isinstance(mark, (int, float)):
+            note = "印 until_song_end が古い形（数値でない）なので、最後の行の表示の終わりを延ばしません。--replan で作り直してください"
+        elif last["end"] < mark - 0.003:
+            note = "印の付いた行の end が手で縮められているので、表示の終わりを延ばしません（退場は保存済みの値のまま）"
+        elif not float(duration) > last["end"]:
+            return plan
+        if note is not None:
+            if self.themed:
+                self.look_notes.append(note)
+            else:
+                print(f"      [WARN] {note}")
+            return plan
+        new = dict(last, end=round(float(duration), 3))
+        self.plan_all = [new if c is last else c for c in self.plan_all]
+        self.song_end_extended = (last["index"], last["end"], new["end"])
+        if self.themed:
+            self.look_notes.append(f"最後の行（行{last['index']}）の表示の終わりを {last['end']} から {new['end']} へ延ばした（曲の長さまで）")
+        return plan[:-1] + [new]
+
     def __init__(self, image_path, plan, beats, style, duration=None, backgrounds=None, look=None, scan_range=None):
         """look: prepare_plan が返す runtime。テーマ（名前付きの配色・書体の役）を使う曲だけ渡す。
         渡さない（または theme が None）なら、従来の経路（添字のパレット・背景画像）のまま。
@@ -2643,16 +2679,18 @@ class KineticRenderer:
         # 行番号で引く所（区間の解決・stack・カウンターの出現）は plan_all、行番号→字幕に出す行の位置は pos_of_line（この2つだけで引く）。
         # 以後この関数の中の plan は字幕に出す行だけ。hidden が無い曲は plan_all is plan で、通る分岐が無い
         self.plan_all = plan
-        if any(c.get("hidden") for c in plan):
-            plan = [c for c in plan if not c.get("hidden")]
-        self.plan = plan
-        self.pos_of_line = {c["index"]: j for j, c in enumerate(plan)}
+        self.song_end_extended = None       # 最後の行を曲の長さまで延ばしたら (行番号, 元の end, 新しい end)（U14）
+        self.look_notes = []
         self.theme = (look or {}).get("theme")
         self.themed = self.theme is not None
+        if any(c.get("hidden") for c in plan):
+            plan = [c for c in plan if not c.get("hidden")]
+            plan = self._extend_last_cut(plan, duration)   # 差し替えは starts・shot_span・find_interludes・_Cut の生成より前
+        self.plan = plan
+        self.pos_of_line = {c["index"]: j for j, c in enumerate(plan)}
         if self.themed and not all(c.get("font_role") for c in plan):
             raise RuntimeError("テーマを使うのに、役（font_role）の無いカットがあります。kinetic_plan.json を作り直してください（--replan）")
         self._theme_solid = {}
-        self.look_notes = []
         self.starts = [c["start"] for c in plan]
         # ショットごとの開始・終了（次のショットの開始まで動き続ける）
         self.shot_span = {}
