@@ -181,17 +181,17 @@ def choose_columns(chars, mid, max_col):
     return min(sols, key=lambda ks: (mids(ks[1]), ks[0]))[1]
 
 
-def size_for(chars, cols, height, cap):
+def size_for(chars, cols, height, cap, usable_w=None):
     """列の組に対する字の大きさ（整数 px）。高さ：最長の列が height に収まる。幅：段の送り 1.5 倍で 896px に収まる"""
     w = _weights(chars)
     ext = max(col_extent(chars, w, a, b) for a, b in cols)
     k = len(cols)
     size_h = height / (max(ext, 1) * PITCH)
-    size_w = USABLE_W / (COL_PITCH * (k - 1) + 1)
+    size_w = (usable_w or USABLE_W) / (COL_PITCH * (k - 1) + 1)
     return int(min(cap, size_h, size_w))
 
 
-def arrange(chars, mid, max_col, height, cap, min_px, forced=None):
+def arrange(chars, mid, max_col, height, cap, min_px, forced=None, usable_w=None):
     """段の切り方と大きさを決める。下限（min_px）を割るなら段を増やす（縮小で収めない）。
     forced: 段の切れ目の指定（break_after 済みの段の文字数の並び）。あればそれを使う。
     戻り値: (段の文字列のリスト, 大きさ px)。収まらなければ LookError"""
@@ -216,7 +216,7 @@ def arrange(chars, mid, max_col, height, cap, min_px, forced=None):
             if col_len(chars, w, a, b) > max_col:
                 raise LookError(f"縦組み: break_after で指定した段（{b - a}字）が 1段の上限 {max_col}字を超えます。"
                                 f"break_after か max_col_chars を見直してください。黙って動かさず止めました")
-        size = size_for(chars, cols, height, cap)
+        size = size_for(chars, cols, height, cap, usable_w)
         if size < min_px:
             raise LookError(f"縦組み: 指定した段（{len(cols)}段）では字が {size}px になり、下限 {min_px}px を割ります。"
                             f"break_after・max_px・min_px を見直してください。黙って縮めず止めました")
@@ -229,18 +229,18 @@ def arrange(chars, mid, max_col, height, cap, min_px, forced=None):
         cols = first if k == len(first) else split_columns(chars, mid, max_col, k)
         if cols is None:
             continue
-        size = size_for(chars, cols, height, cap)
+        size = size_for(chars, cols, height, cap, usable_w)
         last_size = size
         if size >= min_px:
             return [chars[a:b] for a, b in cols], size
-        if size_for_width_only(k) < min_px:
+        if size_for_width_only(k, usable_w) < min_px:
             break
     raise LookError(f"縦組み: 段を増やしても字の下限 {min_px}px を割ります（{last_size}px）。"
                     f"行の字数・max_col_chars・使える高さ（direction の vertical）を見直してください")
 
 
-def size_for_width_only(k):
-    return int(USABLE_W / (COL_PITCH * (k - 1) + 1))
+def size_for_width_only(k, usable_w=None):
+    return int((usable_w or USABLE_W) / (COL_PITCH * (k - 1) + 1))
 
 
 def row_extent(text):

@@ -138,7 +138,14 @@ def parse_args():
         "--stills", metavar="DIR",
         help="kinetic: 動画は書き出さず、各カットの静止画一覧をDIRに出す（書き出し前の確認用）",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--safe-overlay", action="store_true",
+        help="--stills のとき、direction の safe_area の枠を静止画に細い線で重ねる（静止画だけ。mp4 には描かない）",
+    )
+    args = parser.parse_args()
+    if args.safe_overlay and not args.stills:
+        parser.error("--safe-overlay は --stills と一緒に使います（静止画だけに枠を重ねる。mp4 には描かない）")
+    return args
 
 
 def _pick_shorts(spec, candidates):
@@ -282,7 +289,8 @@ def main():
         if args.stills:
             print(f"[4/4] 静止画一覧を書き出し中: {args.stills}")
             try:
-                sheets = render_stills(image_path, plan, beats, style, args.stills, backgrounds=backgrounds, look=rt)
+                sheets = render_stills(image_path, plan, beats, style, args.stills, backgrounds=backgrounds, look=rt,
+                                       safe_overlay=args.safe_overlay)
             except look.LookError as e:
                 print(f"[ERROR] {e}")
                 sys.exit(1)

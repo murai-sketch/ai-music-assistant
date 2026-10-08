@@ -2690,6 +2690,7 @@ class KineticRenderer:
         if self.themed:
             self._check_carry()
             self._setup_stack()
+            self._check_safe_area()
         self.counter = None
         self.counter_skipped = 0
         self._cut_rects = {}
@@ -2705,6 +2706,60 @@ class KineticRenderer:
             self._check_points()
         for note in self.look_notes + self.impact_notes:
             print(f"      [書体] {note}")
+
+    def _check_safe_area(self):
+        """検査（止める）：direction の safe_area（暫定の枠。値は direction に書く）に、全フレーム（30fps）で、読み字の外接矩形（carry の移動・
+        踏み込みの沈み・字ごとの入りの動き・画面の寄り（カメラ）を当てた後の位置）が入ること。入りの最初の2フレーム（字が見え始めてから2枚）は除く。
+        描かずに、字の矩形（_Cut.glyph_box。draw と同じ置き方）の計算で行う。描くフレームだけ（scan_range）。T35 U8-c"""
+        from look import LookError
+
+        sa = self._dir.get("safe_area")
+        if not sa or not self._strict:
+            return
+        W, H = VIDEO_SIZE
+        L, R, T, B = float(sa["left"]), float(sa["right"]), float(sa["top"]), float(sa["bottom"])
+        corner = sa.get("corner")
+        for j, (c, o) in enumerate(zip(self.plan, self.cuts)):
+            if not o.glyphs:
+                continue
+            k0 = int(math.ceil((c["start"] - 0.2) * FPS - 1e-9))
+            k1 = int(math.ceil(self.shown_until[j] * FPS - 1e-9))
+            if self._scan_range is not None:
+                a, b = self._scan_range
+                k0, k1 = max(k0, int(math.floor(a * FPS)) - 1), min(k1, int(math.ceil(b * FPS)) + 1)
+            seen = 0
+            for k in range(k0, k1 + 1):
+                t = k / FPS
+                if j not in self._active(t):
+                    continue
+                tc = self._cut_time(j, t)
+                dur = c["end"] - c["start"]
+                boxes = [b_ for b_ in (o.glyph_box(g, tc - c["start"], dur) for g in o.glyphs) if b_ is not None]
+                if not boxes:
+                    continue
+                seen += 1
+                if seen <= 2:
+                    continue          # 入りの最初の2フレーム
+                _bg, g_zoom, sx, sy = self.camera_at(t)
+                z = self._screen_zoom(g_zoom, sx, sy)
+                x0 = W / 2 + z * (min(b_[0] for b_ in boxes) - W / 2) + sx
+                x1 = W / 2 + z * (max(b_[2] for b_ in boxes) - W / 2) + sx
+                y0 = H / 2 + z * (min(b_[1] for b_ in boxes) - H / 2) + sy
+                y1 = H / 2 + z * (max(b_[3] for b_ in boxes) - H / 2) + sy
+                over = []
+                if x0 < L - 1e-6:
+                    over.append(f"左へ {L - x0:.1f}px")
+                if W - x1 < R - 1e-6:
+                    over.append(f"右へ {x1 - (W - R):.1f}px")
+                if y0 < T - 1e-6:
+                    over.append(f"上へ {T - y0:.1f}px")
+                if y1 > B + 1e-6:
+                    over.append(f"下へ {y1 - B:.1f}px")
+                if corner and y1 > corner["y_from"] + 1e-6 and x1 > corner["x_max"] + 1e-6:
+                    over.append(f"右下の角へ（y＞{corner['y_from']} では x≦{corner['x_max']}。右へ {x1 - corner['x_max']:.1f}px、下端 {y1:.1f}px＝角の上端から {y1 - corner['y_from']:.1f}px）")
+                if over:
+                    raise LookError(f"行{c['index']}・{t:.2f}秒：読み字が安全域（safe_area）からはみ出します（{'、'.join(over)}）。"
+                                    f"text_y・大きさ・carry・構図を見直してください。黙って縮めず止めました")
 
     def _check_carry(self):
         """検査（止める）：carry で動いた後の読み字が、上下の余白（CARRY_MARGIN＝92px）に収まる（動く範囲は carry_extent。縦組みで列ごとに
@@ -2727,6 +2782,8 @@ class KineticRenderer:
                 bad = [k for k in spec if int(k) >= len(c["rows"])]
                 if bad:
                     raise LookError(f"direction: 行{c['index']} の carry の段番号 {', '.join(bad)} が、段の数（{len(c['rows'])}）以上です")
+            if self._dir.get("safe_area"):
+                continue          # safe_area がある曲は、carry の上下の余白の検査を _check_safe_area（全フレーム）に置き換える（T35 U8-c）
             _X0, Y0, _X1, Y1 = self._screen_rect(o)
             up, down = carry_extent(c)
             if Y0 - up < CARRY_MARGIN - 1e-6 or Y1 + down > H - CARRY_MARGIN + 1e-6:
@@ -2854,6 +2911,26 @@ class KineticRenderer:
         y0, y1 = min(b[1] for b in boxes), max(b[3] for b in boxes)
         f = lambda v, half, sh: half + z * (v - half) + sh   # draw 後の画面全体の寄り・揺れ（_foreground の transform と同じ）
         return f(x0, W / 2, sx), f(y0, H / 2, sy), f(x1, W / 2, sx), f(y1, H / 2, sy)
+
+    def still_frame(self, t, safe_overlay=False):
+        """静止画用のフレーム。safe_overlay＝True なら安全域（direction の safe_area）の枠を細い線で重ねる（静止画だけ。mp4 には描かない）"""
+        fr = self.frame_at(t)
+        if safe_overlay:
+            from look import LookError
+
+            sa = self._dir.get("safe_area") if self.themed else None
+            if not sa:
+                raise LookError("--safe-overlay には、direction の safe_area が要ります")
+            fr = fr.copy()
+            d = ImageDraw.Draw(fr)
+            W, H = VIDEO_SIZE
+            L, R, T, B = sa["left"], sa["right"], sa["top"], sa["bottom"]
+            col = (255, 60, 60)
+            c = sa.get("corner")
+            pts = [(L, T), (W - R, T), (W - R, c["y_from"]), (c["x_max"], c["y_from"]), (c["x_max"], B), (L, B), (L, T)] if c else \
+                  [(L, T), (W - R, T), (W - R, B), (L, B), (L, T)]
+            d.line(pts, fill=col, width=3)
+        return fr
 
     @staticmethod
     def _screen_zoom(g_zoom, sx, sy):
@@ -3991,7 +4068,7 @@ def render_kinetic(image_path, audio_path, plan, beats, style, output_path, prog
     return output_path
 
 
-def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, backgrounds=None, look=None):
+def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, backgrounds=None, look=None, safe_overlay=False):
     """各カットの 0/25/50/75/100% と入りの着地直後を静止画にし、
     一覧画像（コンタクトシート）にまとめる。書き出し前の目視確認用。"""
     renderer = KineticRenderer(image_path, plan, beats, style, backgrounds=backgrounds, look=look)
@@ -4018,7 +4095,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
                 t = c["start"] + max(dur * fr, 0 if fr else 0) + (min(first_frame * 0.5, dur * 0.2) if fr == 0 else 0)
                 if fr == 0:
                     t = max(t, renderer.seen_at[s + r])   # 1列目は、この行が実際に描かれる最初のフレーム以降（延ばした間は前の行が写る）
-                im = renderer.frame_at(t).resize((thumb_w, thumb_h), Image.BILINEAR)
+                im = renderer.still_frame(t, safe_overlay).resize((thumb_w, thumb_h), Image.BILINEAR)
                 sheet.paste(im, (80 + k * thumb_w, r * thumb_h))
                 if renderer.themed and renderer.cuts[s + r].karaoke:
                     n_lit, n_all = renderer.cuts[s + r].lit_count(t - c["start"])   # 点灯済み字数／全字数
@@ -4048,7 +4125,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
                     t = max(e - 0.2, c["start"])
                     nxt = plan[s + r + 1] if s + r + 1 < len(plan) else None
                     switched = nxt is not None and t >= nxt["start"]   # この列は次の行を写している
-                    im = renderer.frame_at(t).resize((thumb_w, thumb_h), Image.BILINEAR)
+                    im = renderer.still_frame(t, safe_overlay).resize((thumb_w, thumb_h), Image.BILINEAR)
                     sheet.paste(im, (80 + len(fractions) * thumb_w, r * thumb_h))
                     d.text((6, r * thumb_h + 100), f"E {e:.2f}", font=small, fill=(255, 220, 120))
                     if switched:
@@ -4064,13 +4141,13 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
         sheets.append(path)
     if renderer.themed and (look or {}).get("direction"):
         # 動きの静止画（別シート）と、検査の報告。今の列（上）は変えない
-        sheets.extend(render_motion_sheets(renderer, out_dir, cuts_per_sheet=cuts_per_sheet))
+        sheets.extend(render_motion_sheets(renderer, out_dir, cuts_per_sheet=cuts_per_sheet, safe_overlay=safe_overlay))
         if (look or {}).get("cache_dir"):
             renderer.write_look_report(look["cache_dir"])
     return sheets
 
 
-def render_motion_sheets(renderer, out_dir, cuts_per_sheet=8):
+def render_motion_sheets(renderer, out_dir, cuts_per_sheet=8, safe_overlay=False):
     """動きの静止画の別シート（sheet_motion_NN.png）。行の種類に応じた列。
     ラベル：時刻・役と大きさ・背景色と文字色の色コード・点灯済み字数・カウンターの値と不透明度・画面の寄り"""
     ent = renderer.motion_entries()
@@ -4096,7 +4173,7 @@ def render_motion_sheets(renderer, out_dir, cuts_per_sheet=8):
                 for k, line in enumerate((f"{c['font_role']} {renderer.cuts[row - 1].size}px", f"bg {pal['bg']}", f"tx {pal['text']}")):
                     d.text((6, y0 + 60 + k * 16), line, font=tiny, fill=(190, 210, 255))
             for k, t in enumerate(times):
-                im = renderer.frame_at(t).resize((thumb_w, thumb_h), Image.BILINEAR)
+                im = renderer.still_frame(t, safe_overlay).resize((thumb_w, thumb_h), Image.BILINEAR)
                 x0 = 140 + k * thumb_w
                 sheet.paste(im, (x0, y0))
                 lines = [f"{t:.3f}s"]
@@ -4460,7 +4537,8 @@ def arrange_vertical(plan, direction, theme, vdefaults, words=None, use_lcs=Fals
             _t, word_of, _n = _match_line(flat, _window_words(words, plan, i), use_lcs)
         mid = kinetic_vertical.mid_word_flags(flat, word_of)
         rows, size = kinetic_vertical.arrange(flat, mid, int(c.get("max_col_chars", kinetic_vertical.DEFAULT_MAX_COL)),
-                                              height, cap, min_px, forced=forced)
+                                              height, cap, min_px, forced=forced,
+                                              usable_w=((theme.get("layout") or {}).get("text_width") if theme is not None else None))   # 縦組みの横幅はテーマの text_width に従う（無ければ従来の 896。T35 U8-b）
         if notes is not None and not word_of and len(rows) > 1:
             # 単語の時刻が照合できない行は、字種の変わり目で切る（助詞が段の頭に来ることがある）。黙らず知らせる
             heads = [r[0] for r in rows[1:] if r[0] in kinetic_vertical.PARTICLES]

@@ -52,6 +52,7 @@ look.py
 
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -278,7 +279,7 @@ ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows�
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
-                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack"}
+                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack", "safe_area"}
 CARRY_DIRS = ("down", "up")          # carry（行全体を一定の速さで動かす保持）の向き
 CARRY_KEYS = {"px_s", "dir"}
 STACK_KEYS = {"lines", "dim", "clear_at_line"}   # stack（前の列を残して薄くする）
@@ -346,8 +347,8 @@ def _normalize_item(item, allowed, where):
         if name == "clear_cap" and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.05 <= v <= 0.25):
             raise LookError(f"direction: {where} の clear_cap は 0.05〜0.25 の数値で書いてください（読み字の周りの点の被覆の上限。既定 0.25）")
         if name == "row_lengths":
-            if (not isinstance(v, list) or len(v) < 2 or any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in v)):
-                raise LookError(f"direction: {where} の row_lengths は、段の字数（正の整数）を2つ以上並べた配列で書いてください（例 [4, 3]）")
+            if (not isinstance(v, list) or len(v) < 1 or any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in v)):
+                raise LookError(f"direction: {where} の row_lengths は、段の字数（正の整数）を1つ以上並べた配列で書いてください（例 [4, 3]。[7] は「切らずに1段」）")
         if name == "accent_rows":
             if (not isinstance(v, list) or not v or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in v)
                     or len(set(v)) != len(v)):
@@ -437,6 +438,28 @@ def parse_line_keys(keys, n_lines):
             merged.update(item)
             out[n] = merged
     return out
+
+
+SAFE_AREA_KEYS = {"left", "right", "top", "bottom", "corner"}
+
+
+def _validate_safe_area(sa):
+    """safe_area：読み字（carry・踏み込み・画面の寄りを当てた後の外接矩形）が全フレームで入る枠（px。画面は 1080×1920）。
+    {"left", "right"（左右の余白）, "top", "bottom"（枠の上端・下端の y）, "corner": {"y_from", "x_max"}（任意。y が y_from より下では x が x_max まで）}。
+    値は暫定でコードに持たない（direction に書く）"""
+    if not isinstance(sa, dict) or not {"left", "right", "top", "bottom"} <= set(sa) or set(sa) - SAFE_AREA_KEYS:
+        raise LookError("direction: safe_area は {\"left\", \"right\", \"top\", \"bottom\"（必須）, \"corner\": {\"y_from\", \"x_max\"}（任意）} の形で書いてください")
+    for k in ("left", "right", "top", "bottom"):
+        if isinstance(sa[k], bool) or not isinstance(sa[k], (int, float)) or not math.isfinite(sa[k]) or sa[k] < 0:
+            raise LookError(f"direction: safe_area.{k} は 0 以上の有限の数値で書いてください（NaN・inf は不可）")
+    if sa["left"] + sa["right"] >= 1080 or sa["top"] >= sa["bottom"] or sa["bottom"] > 1920:
+        raise LookError("direction: safe_area の枠が画面（1080×1920）に収まらないか、空です（left＋right＜1080、top＜bottom≦1920）")
+    c = sa.get("corner")
+    if c is not None:
+        if not isinstance(c, dict) or set(c) != {"y_from", "x_max"} or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in c.values()):
+            raise LookError('direction: safe_area.corner は {"y_from": 数値, "x_max": 数値} の形で書いてください')
+        if not sa["top"] < c["y_from"] < sa["bottom"] or not sa["left"] < c["x_max"] <= 1080 - sa["right"]:
+            raise LookError("direction: safe_area.corner が枠の外です（top＜y_from＜bottom、left＜x_max≦1080−right）")
 
 
 def _validate_stack(stack, n_lines, by_line, theme):
@@ -544,6 +567,10 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
                 raise LookError(f"direction: 行{n} の impact '{item['impact']}' が impacts にありません"
                                 f"（{', '.join(sorted(direction.get('impacts') or {})) or 'impacts なし'}）")
     _validate_stage3(direction, by_line, theme)
+    if "safe_area" in direction:        # null も検査に通す（黙って効かなくしない）
+        if theme is None:
+            raise LookError("direction: safe_area はテーマを使う曲でだけ使えます（検査はテーマの経路の描画器で行う）")
+        _validate_safe_area(direction["safe_area"])
     if direction.get("stack") is not None:
         _validate_stack(direction["stack"], n_lines, by_line, theme)
     if direction.get("points") is not None:
