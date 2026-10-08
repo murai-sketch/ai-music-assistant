@@ -2142,8 +2142,11 @@ class _Cut:
         if box is None:
             return
         x0, x1, y0 = box
+        xe = int(round(x0 + (x1 - x0) * k)) - 1
+        if xe < int(round(x0)):
+            return
         d = ImageDraw.Draw(frame)
-        d.rectangle([int(round(x0)), int(round(y0)), int(round(x0 + (x1 - x0) * k)) - 1, int(round(y0)) + RULE_PX - 1],
+        d.rectangle([int(round(x0)), int(round(y0)), xe, int(round(y0)) + RULE_PX - 1],
                     fill=_hex(self.colors[0]))
 
     def draw(self, frame, t, sprites, cam=(1.0, 0.0, 0.0, 0.0), dim=1.0):
