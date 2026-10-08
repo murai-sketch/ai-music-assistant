@@ -557,14 +557,17 @@ def _fit_exit_to_tail(cut):
 
 
 def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, sung_ends=None,
-               tails=None, fixed_ends=None, duration=None):
+               tails=None, fixed_ends=None, duration=None, hiddens=None):
     """alignment（[{line,start,end}]）と、行ごとの構成タグ名から、
     カットごとの設計を作る。meta（曲ノートの title/genre/tags/bpm）があれば、
     曲の性格に合わせて参考作品由来の技法（kinetic_fx）を割り当てる。
 
     sung_end のとき: sung_ends は 行ごとの歌い終わり（float / None、または {"w","d"}）。E = max(W, D)。
     tails は行ごとの余韻（秒、None なら style の tail_sec）、fixed_ends は行ごとの絶対時刻の終わり（None なら E＋余韻）。
-    duration は曲の長さ（最後の行の上限。無ければ alignment の end）。"""
+    duration は曲の長さ（最後の行の上限。無ければ alignment の end）。
+    hiddens は行ごとの hidden（U13。真偽の配列、None なら全行が字幕に出る）。hidden の行は字幕に出さない：カットは残し（行番号・開始の時刻は
+    そのまま）、end は開始と同じ。前の行の「次の開始」は次に字幕に出す行の開始（無ければ曲の長さ。渡されなければ alignment の最後の行の end）。
+    hidden の行は prev_gap・ショット・背景の切り替えの数えに入れない。"""
     max_hold = style.get("max_hold_sec", 2.8)
     hold_mode = style.get("hold_mode", "cap")
     tail_sec = style.get("tail_sec", 0.6)
@@ -589,14 +592,17 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
     bg_mode = "image"
     last_bg_switch = -99.0
     for i, item in enumerate(alignment):
+        hidden = bool(hiddens and i < len(hiddens) and hiddens[i])
         text = item["line"]
         section = sections[i] if i < len(sections) else ""
         level = section_intensity(section)
         if counts[text] >= 2 and level == 2 and _clean_len(text) <= 6:
             level = 3
         start = float(item["start"])
-        next_start = float(alignment[i + 1]["start"]) if i + 1 < len(alignment) else float(item["end"])
-        if hold_mode == "sung_end" and i + 1 >= len(alignment) and duration is not None and duration > next_start:
+        # 次の開始＝次に字幕に出す行の開始。無ければ曲の長さ（hidden を使わない曲では「最後の行」のときだけ。従来と同じ）
+        nv = next((k for k in range(i + 1, len(alignment)) if not (hiddens and k < len(hiddens) and hiddens[k])), None)
+        next_start = float(alignment[nv]["start"]) if nv is not None else float(alignment[-1]["end"])
+        if hold_mode == "sung_end" and nv is None and duration is not None and duration > next_start:
             next_start = float(duration)   # 最後の行は曲の終わりまで残せる（alignment の end で切らない）
         show_end = min(next_start, start + max_hold)
         sung_e = sung_w = sung_d = None
@@ -611,6 +617,8 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
             show_end = max(show_end, min(start + 0.3, next_start))
             if fixed_ends and i < len(fixed_ends) and fixed_ends[i] is not None:
                 show_end = max(min(next_start, float(fixed_ends[i])), min(start + 0.3, next_start))
+        if hidden:
+            show_end = start          # 字幕に出さない行は 0 秒（開始の時刻だけがプランに残る）
         latin = profile.get("latin", False)
         growl = is_growl(section)
         rows = _split_rows(text, short=profile.get("kids", False), latin=latin, growl=growl)
@@ -654,9 +662,10 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
             tier = 1 if n <= (14 if latin else 8) or profile.get("kids") else 2
 
         # 背景: Hookは毎行切り替え、Verseは4行ごと、囁きは暗色固定、長い間の後は画像に戻す
-        prev_gap = start - (float(alignment[i - 1]["start"]) + max_hold) if i > 0 else 99
-        if hold_mode == "sung_end" and i > 0:
-            prev_gap = start - plan[-1]["end"]
+        shown_prev = [k for k in range(i) if not (hiddens and k < len(hiddens) and hiddens[k])]    # 字幕に出す前の行（prev_gap は直前の字幕に出す行から測る）
+        prev_gap = start - (float(alignment[shown_prev[-1]]["start"]) + max_hold) if shown_prev else 99
+        if hold_mode == "sung_end" and shown_prev:
+            prev_gap = start - plan[shown_prev[-1]]["end"]
         want = bg_mode
         if level == 1:
             want = 0
@@ -667,6 +676,8 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
             want = "image"
         elif verse_i % 4 == 0:
             want = "image" if bg_mode != "image" else (palette_i + 2) % len(DEFAULT_PALETTE)
+        if hidden:
+            want = bg_mode                     # 字幕に出さない行は背景を切り替えない
         if want != bg_mode and start - last_bg_switch >= MIN_BG_SWITCH_GAP:
             bg_mode = want
             last_bg_switch = start
@@ -678,16 +689,20 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
             if near:
                 land = min(near, key=lambda b: abs(b - land))
 
-        if bg_mode != prev_bg or level == 3 or start - prev_end > GAP_FOR_REST:
-            shot += 1
-            if level == 3:
-                camera = "punch"
-            elif level == 1:
-                camera = "drift"
-            else:
-                camera = CAMERA_MOVES[shot % len(CAMERA_MOVES)]
-        prev_bg = bg_mode
-        prev_end = show_end
+        if hidden:
+            if shot < 0:                       # 先頭が hidden のとき：ショットの数えに入れない（番号は -1 のまま）。カメラは仮の値
+                camera = CAMERA_MOVES[0]
+        else:
+            if bg_mode != prev_bg or level == 3 or start - prev_end > GAP_FOR_REST:
+                shot += 1
+                if level == 3:
+                    camera = "punch"
+                elif level == 1:
+                    camera = "drift"
+                else:
+                    camera = CAMERA_MOVES[shot % len(CAMERA_MOVES)]
+            prev_bg = bg_mode
+            prev_end = show_end
 
         plan.append({
             "index": i + 1,
@@ -709,8 +724,10 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
             "tier": tier,
             "bg": bg_mode,
             "flash": level == 3 and entrance in ("slam", "slash")
-                     and (i == 0 or plan[-1]["level"] != 3),
+                     and (i == 0 or plan[-1]["level"] != 3) and not hidden,
         })
+        if hidden:
+            plan[-1]["hidden"] = True          # 字幕に出さない行（U13）。hidden でない行にはこのキーを足さない（既存のプランを変えない）
         if hold_mode == "sung_end":
             plan[-1]["sung_end"] = None if sung_e is None else round(sung_e, 3)
             plan[-1]["sung_w"] = None if sung_w is None else round(sung_w, 3)
@@ -741,7 +758,8 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
     if hold_mode == "sung_end":
         # 退場の長さ ≦ 余韻（判定は _fit_exit_to_tail の1か所）。cap モード（既存の曲）は何もしない
         for cut in plan:
-            _fit_exit_to_tail(cut)
+            if not cut.get("hidden"):
+                _fit_exit_to_tail(cut)
     return plan
 
 
@@ -755,7 +773,7 @@ def plan_to_markdown(plan, header=None):
     sung = any("sung_end" in c for c in plan)
     voiced = any("voice" in c for c in plan)
     looked = any("font_role" in c for c in plan)
-    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset", "carry", "stack_group", "row_lengths"))
+    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset", "carry", "stack_group", "row_lengths", "hidden"))
     head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     if voiced:
@@ -805,6 +823,8 @@ def plan_to_markdown(plan, header=None):
                         f"{k}={'割れ' if k == 'break' else v}" for k, v in sp.items()))
             if c.get("solo"):
                 bits.append("solo")
+            if c.get("hidden"):
+                bits.append("字幕なし（hidden。開始の時刻だけを基準に残す）")
             if c.get("vertical_typeset"):
                 bits.append(f"縦組み(vert) {len(c['rows'])}段 {c.get('vertical_size')}px")
                 if c.get("row_roles"):
@@ -2617,7 +2637,14 @@ class KineticRenderer:
         scan_range: 点の層の全フレームの走査（_scan_points）をかける秒の範囲 (from, to)。None ＝ 全区間（従来。全編の書き出し・direction の登録）。
         描くフレームだけ走査すればよい経路（部分書き出し・GUI のプレビュー）が渡す。to < from なら走査しない（T35 R0-12）"""
         self._scan_range = scan_range
+        # 字幕に出さない行（hidden。U13）：カットはプラン（plan_all）に残し、描画器は字幕に出す行だけで組む。
+        # 行番号で引く所（区間の解決・stack・カウンターの出現）は plan_all、行番号→字幕に出す行の位置は pos_of_line（この2つだけで引く）。
+        # 以後この関数の中の plan は字幕に出す行だけ。hidden が無い曲は plan_all is plan で、通る分岐が無い
+        self.plan_all = plan
+        if any(c.get("hidden") for c in plan):
+            plan = [c for c in plan if not c.get("hidden")]
         self.plan = plan
+        self.pos_of_line = {c["index"]: j for j, c in enumerate(plan)}
         self.theme = (look or {}).get("theme")
         self.themed = self.theme is not None
         if self.themed and not all(c.get("font_role") for c in plan):
@@ -2663,7 +2690,7 @@ class KineticRenderer:
         self.bar_sec = bar
         self.cuts = []
         if self.themed:
-            self._setup_theme(look, plan)
+            self._setup_theme(look, plan, self.plan_all)
         for c in plan:
             if self.themed:
                 pal = self.theme["palettes"][c["bg"]]
@@ -2893,7 +2920,9 @@ class KineticRenderer:
                 if ratio < look_mod.COUNTER_MIN_CONTRAST:
                     raise LookError(f"stack[{gi}]：行{self.plan[j]['index']} の残した列（不透明度 {dim}）の比が、最悪の背景で {ratio:.2f} になり、"
                                     f"{look_mod.COUNTER_MIN_CONTRAST} を割ります。dim を上げてください")
-            for j in range(members[0] + 1, clear - 1):          # 積む行の2行目から、clear_at_line の行の手前まで
+            if clear not in self.pos_of_line:
+                raise LookError(f"stack[{gi}]：clear_at_line の行{clear}は字幕に出さない行（hidden）です")
+            for j in range(members[0] + 1, self.pos_of_line[clear]):          # 積む行の2行目から、clear_at_line の行の手前まで（位置は字幕に出す行の並び）
                 self._stack_prev[j] = [(p, dim) for p in members if p < j]
 
     def _screen_rect(self, o):
@@ -3139,7 +3168,7 @@ class KineticRenderer:
         if cfg is None or "palette" not in cfg or not cfg.get("slots"):
             raise LookError("direction に counter がありますが、テーマの parts.counter に palette・slots がありません")
         switch = {c["index"]: self.handoff[j] for j, c in enumerate(self.plan)}   # 切り替えのフレーム（割れの始まり）
-        self.counter = kinetic_fx.Counter(self.plan, self._dir["counter"], beats, cfg, switch=switch)
+        self.counter = kinetic_fx.Counter(self.plan, self._dir["counter"], beats, cfg, switch=switch, plan_all=self.plan_all)
         ref = self._fonts.get(cfg["role"])
         if ref is None:
             raise LookError(f"parts.counter.role '{cfg['role']}' の書体が解決されていません")
@@ -3168,7 +3197,7 @@ class KineticRenderer:
         c = self.plan[j]
         if c.get("stack_group") is None:
             return None
-        return self.plan[c["stack_clear_line"] - 1]["start"]
+        return self.plan_all[c["stack_clear_line"] - 1]["start"]       # 行番号で引く（全行）
 
     def _counter_rects(self, t):
         """t に出ている文字の外接矩形（余白込み・余白なし）。slam の入りの拡大中は含めない（読ませる時間ではない）"""
@@ -3190,14 +3219,15 @@ class KineticRenderer:
         from look import LookError
 
         self._compute_cut_rects()
-        shown = [self._shown_end(c) for c in self.plan]
+        shown = [self._shown_end(c) for c in self.plan]                 # 字幕に出す行の並び
+        shown_all = [self._shown_end(c) for c in self.plan_all]         # 全行の並び（hidden の行は表示の終わり＝開始）。resolve_span が plan と同じ添字で読む
         duration = self.duration or look.get("duration")
         self.point_sprites = kinetic_points.PointSprites(self.sprites.fonts)
-        n_alpha = len(self.plan)
+        n_alpha = len(self.plan_all)
         for i, sp in enumerate(self._dir["points"]):
             where = f"points[{i}]"
             span = sp["span"]
-            t0, t1 = resolve_span(self.plan, span, duration, where=where, shown=shown)
+            t0, t1 = resolve_span(self.plan_all, span, duration, where=where, shown=shown_all)
             if t1 <= t0:
                 raise LookError(f"direction: {where} の区間が空です（{t0:.2f}〜{t1:.2f}秒）")
             rows = [j for j, c in enumerate(self.plan) if frame_overlap(c["start"], shown[j], t0, t1) > 0]
@@ -3207,7 +3237,7 @@ class KineticRenderer:
                 k = src["key"]
                 if k["line"] > n_alpha:
                     raise LookError(f"direction: {where}.source.key.line が行数（{n_alpha}）を超えています")
-                text = kinetic_points.source_chars(flats[k["line"] - 1][k["from"]:k["from"] + k["len"]])
+                text = kinetic_points.source_chars("".join(self.plan_all[k["line"] - 1]["rows"])[k["from"]:k["from"] + k["len"]])   # 行番号で引く（hidden の行は検証で止まる）
                 variants = [(0.0, text)]
             elif src == "section":
                 name = span.get("section") or (self.plan[rows[0]].get("section") if rows else None)
@@ -3246,7 +3276,7 @@ class KineticRenderer:
                     b = self._cut_rects[prev_rows[-1]]
                     anchor = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
             # track の at_line・at_time を、区間の頭からの秒に直す（ここ1か所。直した後の秒で check_track を掛ける。T35 U3）
-            sp, _resolved = kinetic_points.resolve_track(sp, sp["kind"], [c["start"] for c in self.plan], t0, where)
+            sp, _resolved = kinetic_points.resolve_track(sp, sp["kind"], [c["start"] for c in self.plan_all], t0, where)
             layer = kinetic_points.PointLayer(sp, i, t0, t1, variants, rects, beats=beats, anchor=anchor)
             role = sp.get("role") or ("tsubu" if "tsubu" in self.theme["fonts"] else self.theme.get("default_role"))
             ref = self._fonts.get(role)
@@ -3752,7 +3782,9 @@ class KineticRenderer:
 
     # --- テーマ（名前付きの配色・書体の役・背景色の時間軸） ---
 
-    def _setup_theme(self, look, plan):
+    def _setup_theme(self, look, plan, plan_all=None):
+        """plan＝字幕に出す行（入替の判定。隣は字幕に出す行）、plan_all＝全行（resolve_span。行番号で引く）"""
+        plan_all = plan if plan_all is None else plan_all
         theme = self.theme
         self._fonts = look.get("fonts") or {}
         self._paper = (theme.get("texture") or {}).get("paper", "plain") != "none"
@@ -3764,7 +3796,7 @@ class KineticRenderer:
         self._dir = look.get("direction_data") or {}
         self._transitions = []
         for tr in (self._dir.get("bg_transitions") or []):
-            t0, t1 = resolve_span(plan, tr)
+            t0, t1 = resolve_span(plan_all, tr)
             self._transitions.append((t0, max(t1, t0 + 1e-6), _hex(theme["palettes"][tr["from"]]["bg"]),
                                       _hex(theme["palettes"][tr["to"]]["bg"]),
                                       _hex(theme["palettes"][tr["from"]]["text"]), _hex(theme["palettes"][tr["to"]]["text"]),
@@ -3778,7 +3810,7 @@ class KineticRenderer:
             from look import LookError
 
             to_end = it.get("until") == "end"
-            t0, t1 = resolve_span(plan, it, song_len, where="interludes")
+            t0, t1 = resolve_span(plan_all, it, song_len, where="interludes")
             if t1 <= t0:
                 raise LookError(f"interludes: 区間が空です（{t0:.2f}〜{t1:.2f}秒）")
             self.interlude_spans.append({"t0": t0, "t1": t1, "kind": it.get("kind", "duotone"), "to_end": to_end,
@@ -4146,6 +4178,7 @@ def render_stills(image_path, plan, beats, style, out_dir, cuts_per_sheet=8, bac
     """各カットの 0/25/50/75/100% と入りの着地直後を静止画にし、
     一覧画像（コンタクトシート）にまとめる。書き出し前の目視確認用。"""
     renderer = KineticRenderer(image_path, plan, beats, style, backgrounds=backgrounds, look=look)
+    plan = renderer.plan      # 字幕に出す行（hidden の行は一覧に載せない。位置 s + r で renderer.cuts・seen_at を引くため、描画器と同じ並びで回す）
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     thumb_w, thumb_h = 216, 384
@@ -4242,9 +4275,9 @@ def render_motion_sheets(renderer, out_dir, cuts_per_sheet=8, safe_overlay=False
             d.text((6, y0 + 8), f"#{row}" if row else "間奏", font=label_font, fill=(255, 255, 255))
             d.text((6, y0 + 40), label, font=tiny, fill=(255, 230, 120))
             if row:
-                c = renderer.plan[row - 1]
+                c = renderer.plan_all[row - 1]
                 pal = renderer.theme["palettes"][c["bg"]]
-                for k, line in enumerate((f"{c['font_role']} {renderer.cuts[row - 1].size}px", f"bg {pal['bg']}", f"tx {pal['text']}")):
+                for k, line in enumerate((f"{c['font_role']} {renderer.cuts[renderer.pos_of_line[row]].size}px", f"bg {pal['bg']}", f"tx {pal['text']}")):
                     d.text((6, y0 + 60 + k * 16), line, font=tiny, fill=(190, 210, 255))
             for k, t in enumerate(times):
                 im = renderer.still_frame(t, safe_overlay).resize((thumb_w, thumb_h), Image.BILINEAR)
@@ -4252,8 +4285,8 @@ def render_motion_sheets(renderer, out_dir, cuts_per_sheet=8, safe_overlay=False
                 sheet.paste(im, (x0, y0))
                 lines = [f"{t:.3f}s"]
                 if row:
-                    c = renderer.plan[row - 1]
-                    o = renderer.cuts[row - 1]
+                    c = renderer.plan_all[row - 1]
+                    o = renderer.cuts[renderer.pos_of_line[row]]
                     if o.karaoke:
                         n_lit, n_all = o.lit_count(t - c["start"])
                         lines.append(f"点灯 {n_lit}/{n_all}")
@@ -4284,17 +4317,18 @@ def _direction_items(direction, n_lines):
 
 
 def direction_line_options(direction, n_lines, vdefaults, voice_key="voice"):
-    """build_plan に渡す行ごとの余韻（tails）と固定の終わり（fixed_ends）。
+    """build_plan に渡す行ごとの余韻（tails）と固定の終わり（fixed_ends）と hidden（字幕に出さない行。U13）。
     余韻は 行の tail → 声の既定 → None（style の tail_sec）の順"""
     items = _direction_items(direction, n_lines)
-    tails, fixed = [], []
+    tails, fixed, hiddens = [], [], []
     for it in items:
         tail = it.get("tail")
         if tail is None:
             tail = (vdefaults.get(it.get(voice_key)) or {}).get("tail")
         tails.append(None if tail is None else float(tail))
         fixed.append(None if it.get("end") is None else float(it["end"]))
-    return tails, fixed
+        hiddens.append(bool(it.get("hidden")))
+    return tails, fixed, hiddens
 
 
 _DIRECTION_EXITS = ("swap", "fade", "fall", "drift", "fly", "split", "shatter")
@@ -4306,6 +4340,14 @@ def _is_chorus_or_bridge(section):
     for pre in ("pre-chorus", "pre chorus", "prechorus"):
         t = t.replace(pre, "")
     return "chorus" in t or "bridge" in t
+
+
+def _next_shown(plan, i):
+    """行 i（0 始まり）の次に字幕に出す行のカット（hidden の行は隣と見ない）。無ければ None"""
+    for k in range(i + 1, len(plan)):
+        if not plan[k].get("hidden"):
+            return plan[k]
+    return None
 
 
 def _window_words(words, plan, i):
@@ -4522,8 +4564,9 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             # 隣の行と重ねて2回数えない。表示の終わりの後の隙間（歌詞外の声）の単語では増やさない。次の行へ入れ替わる行（終わり ≧ 次の開始）は
             # 次の行の開始まで
             hi = c["end"]
-            if i + 1 < len(plan) and c["end"] >= plan[i + 1]["start"] - 0.0015:
-                hi = plan[i + 1]["start"]
+            nx_ = _next_shown(plan, i)          # 隣＝次に字幕に出す行（hidden の行は隣と見ない。U13）
+            if nx_ is not None and c["end"] >= nx_["start"] - 0.0015:
+                hi = nx_["start"]
             c["counter_words"] = [round(float(w["start"]), 3) for w in words if c["start"] <= w["start"] < hi]
         if it.get("solo"):
             c["solo"] = True
@@ -4560,16 +4603,24 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
         a, b = st["lines"]
         for k in range(a, b + 1):
             c = plan[k - 1]
-            nxt = plan[k] if k < len(plan) else None
+            nxt = _next_shown(plan, k - 1)      # 隣＝次に字幕に出す行（stack.lines に hidden の行は検証で止まる）
             if nxt is None or c["end"] < nxt["start"] - 0.0015:
                 raise look.LookError(f"direction: stack[{gi}] の行{k} の表示が、次の行の開始まで続きません（終わり {c['end']:.2f}秒）。"
                                      f"積んだ列を残すには、行に tail（行の長さより大きい値）か end を書いて、次の行の開始まで表示してください")
             c["stack_group"], c["stack_dim"], c["stack_clear_line"] = gi, float(st["dim"]), st["clear_at_line"]
     for i, (c, it) in enumerate(zip(plan, items)):
-        nxt = plan[i + 1] if i + 1 < len(plan) else None
+        if c.get("hidden"):
+            c["exit"] = "swap"     # 字幕に出さない行は退場を持たない（描画器に渡らない）
+            continue
+        nxt = _next_shown(plan, i)     # 隣＝次に字幕に出す行（hidden の行は隣と見ない。U13）
         name = it.get("exit")
         if name is None:
-            name = "swap" if nxt is not None and c["end"] >= nxt["start"] - 0.0015 else "fade"
+            if nxt is not None:
+                name = "swap" if c["end"] >= nxt["start"] - 0.0015 else "fade"
+            elif any(p_.get("hidden") for p_ in plan[i + 1:]):
+                name = "swap"      # 後ろの行がすべて hidden：表示の終わり（曲の長さ）まで出したまま。薄れは end＋exit を書いたときだけ（Q-END）
+            else:
+                name = "fade"      # 後ろに行が無い（hidden を使わない曲の最後の行）：従来どおり
         elif not (name in _DIRECTION_EXITS or _exit_fade_sec(name) is not None):
             raise RuntimeError(f"direction 行{c['index']}: 消え方 '{name}' は未対応です")
         if c.get("stack_group") is not None:
@@ -4707,6 +4758,8 @@ def apply_look(plan, theme, direction, vdefaults):
     notes = []
     flagged, containing = set(), set()
     for c, it in zip(plan, items):
+        if c.get("hidden"):
+            continue       # 字幕に出さない行（U13）は書体・配色を持たない（描画器に渡らない）
         vd = vdefaults.get(it.get("voice") or c.get("voice")) or {}
         role = it.get("role") or vd.get("role") or theme.get("default_role")
         palette = it.get("palette") or vd.get("palette") or theme.get("default_palette")
@@ -4859,7 +4912,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
     eff_style = dict(style)
     if direction is not None:
         eff_style["hold_mode"] = "sung_end"   # 歌い終わり E ＋ 余韻。余韻は direction の声・行で決まる
-    sung_ends = tails = fixed = None
+    sung_ends = tails = fixed = hiddens = None
     words, use_lcs = None, False
     vdefaults = look.voice_defaults(direction, theme)
     if direction is not None:
@@ -4877,7 +4930,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
         d_ends = vocal_ends(alignment, vpath, cache_dir, w_ends=w_ends) if vpath.exists() else None
         sung_ends = combine_sung_ends(w_ends, d_ends)
         if direction is not None:
-            tails, fixed = direction_line_options(direction, len(alignment), vdefaults)
+            tails, fixed, hiddens = direction_line_options(direction, len(alignment), vdefaults)
 
     def post(plan):
         if direction is not None:
@@ -4909,10 +4962,10 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
         header = [f"<!-- 見た目: {theme_name}（{look.theme_digest(theme)}） -->"] + [
             f"<!-- 役 {r}: {f['family']} {f['style']} index {f['index']} {f['path']} -->" for r, f in fonts.items()]
     kwargs = dict(meta=meta, backgrounds=backgrounds, sung_ends=sung_ends, tails=tails, fixed_ends=fixed,
-                  duration=duration, post=post)
+                  duration=duration, post=post, hiddens=hiddens)
     if plan_path is None:
         plan = post(build_plan(alignment, sections, beats, eff_style, meta, backgrounds, sung_ends=sung_ends,
-                               tails=tails, fixed_ends=fixed, duration=duration))
+                               tails=tails, fixed_ends=fixed, duration=duration, hiddens=hiddens))
     else:
         plan = load_or_build_plan(plan_path, alignment, sections, beats, eff_style, replan=replan,
                                   variant=variant, md_header=header, **kwargs)
@@ -4926,7 +4979,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
 
 def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=False, meta=None, backgrounds=None,
                        sung_ends=None, tails=None, fixed_ends=None, duration=None, variant=None, post=None,
-                       md_header=None):
+                       md_header=None, hiddens=None):
     """variant: 既定の経路では None。それ以外（歌い終わり方式・テーマ・direction）は設計を決める入力の digest。
     保存する JSON には variant を既定の経路以外のときだけ書く（既存の曲のファイルは1バイトも変わらない）。"""
     plan_path = Path(plan_path)
@@ -4948,7 +5001,7 @@ def load_or_build_plan(plan_path, alignment, sections, beats, style, replan=Fals
         shutil.copy2(plan_path, bak)
         print(f"      既存の {plan_path.name} を退避: {bak.name}")
     plan = build_plan(alignment, sections, beats, style, meta, backgrounds, sung_ends=sung_ends,
-                      tails=tails, fixed_ends=fixed_ends, duration=duration)
+                      tails=tails, fixed_ends=fixed_ends, duration=duration, hiddens=hiddens)
     if post is not None:
         plan = post(plan)
     plan_path.parent.mkdir(parents=True, exist_ok=True)

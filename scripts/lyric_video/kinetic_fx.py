@@ -562,8 +562,9 @@ class Counter:
     最上位 counter.appear は、新しいバッジを 0 から出す（それまでのバッジは取り除く）。単語の無い区間なので、
     次の行の開始までは beats のオンセットごとに +1。"""
 
-    def __init__(self, plan, spec, beats, cfg, switch=None):
+    def __init__(self, plan, spec, beats, cfg, switch=None, plan_all=None):
         self.plan = plan
+        self.plan_all = plan if plan_all is None else plan_all   # 行番号で引く区間（counter.appear）は全行（hidden の行を含む）。出入りは plan（字幕に出す行）
         self.switch = switch or {}   # 行番号 → 切り替えのフレーム（次の行が実際に描かれる最初のフレーム。割れの始まり）
         self.spec = spec or {}
         self.beats = sorted(float(b) for b in (beats or []))
@@ -590,7 +591,7 @@ class Counter:
             else:
                 from kinetic import resolve_span
 
-                a, b = resolve_span(self.plan, ap)
+                a, b = resolve_span(self.plan_all, ap)
                 if b <= a:
                     from look import LookError
                     raise LookError(f"counter.appear: 行{ap['after_line']}の終わり {a:.2f} 秒から行{ap['until_line']}の開始 {b:.2f} 秒までが空の区間です")

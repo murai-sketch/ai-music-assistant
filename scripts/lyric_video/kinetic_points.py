@@ -395,7 +395,7 @@ def _check_shape(sh, where, size_hi):
         _err(f"direction: {where}.shape が画面からはみ出します（中心 {cx:.0f},{cy:.0f}、半径 {rmax:.0f}px）")
 
 
-def validate_points(points, n_lines, theme):
+def validate_points(points, n_lines, theme, hidden=frozenset()):
     """direction の points を検査する（未知の項目・範囲外の値は止める）。戻り値なし"""
     if theme is None:
         _err("direction: points（点の層）はテーマ（look）を使う曲でだけ使えます（字の色・書体をテーマの役から決めます）")
@@ -423,6 +423,8 @@ def validate_points(points, n_lines, theme):
                 if (not isinstance(ln, list) or len(ln) != 2 or not all(isinstance(x, int) and not isinstance(x, bool) for x in ln)
                         or not 1 <= ln[0] <= ln[1] <= n_lines):
                     _err(f"direction: {where}.span.lines は [開始の行, 終わりの行]（1〜{n_lines}、開始≦終わり）で書いてください")
+                if ln[1] in hidden:
+                    _err(f"direction: {where}.span.lines の終わりの行{ln[1]} は字幕に出さない行（hidden）です。行の表示の終わりが無いので区間が決まりません")
             elif not isinstance(span["section"], str) or not span["section"]:
                 _err(f"direction: {where}.span.section は区分の名前（文字列）で書いてください")
         else:
@@ -437,6 +439,8 @@ def validate_points(points, n_lines, theme):
             for k in ("after_line", "until_line"):
                 if k in span and not (isinstance(span[k], int) and not isinstance(span[k], bool) and 1 <= span[k] <= n_lines):
                     _err(f"direction: {where}.span.{k} が行番号（1〜{n_lines}）ではありません")
+            if span.get("after_line") in hidden:
+                _err(f"direction: {where}.span.after_line は字幕に出さない行（hidden）です。行の表示の終わりが無いので区間が決まりません（until_line は使えます）")
         # source
         src = sp.get("source", "line")
         if isinstance(src, dict):
@@ -446,6 +450,8 @@ def validate_points(points, n_lines, theme):
             if not (isinstance(k["line"], int) and 1 <= k["line"] <= n_lines and isinstance(k["from"], int) and k["from"] >= 0
                     and isinstance(k["len"], int) and k["len"] >= 1) or any(isinstance(v, bool) for v in k.values()):
                 _err(f"direction: {where}.source.key は line（1〜{n_lines}）・from（0 以上）・len（1 以上）の整数で書いてください")
+            if k["line"] in hidden:
+                _err(f"direction: {where}.source.key.line は字幕に出さない行（hidden）です。字幕に出さない行の字を点で出しません")
         elif src not in ("line", "section"):
             _err(f"direction: {where}.source は \"line\"・\"section\"・{{\"key\": ...}} のどれかで書いてください")
         # 大きさ・不透明度・seed・role・ink

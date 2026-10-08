@@ -274,7 +274,7 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
@@ -332,6 +332,8 @@ def _normalize_item(item, allowed, where):
             raise LookError(f"direction: {where} の '{k}' は数値で書いてください")
         if name == "land" and v not in LAND_MODES:
             raise LookError(f"direction: {where} の land '{v}' は {', '.join(LAND_MODES)} のどれかで書いてください")
+        if name == "hidden" and v is not True:
+            raise LookError(f"direction: {where} の hidden は true だけ書けます（字幕に出さない行。false・数値は書けません。出す行には hidden を書かない）")
         if name in ("karaoke_land", "solo") and not isinstance(v, bool):
             raise LookError(f"direction: {where} の '{k}' は true / false で書いてください")
         if name == "text_y" and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.15 <= v <= 0.85):
@@ -488,6 +490,9 @@ def _validate_stack(stack, n_lines, by_line, theme):
         n = st["clear_at_line"]
         if isinstance(n, bool) or not isinstance(n, int) or n != ln[1] + 1 or n > n_lines:
             raise LookError(f"direction: {where}.clear_at_line は、最後の行の次の行（{ln[1] + 1}。{n_lines} 以下）だけ書けます（間に積まない行を挟むと、重なる・列が早く消える）")
+        hid = hidden_lines(by_line)
+        if n in hid or any(k in hid for k in range(ln[0], ln[1] + 1)):
+            raise LookError(f"direction: {where} の lines／clear_at_line に字幕に出さない行（hidden）があります（行の表示の終わりが無いので、残した列の区間が決まりません）")
         for k in range(ln[0], ln[1] + 1):
             it = by_line.get(k, {})
             if it.get("layout") != "vertical":
@@ -501,6 +506,26 @@ def _validate_stack(stack, n_lines, by_line, theme):
             raise LookError(f"direction: {w0} と {w1} の区間（最初の行〜消す行の手前）が重なっています")
 
 
+def hidden_lines(by_line):
+    """字幕に出さない行（hidden: true）の行番号の集合（1 始まり）"""
+    return frozenset(n for n, it in by_line.items() if it.get("hidden"))
+
+
+def _validate_hidden(hidden, by_line, n_lines):
+    """hidden（U13）：字幕に出さない行。カットはプランに残り、行の開始は at_line／until_line の基準に使える。
+    hidden の行に書けるのは hidden だけ（効かない値を残さない）。前の行が字幕に出ない行の align_to_prev・全行 hidden は止める"""
+    if not hidden:
+        return
+    for n in sorted(hidden):
+        other = sorted(k for k in by_line[n] if k != "hidden")
+        if other:
+            raise LookError(f"direction: 行{n} は hidden（字幕に出さない行）なので、ほかの項目（{', '.join(other)}）は書けません（効かない値を残さず止めました）")
+        if n + 1 <= n_lines and by_line.get(n + 1, {}).get("align_to_prev"):
+            raise LookError(f"direction: 行{n + 1} の align_to_prev は、前の行（行{n}）が hidden（字幕に出さない）ので使えません")
+    if len(hidden) >= n_lines:
+        raise LookError("direction: 全部の行が hidden です（字幕に出す行が1つもありません）")
+
+
 def validate_direction(direction, n_lines, vdefaults, theme=None):
     """direction の中身の検査（書き間違いを黙って既定値に戻さない）。未知の項目・存在しない声は LookError で止める。
     vdefaults は voice_defaults の結果（テーマ・direction の voices の和）"""
@@ -508,6 +533,8 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         if k not in DIRECTION_TOP_KEYS and not str(k).startswith("_"):
             raise LookError(f"direction: 未知の最上位の項目 '{k}' があります（{', '.join(sorted(DIRECTION_TOP_KEYS))}）")
     by_line = parse_line_keys(direction.get("lines", {}), n_lines)
+    hidden = hidden_lines(by_line)
+    _validate_hidden(hidden, by_line, n_lines)
     for n, item in sorted(by_line.items()):
         v = item.get("voice")
         if v is not None and v not in vdefaults:
@@ -587,7 +614,7 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
     if direction.get("points") is not None:
         import kinetic_points   # 遅延 import
 
-        kinetic_points.validate_points(direction["points"], n_lines, theme)
+        kinetic_points.validate_points(direction["points"], n_lines, theme, hidden=hidden)
     vt = direction.get("vertical")
     if vt is not None:
         if not isinstance(vt, dict) or not vt or not set(vt) <= VERTICAL_KEYS:
@@ -635,6 +662,8 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         for key in ("after_line", "until_line"):
             if key in tr and not (isinstance(tr[key], int) and 1 <= tr[key] <= n_lines):
                 raise LookError(f"direction: {where}.{key} が行番号（1〜{n_lines}）ではありません")
+        if tr.get("after_line") in hidden:
+            raise LookError(f"direction: {where}.after_line は字幕に出さない行（hidden）です。行の表示の終わりが無いので意味が決まりません（start か until_line を使うか、字幕に出す行を指してください）")
         for key in ("start", "seconds"):
             if key in tr and (isinstance(tr[key], bool) or not isinstance(tr[key], (int, float)) or tr[key] < 0):
                 raise LookError(f"direction: {where}.{key} は 0 以上の数値で書いてください")
@@ -695,7 +724,7 @@ def _validate_stage3(direction, by_line, theme):
         if kd.get("keyword_unlit", "text") != "text":
             raise LookError("direction: karaoke.keyword_unlit は text だけです")
     _validate_counter_top(direction, by_line)
-    _validate_interludes(direction)
+    _validate_interludes(direction, hidden_lines(by_line))
 
 
 def _num(v):
@@ -735,6 +764,8 @@ def _validate_counter_top(direction, by_line):
             for key in ("after_line", "until_line"):
                 if not (isinstance(ap[key], int) and not isinstance(ap[key], bool) and 1 <= ap[key] <= n):
                     raise LookError(f"direction: {where}.{key} が行番号（1〜{n}）ではありません")
+            if ap["after_line"] in hidden_lines(by_line):
+                raise LookError(f"direction: {where}.after_line は字幕に出さない行（hidden）です。行の表示の終わりが無いので意味が決まりません（until_line は hidden の行でも使えます）")
             if ap["until_line"] <= ap["after_line"]:
                 raise LookError(f"direction: {where} は until_line が after_line より後の行でなければなりません（空の区間）")
         if "at_fraction" in ap and (not _num(ap["at_fraction"]) or not 0 <= ap["at_fraction"] <= 1):
@@ -745,7 +776,7 @@ def _validate_counter_top(direction, by_line):
             raise LookError(f"direction: {where}.rate は per_onset だけです（単語の無い区間は beats のオンセットで増やす）")
 
 
-def _validate_interludes(direction):
+def _validate_interludes(direction, hidden=frozenset()):
     il = direction.get("interludes")
     if il is None:
         return
@@ -769,6 +800,8 @@ def _validate_interludes(direction):
         for key in ("after_line", "until_line"):
             if key in it and not (isinstance(it[key], int) and not isinstance(it[key], bool) and 1 <= it[key] <= n):
                 raise LookError(f"direction: {where}.{key} が行番号（1〜{n}）ではありません")
+        if it.get("after_line") in hidden:
+            raise LookError(f"direction: {where}.after_line は字幕に出さない行（hidden）です。行の表示の終わりが無いので意味が決まりません")
         if "until" in it and it["until"] != "end":
             raise LookError(f'direction: {where}.until は "end"（曲末）だけです')
         if "zoom_peak" in it and (not _num(it["zoom_peak"]) or not 1.0 <= it["zoom_peak"] <= 1.2):
