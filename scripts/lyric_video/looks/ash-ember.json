@@ -167,17 +167,17 @@
   },
   "morning": {
    "bg": "#1C1C1C",
-   "text": "#E8E8E8",
+   "text": "#CCCCCC",
    "sub": "#9A9A9A",
    "stroke": "#1C1C1C",
-   "accent": "#E8E8E8"
+   "accent": "#CCCCCC"
   },
   "floor": {
    "bg": "#0B0B0B",
-   "text": "#EDEDED",
+   "text": "#CCCCCC",
    "sub": "#9A9A9A",
    "stroke": "#0B0B0B",
-   "accent": "#EDEDED"
+   "accent": "#CCCCCC"
   },
   "thaw": {
    "bg": "#1D1915",
