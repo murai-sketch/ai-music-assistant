@@ -4759,6 +4759,19 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
                     win_k = _window_words(words, plan, i)
                     cap = min(float(win_k[word_of_k[max(word_of_k)]]["end"]), c["end"])
                 c["char_times"] = _karaoke_times(len(flat), time_of, c["start"], cap)
+                if it.get("karaoke_at") and c["char_times"]:
+                    # karaoke_at：単語時刻が声の頭とずれる字だけ、点灯の秒を直接置く（行の開始〜表示の終わりに収め、前の字は遅くしない・後ろの字は早くしない）
+                    ctl = c["char_times"]
+                    for k_, t_ in it["karaoke_at"].items():
+                        k_ = int(k_)
+                        if k_ >= len(ctl):
+                            raise look.LookError(f"direction: 行{c['index']} の karaoke_at の位置 {k_} が字数（{len(ctl)}）以上です")
+                        t_ = round(min(max(float(t_), c["start"]), c["end"]), 3)
+                        ctl[k_] = t_
+                        for j in range(k_):
+                            ctl[j] = min(ctl[j], t_)
+                        for j in range(k_ + 1, len(ctl)):
+                            ctl[j] = max(ctl[j], t_)
         # --- 段3後半：カウンター（行の状態と、増える時刻の元になる単語の開始）・solo
         if direction.get("counter") is not None:
             if words is None:

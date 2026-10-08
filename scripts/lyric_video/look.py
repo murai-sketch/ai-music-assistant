@@ -274,7 +274,7 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step", "reveal", "bouten"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step", "reveal", "bouten", "karaoke_at"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
@@ -357,6 +357,9 @@ def _normalize_item(item, allowed, where):
             if (not isinstance(v, dict) or set(v) != {"dir", "sec"} or v["dir"] not in REVEAL_DIRS or isinstance(v["sec"], bool)
                     or not isinstance(v["sec"], (int, float)) or not REVEAL_SEC[0] <= v["sec"] <= REVEAL_SEC[1]):
                 raise LookError(f"direction: {where} の reveal は {{\"dir\": {'・'.join(REVEAL_DIRS)} のどちらか, \"sec\": {REVEAL_SEC[0]}〜{REVEAL_SEC[1]} 秒}} で書いてください（入りの切り抜き。字ごとの遅れはなし）")
+        if name == "karaoke_at" and (not isinstance(v, dict) or not v or any(
+                not str(k).isdigit() or isinstance(t, bool) or not isinstance(t, (int, float)) or t < 0 for k, t in v.items())):
+            raise LookError(f"direction: {where} の karaoke_at は {{\"<字の位置（0 から）>\": <点灯の秒>}} で書いてください（声の頭を実測して直す字だけ）")
         if name == "bouten" and v is not True:
             raise LookError(f"direction: {where} の bouten は true だけを書けます（karaoke の行で、点灯した字の上に点が灯って残る）")
         if name == "align_to_prev" and v is not True:
@@ -565,6 +568,8 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
             raise LookError(f"direction: 行{n} の accent_rows は accent: rows の行だけに書けます（accent: rows には accent_rows の指定が要ります）")
         if item.get("karaoke_cap") is not None and item.get("entrance") != "karaoke":
             raise LookError(f"direction: 行{n} の karaoke_cap は entrance: karaoke の行だけに書けます")
+        if item.get("karaoke_at") is not None and item.get("entrance") != "karaoke":
+            raise LookError(f"direction: 行{n} の karaoke_at は entrance: karaoke の行だけに書けます")
         if item.get("align_to_prev"):
             if n == 1:
                 raise LookError("direction: 行1 の align_to_prev は、前の行が無いので使えません")
