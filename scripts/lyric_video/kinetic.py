@@ -728,6 +728,8 @@ def build_plan(alignment, sections, beats, style, meta=None, backgrounds=None, s
         })
         if hidden:
             plan[-1]["hidden"] = True          # 字幕に出さない行（U13）。hidden でない行にはこのキーを足さない（既存のプランを変えない）
+        elif nv is None and i < len(alignment) - 1 and show_end >= next_start - 0.0015:
+            plan[-1]["until_song_end"] = True  # 後ろがすべて hidden で、表示の終わりが曲の長さに届いた行（U13a）。条件外はキーを書かない
         if hold_mode == "sung_end":
             plan[-1]["sung_end"] = None if sung_e is None else round(sung_e, 3)
             plan[-1]["sung_w"] = None if sung_w is None else round(sung_w, 3)
@@ -4617,10 +4619,10 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
         if name is None:
             if nxt is not None:
                 name = "swap" if c["end"] >= nxt["start"] - 0.0015 else "fade"
-            elif any(p_.get("hidden") for p_ in plan[i + 1:]):
-                name = "swap"      # 後ろの行がすべて hidden：表示の終わり（曲の長さ）まで出したまま。薄れは end＋exit を書いたときだけ（Q-END）
             else:
-                name = "fade"      # 後ろに行が無い（hidden を使わない曲の最後の行）：従来どおり
+                # 後ろに字幕に出す行が無い。表示の終わりが曲の長さに届いた行（build_plan の印 until_song_end）は出したまま（swap）、
+                # 届かない行・hidden を使わない曲の最後の行は薄れて消える（fade。従来どおり）
+                name = "swap" if c.get("until_song_end") else "fade"
         elif not (name in _DIRECTION_EXITS or _exit_fade_sec(name) is not None):
             raise RuntimeError(f"direction 行{c['index']}: 消え方 '{name}' は未対応です")
         if c.get("stack_group") is not None:

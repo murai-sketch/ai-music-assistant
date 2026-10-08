@@ -643,6 +643,8 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         if (not isinstance(kw, dict) or not isinstance(kw.get("from_line"), int)
                 or not 1 <= kw["from_line"] <= n_lines or kw.get("rule") != "first_bracket"):
             raise LookError('direction: key_word は {"from_line": 行番号, "rule": "first_bracket"} の形で書いてください')
+        if kw["from_line"] in hidden:
+            raise LookError(f"direction: key_word.from_line の行{kw['from_line']} は hidden（字幕に出さない行）なので、差し色の語の取り出し元にできません")
     trs = direction.get("bg_transitions", [])
     if not isinstance(trs, list):
         raise LookError("direction: bg_transitions は配列で書いてください")
