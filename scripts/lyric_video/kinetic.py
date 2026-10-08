@@ -2197,6 +2197,11 @@ class _Cut:
                         if im is not None:
                             frame.paste(im, (int(gcx - im.size[0] / 2), int(gcy - im.size[1] / 2)), im)
 
+        reveal_q = 1.0
+        if cut.get("reveal"):
+            rsec_ = cut["reveal"]["sec"]
+            if tl < rsec_:
+                reveal_q = _ease_out(max(tl, 0.0) / rsec_)
         for g in self.glyphs:
             dx, dy, scale, angle, alpha, crop_top, crop_right = self.glyph_state(g, tl, dur)
             if dim != 1.0:
@@ -2215,7 +2220,19 @@ class _Cut:
                     im = sprites.transformed(lkey, limg, scale, total_angle, la * alpha, crop_top, crop_right, alpha_step=20)
                     if im is None:
                         continue
-                    frame.paste(im, (int(kcx - im.size[0] / 2), int(kcy - im.size[1] / 2)), im)
+                    full_h = im.size[1]
+                    py_ = int(kcy - full_h / 2)
+                    if reveal_q < 1.0:
+                        # 入りの切り抜き（reveal）：字の枠の下端（up）／上端（down）から出る。字ごとの遅れなし
+                        shown_ = int(full_h * reveal_q)
+                        if shown_ <= 0:
+                            continue
+                        if cut["reveal"]["dir"] == "up":
+                            im = im.crop((0, 0, im.size[0], shown_))
+                            py_ += full_h - shown_
+                        else:
+                            im = im.crop((0, full_h - shown_, im.size[0], full_h))
+                    frame.paste(im, (int(kcx - im.size[0] / 2), py_), im)
                 continue
             reveal_clip = None
             if motion == "mask":
@@ -2224,6 +2241,10 @@ class _Cut:
                 if q <= 0:
                     continue
                 reveal_clip = q
+            elif reveal_q < 1.0:
+                if reveal_q <= 0:
+                    continue
+                reveal_clip = reveal_q
             gx = g["cx"] * scale
             gy = g["cy"] * scale
             rx = gx * cos_a - gy * sin_a
@@ -2245,10 +2266,14 @@ class _Cut:
                     shown = int(im.size[1] * reveal_clip)
                     if shown <= 0:
                         continue
-                    im = im.crop((0, 0, im.size[0], shown))
+                    down_ = motion != "mask" and cut.get("reveal", {}).get("dir") == "down"
+                    if down_:
+                        im = im.crop((0, im.size[1] - shown, im.size[0], im.size[1]))     # 下向き：上端から下りる
+                    else:
+                        im = im.crop((0, 0, im.size[0], shown))
                     px = ax + rx + gdx - im.size[0] / 2
                     top = ay + ry - (h * scale) / 2
-                    py = top + (h * scale) - shown
+                    py = top if down_ else top + (h * scale) - shown
                     frame.paste(im, (int(px), int(py)), im)
                     continue
                 gcx, gcy = self.glyph_center(g, scale, gdx, gdy)
@@ -2281,6 +2306,9 @@ class _Cut:
                     continue
                 frame.paste(im, (int(px), int(py)), im)
 
+        if cut.get("bouten") and self.karaoke:
+            self._draw_bouten(frame, tl, dur, dim)
+
         if self.overlay is not None:
             self._draw_overlay(frame, tl, dur)
         self._draw_slash(frame, tl)
@@ -2289,6 +2317,33 @@ class _Cut:
             if 5 < remain < 8:
                 d = ImageDraw.Draw(frame)
                 d.line([(-50, ay + 60), (VIDEO_SIZE[0] + 50, ay - 60)], fill=(255, 255, 255), width=8)
+
+    def _draw_bouten(self, frame, tl, dur, dim):
+        """傍点（bouten）：字が点灯した瞬間に、その字の上へ小さな点（字の約 0.15 倍・本文と同じ色）が灯り、行の終わりまで残る。
+        点灯する字（karaoke の char_times）だけ。bouten の無い行は通らない"""
+        ct = self.cut.get("char_times")
+        if ct is None:
+            return
+        cut = self.cut
+        color = _hex(self.colors[0])
+        rad = 0.075 * self.size
+        for g in self.glyphs:
+            dx, dy, scale, angle, alpha, _ctop, _cr = self.glyph_state(g, tl, dur)
+            alpha *= dim
+            if alpha <= 0.02:
+                continue
+            age = cut["start"] + tl - ct[g.get("ct", g["order"])]
+            if age < 0:
+                continue
+            pop = 1.0 + 0.8 * (1.0 - (3 - 2 * (age / 0.15)) * (age / 0.15) ** 2) if age < 0.15 else 1.0     # 灯る瞬間だけ少し大きい
+            r = rad * scale * pop
+            cx_, cy_ = self.glyph_center(g, scale, dx, dy - 0.66 * self.size * scale)
+            S = 4
+            side = int(r * 2 + 4)
+            m = Image.new("L", (side * S, side * S), 0)
+            ImageDraw.Draw(m).ellipse([(side / 2 - r) * S, (side / 2 - r) * S, (side / 2 + r) * S, (side / 2 + r) * S], fill=int(255 * min(alpha, 1.0)))
+            m = m.resize((side, side), Image.LANCZOS)
+            frame.paste(color, (int(cx_ - side / 2), int(cy_ - side / 2)), m)
 
     def _draw_under(self, frame, tl, dur):
         cut = self.cut
@@ -2833,7 +2888,7 @@ class KineticRenderer:
                 t0_, t1_ = resolve_span(self.plan_all, it["span"], dur_, where=f"halftone[{k}]", shown=shown_all)
                 if t1_ <= t0_ + 2 * float(it.get("fade", 1.0)):
                     raise LookError_(f"direction: halftone[{k}] の区間が短すぎます（{t0_:.2f}〜{t1_:.2f}秒。出入り {it.get('fade', 1.0)} 秒×2 より長く）")
-                self.halftone.append({"t0": t0_, "t1": t1_, "fade": float(it.get("fade", 1.0)), "layers": it["layers"]})
+                self.halftone.append({"t0": t0_, "t1": t1_, "fade": float(it.get("fade", 1.0)), "layers": it["layers"], "heat": it.get("heat")})
         self.points = []            # 点の層（direction の points）。無い曲は空のまま（描画・検査・レポートに何も足さない）
         self.points_max = 0
         self._points_scan = None
@@ -3289,6 +3344,27 @@ class KineticRenderer:
             clip = (W / 2 + (X0 - W / 2) * z, H / 2 + (Y0 - H / 2) * z, W / 2 + (X1 - W / 2) * z, H / 2 + (Y1 - H / 2) * z)
             self._cut_rects[j] = clip
 
+    def _glyph_pixels(self, j):
+        """行 j の読み字が落ち着いた位置での、字の画素（画面の座標。(M, 2)）。shape の glyph（字の形に粒が集まる）の行き先。
+        字の中心・大きさ・向きは draw と同じ式（glyph_state・glyph_center）、画素は字の画像の不透明な所（アルファ 128 超）"""
+        o, c = self.cuts[j], self.plan[j]
+        dur = c["end"] - c["start"]
+        tl = min(1.0, dur * 0.5)
+        out = []
+        for g in o.glyphs:
+            dx, dy, scale, angle, alpha, _ct, _cr = o.glyph_state(g, tl, dur)
+            cx, cy = o.glyph_center(g, scale, dx, dy)
+            a = np.asarray(g["img"].getchannel("A") if "A" in g["img"].getbands() else g["img"].convert("L"))
+            ys, xs = np.nonzero(a > 128)
+            if len(xs) == 0:
+                continue
+            h_, w_ = a.shape
+            u = (xs - w_ / 2.0) * scale
+            v = (ys - h_ / 2.0) * scale
+            tr = math.radians(o.base_angle + angle + g["angle"])
+            out.append(np.stack([cx + u * math.cos(tr) - v * math.sin(tr), cy + u * math.sin(tr) + v * math.cos(tr)], axis=1))
+        return np.concatenate(out) if out else np.zeros((0, 2))
+
     def _stack_end(self, j):
         """残した列（stack）を保つ区間の終わり（clear_at_line の行の開始）。積んだ行でなければ None"""
         c = self.plan[j]
@@ -3362,6 +3438,9 @@ class KineticRenderer:
                 rects.append({"ts": self.plan[j]["start"], "te": te, "line": self.plan[j]["index"],
                               "box": self._cut_rects[j], "h": float(self.cuts[j].size),
                               "cap": float(self.plan[j].get("clear_cap", kinetic_points.CLEAR_OPACITY))})
+                sh_ = sp.get("shape") or {}
+                if sh_.get("glyph") and sh_.get("around") == self.plan[j]["index"]:
+                    rects[-1]["glyph_px"] = self._glyph_pixels(j)     # 字の形に集まる粒の行き先（読み字の画素）
             anchor = None
             if rows and rows[0] in self._cut_rects:
                 b = self._cut_rects[rows[0]]
@@ -4647,6 +4726,14 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             if entrance != "karaoke":
                 raise look.LookError(f"direction: 行{c['index']} の step（踏み込み）は entrance: karaoke の行だけに書けます")
             c["step"] = it["step"]
+        if it.get("reveal") is not None:
+            if entrance not in ("karaoke", "cut"):
+                raise look.LookError(f"direction: 行{c['index']} の reveal（入りの切り抜き）は entrance: karaoke か cut の行だけに書けます")
+            c["reveal"] = {"dir": it["reveal"]["dir"], "sec": float(it["reveal"]["sec"])}
+        if it.get("bouten"):
+            if entrance != "karaoke":
+                raise look.LookError(f"direction: 行{c['index']} の bouten（傍点）は entrance: karaoke の行だけに書けます")
+            c["bouten"] = True
         if entrance == "karaoke":
             c["karaoke"] = {"unlit_opacity": kcfg["unlit_opacity"], "light_frames": kcfg["light_frames"],
                             "keyword_unlit": kcfg.get("keyword_unlit", "text")}

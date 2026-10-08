@@ -63,10 +63,11 @@ COMMON_KEYS = {"kind", "span", "source", "density", "count", "track", "size_px",
 KIND_KEYS = {
     "tsubu": COMMON_KEYS | {"drift_px_s", "dir"},
     "tate_line": COMMON_KEYS | {"motion", "speed_px_s", "length_px", "on_sec", "beat_sync", "dir", "count_fade", "x_px"},
-    "shape": COMMON_KEYS | {"shape", "from", "orient", "gather", "draw_on", "disperse", "flow", "wobble_px", "big"},
+    "shape": COMMON_KEYS | {"shape", "from", "orient", "gather", "draw_on", "disperse", "flow", "wobble_px", "big", "exit"},
 }
+SHAPE_EXITS = ("doors", "push")   # shape の散りの代わりの退場：doors＝縦の中心線で左右へ割れて開く、push＝上へ押し出す（0.5 秒前後。disperse の長さで動く）
 SHAPE_KEYS = {"disc": {"type", "center", "r0", "r"}, "spiral": {"type", "center", "r0", "turns", "r_max"},
-              "concentric": {"type", "center", "rings", "r_min", "gap"}, "outline": {"type", "points", "closed", "mask", "around", "pad"}}
+              "concentric": {"type", "center", "rings", "r_min", "gap"}, "outline": {"type", "points", "closed", "mask", "around", "pad", "glyph"}}
 FROM_MODES = ("scatter", "line", "edge")
 ORIENTS = ("upright", "tangent")
 TATE_DIRS = ("mixed", "down", "up")   # 流れる線の向き：線ごとに乱数（既定）／全部上→下／全部下→上
@@ -404,6 +405,8 @@ def _check_shape(sh, where, size_hi):
             _err(f"direction: {where}.shape.around は points・closed と同時に書けません")
         if isinstance(sh["around"], bool) or not isinstance(sh["around"], int) or sh["around"] < 1:
             _err(f"direction: {where}.shape.around は行番号（1 以上の整数）で書いてください")
+        if "glyph" in sh and sh["glyph"] is not True:
+            _err(f"direction: {where}.shape.glyph は true だけ書けます（around の行の読み字の画素に粒が集まる。字形は割らない）")
         if "pad" in sh and (not _num(sh["pad"]) or not 0 <= sh["pad"] <= 120):
             _err(f"direction: {where}.shape.pad は 0〜120（px。外接矩形から外へ離す量）で書いてください")
         return
@@ -564,6 +567,8 @@ def _check_shape_item(sp, where):
     _check_shape(sp["shape"], where, sp.get("size_px", [12, 60])[1])
     if sp.get("from", "scatter") not in FROM_MODES:
         _err(f"direction: {where}.from は {', '.join(FROM_MODES)} のどれかで書いてください")
+    if "exit" in sp and sp["exit"] not in SHAPE_EXITS:
+        _err(f"direction: {where}.exit は {', '.join(SHAPE_EXITS)} のどちらかで書いてください（書かなければ今までの散り）")
     if sp.get("orient", "upright") not in ORIENTS:
         _err(f"direction: {where}.orient は {', '.join(ORIENTS)} のどちらかで書いてください")
     for k, lo, hi in (("gather", GATHER_MIN_SEC, 3.0), ("draw_on", 0.0, 1.0), ("disperse", DISPERSE_MIN_SEC, 1.5), ("flow", 0.0, 0.5), ("wobble_px", 0.0, 12.0)):
@@ -721,7 +726,9 @@ def render_points(frame, t, color, items, sprites, rects, pre=None):
 # 点の層（points）と違い、読み字の空けを作らない：読み字のある区間には置かない（置くなら読み字の比を測り直す）。
 
 HALFTONE_FIELDS = ("a", "b")                      # 濃淡の場（止まった波。a：粗い縦の波、b：斜めの波）
-HALFTONE_KEYS = {"span", "layers", "fade"}
+HALFTONE_KEYS = {"span", "layers", "fade", "heat"}
+HALFTONE_OPT_LAYER_KEYS = {"heat", "heat_floor", "to"}          # heat: true＝熱の広がりで濃さを変える。to＝区間の終わりでの pitch・angle・max_r・opacity（頭から終わりへ直線で動く）
+HALFTONE_HEAT_KEYS = {"origin", "r0", "r1", "edge"}   # 熱の広がり：origin（画面の割合）から半径 r0→r1（px）へ、縁の幅 edge（px）
 HALFTONE_LAYER_KEYS = {"field", "pitch", "angle", "max_r", "opacity"}
 HALFTONE_FADE = (0.5, 3.0)
 _ht_cache = {}
@@ -751,19 +758,42 @@ def validate_halftone(items, n_lines):
             _err(f"direction: {where}.layers は 1〜3 枚の配列で書いてください")
         for k, l in enumerate(ls):
             w2 = f"{where}.layers[{k}]"
-            if not isinstance(l, dict) or set(l) != HALFTONE_LAYER_KEYS:
+            if not isinstance(l, dict) or not HALFTONE_LAYER_KEYS <= set(l) or set(l) - HALFTONE_LAYER_KEYS - HALFTONE_OPT_LAYER_KEYS:
                 _err(f"direction: {w2} は {{{', '.join(sorted(HALFTONE_LAYER_KEYS))}}} をすべて書いてください")
             if l["field"] not in HALFTONE_FIELDS:
                 _err(f"direction: {w2}.field は {', '.join(HALFTONE_FIELDS)} のどれかで書いてください")
             for key, lo, hi in (("pitch", 8, 80), ("angle", -3.2, 3.2), ("max_r", 2, 40), ("opacity", 0.05, 0.5)):
                 if not _num(l[key]) or not lo <= l[key] <= hi:
                     _err(f"direction: {w2}.{key} は {lo}〜{hi} の数値で書いてください")
+            if "heat_floor" in l and (not _num(l["heat_floor"]) or not 0 <= l["heat_floor"] < 1 or not l.get("heat")):
+                _err(f"direction: {w2}.heat_floor は 0 以上 1 未満の数値で、heat: true と一緒に書いてください（熱がまだ届かない所の濃さの割合）")
+            if "heat" in l and l["heat"] is not True:
+                _err(f"direction: {w2}.heat は true だけ書けます")
+            if "to" in l:
+                to = l["to"]
+                if not isinstance(to, dict) or not to or set(to) - {"pitch", "angle", "max_r", "opacity"}:
+                    _err(f"direction: {w2}.to は pitch・angle・max_r・opacity のうち動かすものだけを書いてください")
+                for key, lo, hi in (("pitch", 8, 80), ("angle", -3.2, 3.2), ("max_r", 2, 40), ("opacity", 0.05, 0.5)):
+                    if key in to and (not _num(to[key]) or not lo <= to[key] <= hi):
+                        _err(f"direction: {w2}.to.{key} は {lo}〜{hi} の数値で書いてください")
+        if any(("heat" in l or "to" in l) for l in ls):
+            h = it.get("heat")
+            if not isinstance(h, dict) or set(h) != HALFTONE_HEAT_KEYS:
+                _err(f"direction: {where}.heat は {{origin, r0, r1, edge}} をすべて書いてください（layers に heat・to があるとき）")
+            o = h["origin"]
+            if not (isinstance(o, list) and len(o) == 2 and all(_num(x) and 0 <= x <= 1 for x in o)):
+                _err(f"direction: {where}.heat.origin は [x, y]（0〜1 の割合）で書いてください")
+            for key, lo, hi in (("r0", 0, 3000), ("r1", 100, 4000), ("edge", 50, 2000)):
+                if not _num(h[key]) or not lo <= h[key] <= hi:
+                    _err(f"direction: {where}.heat.{key} は {lo}〜{hi} の数値で書いてください")
+        elif "heat" in it:
+            _err(f"direction: {where}.heat は、layers に heat か to があるときだけ書けます")
 
 
-def _ht_mask(layer):
+def _ht_mask(layer, heat=None, cache=True):
     """1 枚の網の被覆（'L'。255＝その点の全面）。格子の点を、場の値に応じた半径の円で描く。2 倍で描いて縮める（縁をなめらかに）。区間の外でも使い回すのでキャッシュ"""
     key = (layer["field"], layer["pitch"], layer["angle"], layer["max_r"])
-    m = _ht_cache.get(key)
+    m = _ht_cache.get(key) if cache else None
     if m is not None:
         return m
     S = 2
@@ -776,6 +806,8 @@ def _ht_mask(layer):
     ok = (x > -10) & (x < W + 10) & (y > -10) & (y < H + 10)
     x, y = x[ok], y[ok]
     r = maxr * _ht_field(layer["field"], x, y)
+    if heat is not None:
+        r = r * heat(x, y)
     im = Image.new("L", (W * S, H * S), 0)
     d = ImageDraw.Draw(im)
     for xx, yy, rr in zip(x.tolist(), y.tolist(), r.tolist()):
@@ -783,7 +815,8 @@ def _ht_mask(layer):
             continue
         d.ellipse([(xx - rr) * S, (yy - rr) * S, (xx + rr) * S, (yy + rr) * S], fill=255)
     m = im.resize((W, H), Image.LANCZOS)
-    _ht_cache[key] = m
+    if cache:
+        _ht_cache[key] = m
     return m
 
 
@@ -795,9 +828,30 @@ def render_halftone(frame, t, color, items):
         env = float(_smooth(min(t - it["t0"], it["t1"] - t) / it["fade"]))
         if env <= 0:
             continue
+        u = min(max((t - it["t0"]) / max(it["t1"] - it["t0"], 1e-6), 0.0), 1.0)
         for l in it["layers"]:
-            k = l["opacity"] * env
-            m = _ht_mask(l).point(lambda v, k=k: int(v * k + 0.5))
+            heat = None
+            if "heat" in l or "to" in l:
+                # 時間で変わる網点：熱の広がり（heat）と、網の間隔・向き・点の大きさ・濃さの動き（to）。u は区間の頭 0 → 尻 1 の滑らかな進み
+                s_ = float(_smooth(u))
+                if l.get("heat"):
+                    h = it["heat"]
+                    ox, oy = h["origin"][0] * W, h["origin"][1] * H
+                    front = h["r0"] + u * (h["r1"] - h["r0"])
+                    edge = float(h["edge"])
+                    fl = float(l.get("heat_floor", 0.0))
+                    heat = lambda x, y, ox=ox, oy=oy, front=front, edge=edge, fl=fl: fl + (1.0 - fl) * np.clip((front - np.hypot(x - ox, y - oy)) / edge, 0.0, 1.0)
+                cur = dict(l)
+                for key, v1 in l.get("to", {}).items():
+                    v0 = l[key]
+                    cur[key] = v0 + (v1 - v0) * s_
+                cur["pitch"] = round(cur["pitch"] * 4) / 4        # 網の間隔は 0.25px 刻み（なめらかに動かしつつ、計算の揺れを避ける）
+                k = cur["opacity"] * env
+                m = _ht_mask(cur, heat, cache=False)
+            else:
+                k = l["opacity"] * env
+                m = _ht_mask(l)
+            m = m.point(lambda v, k=k: int(v * k + 0.5))
             frame.paste(color, (0, 0), m)
 
 
@@ -1225,6 +1279,8 @@ class PointLayer:
         self.flow = float(spec.get("flow", 0.1))
         self.wob = float(spec.get("wobble_px", 3.0))
         self.orient = spec.get("orient", "upright")
+        self.exit_mode = spec.get("exit")
+        self.glyph_xy = None
         if self.gather + self.disperse > self.dur + 1e-9:
             _err(f"points[{self.index}]（shape）：集まり {self.gather}秒＋散り {self.disperse}秒が区間（{self.dur:.2f}秒）を超えます")
         self.typ = typ
@@ -1274,6 +1330,12 @@ class PointLayer:
                     pad = float(sh.get("pad", 24))
                     x0, y0, x1, y1 = max(x0 - pad, 0.0), max(y0 - pad, 0.0), min(x1 + pad, float(W)), min(y1 + pad, float(H))
                     pts = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float64)
+                    if sh.get("glyph"):
+                        # 字の形に集まる：行の読み字の画素（実行時に描画器が rects の glyph_px に入れる）から、粒の行き先を乱数で取る（字形は割らない）
+                        gp = rc[0].get("glyph_px")
+                        if gp is None or len(gp) == 0:
+                            _err(f"points[{self.index}]：shape.glyph の行{sh['around']} の読み字の画素が取れません")
+                        self.glyph_xy = np.asarray(gp, dtype=np.float64)[r.randint(0, len(gp), n)]
                 else:
                     pts = np.array(sh["points"], dtype=np.float64) * [W, H]
                 xy = pts
@@ -1321,6 +1383,8 @@ class PointLayer:
 
     def _flow(self, u):
         """流れる位置（集まった後。u＝流れ始めてからの秒）と、道の接線の角度（度、画面の向き）"""
+        if self.glyph_xy is not None:
+            return self.glyph_xy[:, 0], self.glyph_xy[:, 1], np.zeros(len(self.glyph_xy)), np.ones(len(self.glyph_xy))
         if self.typ in ("disc", "concentric"):
             th = self.p_th + self.p_om * u
             x = self.cx + self.p_r * np.cos(th)
@@ -1355,12 +1419,19 @@ class PointLayer:
         if self.disperse > 0:
             p = float(np.clip((t - (self.t1 - self.disperse)) / self.disperse, 0.0, 1.0))
             if p > 0:
-                ux, uy = x - self.cx, y - self.cy
-                nrm = np.maximum(np.hypot(ux, uy), 1.0)
-                k = p * p * self.d_dist
-                x = x + ux / nrm * k
-                y = y + uy / nrm * k
-                op = op * (1.0 - p)
+                if self.exit_mode == "doors":
+                    # 観音開き：縦の中心線（画面の中央）で左右に割れ、画面の外へ開く。濃さは落とさない（外へ出て消える）
+                    e_ = float(_smooth(p))
+                    x = x + np.where(x >= W / 2, 1.0, -1.0) * e_ * (W / 2 + 40)
+                elif self.exit_mode == "push":
+                    y = y - float(_smooth(p)) * (H * 0.8)          # 上へ押し出して画面の外へ
+                else:
+                    ux, uy = x - self.cx, y - self.cy
+                    nrm = np.maximum(np.hypot(ux, uy), 1.0)
+                    k = p * p * self.d_dist
+                    x = x + ux / nrm * k
+                    y = y + uy / nrm * k
+                    op = op * (1.0 - p)
         on = (q > 0) & (op > 0)
         if not on.any():
             return None

@@ -274,7 +274,7 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step", "reveal", "bouten"}
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
@@ -292,6 +292,8 @@ LIGHT_BAD_DECOR = ("tape",)                     # 字が暗い色で固定
 LIGHT_BAD_TEXTURES = ("misregister", "long_shadow")   # 色が要る
 MAX_COL_CHARS_RANGE = (2, 16)
 LAND_MODES = ("first_word", "start")
+REVEAL_DIRS = ("up", "down")         # 入りの切り抜き（reveal）の向き：up＝字の枠の下端から持ち上がる、down＝上端から下りる
+REVEAL_SEC = (0.1, 0.6)
 STEP_LEVEL_NAMES = ("s", "m", "l")   # 踏み込みの段階（小・中・大。値は kinetic.STEP_LEVELS）
 COUNTER_STATES = ("hide", "resume", "off")
 COUNTER_KEYS = {"count", "state", "rate", "enter", "break"}
@@ -351,6 +353,12 @@ def _normalize_item(item, allowed, where):
             raise LookError(f"direction: {where} の karaoke_cap は \"word\"（点灯の上限を、声の終わりでなく最後に対応した単語の終わりにする）だけです")
         if name == "step" and v not in STEP_LEVEL_NAMES:
             raise LookError(f"direction: {where} の step（踏み込みの段階）は {', '.join(STEP_LEVEL_NAMES)} のどれかで書いてください")
+        if name == "reveal":
+            if (not isinstance(v, dict) or set(v) != {"dir", "sec"} or v["dir"] not in REVEAL_DIRS or isinstance(v["sec"], bool)
+                    or not isinstance(v["sec"], (int, float)) or not REVEAL_SEC[0] <= v["sec"] <= REVEAL_SEC[1]):
+                raise LookError(f"direction: {where} の reveal は {{\"dir\": {'・'.join(REVEAL_DIRS)} のどちらか, \"sec\": {REVEAL_SEC[0]}〜{REVEAL_SEC[1]} 秒}} で書いてください（入りの切り抜き。字ごとの遅れはなし）")
+        if name == "bouten" and v is not True:
+            raise LookError(f"direction: {where} の bouten は true だけを書けます（karaoke の行で、点灯した字の上に点が灯って残る）")
         if name == "align_to_prev" and v is not True:
             raise LookError(f"direction: {where} の align_to_prev は true だけを書けます（前の行の先頭字の x にそろえる。やめるときは項目ごと消す）")
         if name == "clear_cap" and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.05 <= v <= 0.25):
