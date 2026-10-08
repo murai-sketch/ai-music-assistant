@@ -14,6 +14,14 @@ align.py の自動アライメント結果（_work/<hash>/alignment.json）を�
 --------------------------------------------------------------------------
 使い方:
 
+    0) 曲ノートの末尾に行を足したとき（自動タイミングを作り直さずに、既存の行をそのまま残して足す）:
+        python3 scripts/lyric_video/timing_editor.py append-lines \\
+          --audio /path/to/song.mp3 --song "01_Songs/曲名.md" \\
+          --times "41=190.0-192.5,42=193.0-195.0" \\
+          [--gui-port 8765（編集 GUI が動いていたら止める。0 で確認しない）] \\
+          [--backup-dir 退避の写しの置き場（GUI の整理の外。既定 ~/.erpj-lyric-backup/<音源ハッシュ>/。フォルダ 0700・ファイル 0600）]
+       （先頭がキャッシュの歌詞と一致していること。保存前に alignment.bak-…-before-append.json へ退避する）
+
     1) 現在のアライメントを編集用シートとして書き出す
         python3 scripts/lyric_video/timing_editor.py export \\
           --audio /path/to/song.mp3 --song "01_Songs/曲名.md"
@@ -81,7 +89,9 @@ make_lyric_video.py をキャッシュありのまま再実行すれば
 
 import argparse
 import json
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from align import _audio_hash, WORK_DIR
@@ -396,6 +406,145 @@ def cmd_shift_range(args):
           "render.py側で自動的に扱われます）。")
 
 
+def _gui_running(port):
+    """編集 GUI（既定 8765）が動いているか。動いている間に alignment.json を書くと、GUI の保存と衝突する"""
+    import socket
+
+    if not port:
+        return False
+    with socket.socket() as sk:
+        sk.settimeout(0.5)
+        return sk.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def append_lines(audio_path, song_path, times_spec, gui_port=8765, backup_dir=None):
+    """曲ノートの末尾に足した行を、既存の字幕の行を1バイトも変えずに、指定の時刻で後ろに足す（自動タイミングを作り直さない）。
+    前提（満たさなければ何も書かずに LookError）：①編集 GUI が動いていない（gui_port。0 で確認しない）②キャッシュの lyric_lines が新しいノートの歌詞の
+    先頭と完全に一致（足したのは末尾だけ）③足した行の数と times_spec（"41=開始-終わり,42=…"）の行が同じ（同じ行番号の重複は不可）
+    ④各行は 0 ≦ 開始 ＜ 終わり（有限の数）で昇順、最初の開始は既存の字幕の最後の終わり以降
+    書くもの：書く前に alignment.bak-<日時>-before-append.json（GUI の「バックアップから戻す」に出る名前）を cache_dir に作り、**GUI の整理（30世代で古いものから消す）が
+    消さない場所（backup_dir。既定は ~/.erpj-lyric-backup/<音源ハッシュ>/。_work/ の外なので tidy_work も触らない）にも同じ物を写す**。
+    書き込みは一時ファイル→fsync→読み直して自己確認（既存の行・他のキーがバイト一致、行数）→os.replace（原子的）。どこで失敗しても
+    （例外・ディスクの空き不足・Ctrl-C）、alignment.json は元のまま（壊れた JSON を残さない）で LookError にする。
+    既存の行・words_source はそのまま、足した行は {line, start, end, section, src}、lyric_lines は新しいノートの値、edited: true。
+    戻り値：(足した行数, 全行数, 退避のパス, 外の退避のパス, [(行番号, 区分)])。歌詞の文言は出力に出さない"""
+    import math
+    import os
+
+    from look import LookError
+    from song_note import SongNote
+
+    cache_dir, alignment_path, _ = _cache_paths(audio_path)
+    if not alignment_path.exists():
+        raise LookError(f"{alignment_path} が見つかりません（先に自動タイミングを作ってください）")
+    if _gui_running(gui_port):
+        raise LookError(f"編集 GUI（port {gui_port}）が動いています。GUI を止めてから実行してください（動いている間に書くと、GUI の保存と衝突します）")
+    orig_bytes = alignment_path.read_bytes()
+    cache = json.loads(orig_bytes.decode("utf-8"))
+    note = SongNote(song_path)
+    old, new = cache["lyric_lines"], note.lyric_lines
+    if len(new) <= len(old):
+        raise LookError(f"ノートの行数（{len(new)}）がキャッシュの行数（{len(old)}）より多くありません（足した行がありません）")
+    for i, (a, b) in enumerate(zip(old, new)):
+        if a != b:
+            raise LookError(f"ノートの先頭がキャッシュと一致しません（{i + 1} 行目が違う）。足せるのは末尾だけです。何も書いていません")
+    n_add = len(new) - len(old)
+    times = {}
+    for part in [p.strip() for p in times_spec.split(",") if p.strip()]:
+        try:
+            k, rest = part.split("=")
+            a, b = rest.split("-")
+            k, a, b = int(k), float(a), float(b)
+        except ValueError:
+            raise LookError(f"--times の '{part}' が読めません（'行番号=開始-終わり'）")
+        if k in times:
+            raise LookError(f"--times に行{k}が2回あります（どちらを使うか決められない）")
+        times[k] = (a, b)
+    want = list(range(len(old) + 1, len(new) + 1))
+    if sorted(times) != want:
+        raise LookError(f"--times の行番号が、足した行 {want[0]}〜{want[-1]}（{n_add} 行）と一致しません")
+    prev_end = max([float(r["end"]) for r in cache["alignment"]] + [0.0])
+    for k in want:
+        a, b = times[k]
+        if not (math.isfinite(a) and math.isfinite(b)):
+            raise LookError(f"行{k}：開始・終わりが有限の数ではありません（inf・NaN は不可）")
+        if not (0 <= a < b):
+            raise LookError(f"行{k}：開始 {a} と終わり {b} が、0 ≦ 開始 ＜ 終わり ではありません")
+        if a < prev_end - 1e-9:
+            raise LookError(f"行{k}：開始 {a} が、前の行の終わり {prev_end}（既存の最後か直前の足した行）より前です（重なる）")
+        prev_end = b
+    before_rows = [json.dumps(r, ensure_ascii=False) for r in cache["alignment"]]
+    other_keys = {k: json.dumps(v, ensure_ascii=False) for k, v in cache.items() if k not in ("lyric_lines", "alignment", "edited")}
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = alignment_path.with_name(f"alignment.bak-{stamp}-before-append.json")
+    outside = Path(backup_dir) if backup_dir else Path.home() / ".erpj-lyric-backup" / cache_dir.name
+    outside_backup = outside / backup.name
+    rows = list(cache["alignment"])
+    added = []
+    for k in want:
+        section = note.lyric_sections[k - 1][1]
+        rows.append({"line": new[k - 1], "start": times[k][0], "end": times[k][1], "section": section, "src": k - 1})
+        added.append((k, section))
+    out = dict(cache)
+    out["lyric_lines"] = new
+    out["alignment"] = rows
+    out["edited"] = True
+    tmp = alignment_path.with_name(alignment_path.name + f".tmp-{os.getpid()}")
+    made_backups = []
+    try:
+        # 退避（_work 内と、GUI の整理の外の写し）。写しの途中で失敗したら、書きかけの退避を消して止める。元とバイト一致も確認する
+        outside.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(outside, 0o700)
+        for dest in (backup, outside_backup):
+            made_backups.append(dest)
+            shutil.copy2(alignment_path, dest)
+            if dest.read_bytes() != orig_bytes:
+                raise LookError(f"退避 {dest.name} が元とバイト一致しません。何も書いていません")
+        os.chmod(outside_backup, 0o600)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(out, ensure_ascii=False, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
+        after = json.loads(tmp.read_text(encoding="utf-8"))           # 読み直して自己確認（置き換える前）
+        ok = ([json.dumps(r, ensure_ascii=False) for r in after["alignment"][:len(before_rows)]] == before_rows
+              and len(after["alignment"]) == len(before_rows) + n_add and after == out        # 足した行の中身・edited を含む全体の比較
+              and {k: json.dumps(v, ensure_ascii=False) for k, v in after.items() if k not in ("lyric_lines", "alignment", "edited")} == other_keys)
+        if not ok:
+            raise LookError("書いた内容の自己確認が合いませんでした（既存の行・他の項目が変わった）。置き換えていません")
+        os.replace(tmp, alignment_path)                                 # 原子的に置き換える
+    except BaseException as e:                                          # 例外・ディスクの空き不足・Ctrl-C のどれでも、元のまま残す
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        if alignment_path.read_bytes() != orig_bytes:
+            alignment_path.write_bytes(orig_bytes)
+        for d_ in made_backups:                      # 書きかけ・元と違う退避は消す（正しい退避は残す）
+            try:
+                if d_.exists() and d_.read_bytes() != orig_bytes:
+                    d_.unlink()
+            except OSError:
+                pass
+        if isinstance(e, LookError):
+            raise
+        raise LookError(f"書き込みに失敗しました（{type(e).__name__}）。alignment.json は元のままです")
+    return n_add, len(after["alignment"]), backup, outside_backup, added
+
+
+def cmd_append_lines(args):
+    from look import LookError
+
+    try:
+        n_add, total, backup, outside, added = append_lines(args.audio, args.song, args.times, gui_port=args.gui_port,
+                                                            backup_dir=args.backup_dir)
+    except LookError as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
+    print(f"[DONE] {n_add}行を後ろに足しました（全{total}行。既存の行はそのまま）。区分: "
+          + "、".join(f"{k}行目＝{sec}" for k, sec in added) + f"。退避: {backup.name}（GUI の整理の外にも写し済み: {outside}）")
+
+
 def cmd_scale(args):
     cache_dir, alignment_path, _ = _cache_paths(args.audio)
     cache = _load_cache(alignment_path)
@@ -445,6 +594,18 @@ def main():
     p_scale.add_argument("--factor", type=float, required=True,
                           help="倍率（1.0より大きいと後半が後ろに伸びる）")
 
+    p_append = sub.add_parser(
+        "append-lines", help="曲ノートの末尾に足した行を、既存の字幕の行を変えずに、指定の時刻で後ろに足す"
+    )
+    p_append.add_argument("--audio", required=True)
+    p_append.add_argument("--song", required=True, help="足した行を含む曲ノート（先頭がキャッシュと一致していること）")
+    p_append.add_argument("--gui-port", type=int, default=8765, dest="gui_port",
+                           help="編集 GUI の port。動いていたら止める（0 で確認しない）")
+    p_append.add_argument("--backup-dir", default=None, dest="backup_dir",
+                           help="退避の写しを置く場所（GUI の整理の外。既定 ~/.erpj-lyric-backup/<音源ハッシュ>/）")
+    p_append.add_argument("--times", required=True,
+                           help="足した行の時刻。'41=開始-終わり,42=開始-終わり'（秒。昇順・重ならない）")
+
     p_snap = sub.add_parser(
         "snap-beats", help="各行の開始時刻を最寄りのビート/オンセットにスナップする"
     )
@@ -461,6 +622,7 @@ def main():
         "shift-range": cmd_shift_range,
         "scale": cmd_scale,
         "snap-beats": cmd_snap_beats,
+        "append-lines": cmd_append_lines,
     }[args.command](args)
 
 
