@@ -214,7 +214,13 @@ def find_shorts(alignment, sections=None, beats=None, duration=None,
         for j in range(i, len(spans)):
             if hid[j]:
                 continue             # hidden の行は候補の終わりにしない（長さの上限の判定は次の行へ進める）
-            t1 = min(spans[j][1] + min(TAIL, gap_after(j) + 0.15), total)
+            if all(hid[j + 1:]) and j + 1 < len(spans):
+                t1 = total           # 後ろがすべて hidden の行なら、曲の終わりまで（字幕なしで聞こえる）
+            elif j + 1 < len(spans):
+                # 次の行の頭が一瞬入らないよう、余韻は次の行の開始の手前まで（開始の直後に切らない）
+                t1 = min(spans[j][1] + min(TAIL, max(gap_after(j) - 0.05, 0.0)), total)
+            else:
+                t1 = min(spans[j][1] + min(TAIL, gap_after(j) + 0.15), total)
             length = t1 - t0
             if length < min_sec:
                 continue
