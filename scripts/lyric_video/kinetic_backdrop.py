@@ -8,7 +8,11 @@ direction の backdrops：単色の背景（テーマの配色の背景色・補
   "backdrops": [
     {"image": "<名前>", "mode": "texture",
      "level": [[<時刻>, <値>], ...],        # 質感の強さ。値＝その画像の「明るい側の揺れ（上位5%）」を背景色に何段（0〜255）足すか。区間の外は最初／最後の値
-     "move":  [[<時刻>, <px/秒>], ...]},     # 任意。その時刻からの移動の速さ（正＝下向き、負＝上向き、0＝止める）。上下をつないで繰り返す
+     "move":  [[<時刻>, <px/秒>], ...],      # 任意。その時刻からの移動の速さ（正＝下向き、負＝上向き、0＝止める）。上下をつないで繰り返す
+     "outside": {"zone": [<y0>, <y1>], "ramp": <px>,      # 任意（texture だけ）。字の高さの帯 y0〜y1 の中は level のまま、
+                 "level": [[<時刻>, <値>], ...]}},        # 帯から ramp px かけて、帯の外では level をこの値（同じ意味）へ滑らかに置き換える。
+                                                        # 書いた曲だけに効く（書かなければ出力は変わらない）。帯の中の字の読みやすさは level が決め、
+                                                        # 帯の外（字の無い所）だけ上限を超えて強くできる
     {"image": "<名前>", "mode": "band",
      "level": [[<時刻>, <値>], ...],        # 画像を重ねる最大の割合（0〜1。例 0.3）
      "band":  {"from_y": 1440, "ramp": 260}}   # この高さから下へ、ramp px かけて 0→1 に増える（これより上は重ならない）
@@ -28,7 +32,7 @@ from PIL import Image
 
 W, H = 1080, 1920
 MODES = ("texture", "band")
-ITEM_KEYS = {"image", "mode", "level", "move", "band"}
+ITEM_KEYS = {"image", "mode", "level", "move", "band", "outside"}
 _TIME = re.compile(r"^(start|end):(\d+)([+-]\d+(?:\.\d+)?)?$")
 _EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
@@ -64,7 +68,15 @@ def validate(spec, n_lines, LookError):
         if not isinstance(it, dict) or not set(it) <= ITEM_KEYS or not isinstance(it.get("image"), str) or it.get("mode") not in MODES:
             raise LookError(f"direction: {where} は image（文字列）・mode（{'・'.join(MODES)}）・level と、任意の move・band だけで書いてください")
         if it["mode"] == "texture":
-            _check_keys(it.get("level"), where + ".level", n_lines, LookError, 0, 40)
+            _check_keys(it.get("level"), where + ".level", n_lines, LookError, 0, 80)
+            if "outside" in it:
+                o = it["outside"]
+                z = o.get("zone") if isinstance(o, dict) else None
+                if (not isinstance(o, dict) or set(o) != {"zone", "ramp", "level"} or not isinstance(z, list) or len(z) != 2
+                        or any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in z + [o["ramp"]])
+                        or not 0 <= z[0] < z[1] <= H or o["ramp"] <= 0):
+                    raise LookError(f"direction: {where}.outside は {{\"zone\": [y0, y1], \"ramp\": 幅(px), \"level\": [[時刻, 値], ...]}} で書いてください")
+                _check_keys(o["level"], where + ".outside.level", n_lines, LookError, 0, 80)
             if "move" in it:
                 _check_keys(it["move"], where + ".move", n_lines, LookError, -200, 200)
             if "band" in it:
@@ -77,6 +89,8 @@ def validate(spec, n_lines, LookError):
                 raise LookError(f"direction: {where} の band は {{\"from_y\": 高さ(px), \"ramp\": 増える幅(px)}} で書いてください")
             if "move" in it:
                 raise LookError(f"direction: {where} の move は mode: texture だけに書けます")
+            if "outside" in it:
+                raise LookError(f"direction: {where} の outside は mode: texture だけに書けます")
 
 
 def find_image(name, work_dir):
@@ -126,6 +140,12 @@ class Backdrops:
                     if j + 1 < len(mv):
                         o += v * (mv[j + 1][0] - t0)
                 rec["move_o"] = offs
+                if "outside" in it:
+                    o = it["outside"]
+                    rec["out_level"] = self._keys(o["level"], resolve_line_time, LookError, where=f"backdrops[{i}].outside.level")
+                    d = np.maximum(o["zone"][0] - np.arange(H, dtype=np.float32), np.arange(H, dtype=np.float32) - o["zone"][1])
+                    m = np.clip(d / float(o["ramp"]), 0.0, 1.0)
+                    rec["out_w"] = (m * m * (3 - 2 * m)).astype(np.float32)   # 帯の中 0 → 帯の外 1（smoothstep）
             else:
                 img = np.asarray(_cover(Image.open(path).convert("RGB"), False), dtype=np.float32)
                 y = np.arange(H, dtype=np.float32)
@@ -172,7 +192,8 @@ class Backdrops:
         arr = None
         for rec in self.items:
             lv = self.level_at(rec["level"], t)
-            if lv <= 1e-4:
+            ov = self.level_at(rec["out_level"], t) if "out_level" in rec else 0.0
+            if lv <= 1e-4 and ov <= 1e-4:
                 continue
             if arr is None:
                 arr = np.asarray(frame, dtype=np.float32).copy()
@@ -184,7 +205,11 @@ class Backdrops:
                 fr = o - i0
                 idx = (np.arange(H) - i0) % period
                 rows = tile[idx] * (1 - fr) + tile[(idx - 1) % period] * fr
-                arr += (rows * lv)[:, :, None]
+                if "out_level" in rec:
+                    lv_row = lv * (1 - rec["out_w"]) + ov * rec["out_w"]      # 行ごとの強さ（字の高さの帯の外だけ outside の値へ）
+                    arr += (rows * lv_row[:, None])[:, :, None]
+                else:
+                    arr += (rows * lv)[:, :, None]
             else:
                 arr = arr * (1 - rec["mask"] * lv) + rec["img"] * (rec["mask"] * lv)
         if arr is None:

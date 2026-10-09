@@ -191,14 +191,14 @@
    "text": "#F2F2F2",
    "sub": "#9A9A9A",
    "stroke": "#121212",
-   "accent": "#FF8A5C"
+   "accent": "#F2F2F2"
   },
   "ember_end": {
    "bg": "#0E0E0E",
    "text": "#E6E6E6",
    "sub": "#9A9A9A",
    "stroke": "#0E0E0E",
-   "accent": "#FF8A5C"
+   "accent": "#E6E6E6"
   }
  },
  "default_role": "drift",
