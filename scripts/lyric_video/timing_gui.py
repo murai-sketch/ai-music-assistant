@@ -271,17 +271,19 @@ def _short_candidates(target=30.0, min_sec=None, max_sec=None, limit=5, mode="ho
     sections = sections_for_alignment(alignment, note.lyric_sections)
     style = STYLES[DEFAULT_STYLE]
     spans = None
+    hidden = None
     import look as look_mod
     if look_mod.direction_path(_cache_dir()).exists() or style.get("hold_mode") == "sung_end":
         # 歌い終わりまで残す方式・direction のある曲は、行の終わりをプランの表示の終わりに合わせる（CLI と同じ shorts.plan_spans）
         plan, _rt = _plan_for(alignment, DEFAULT_STYLE)
         spans = shorts_mod.plan_spans(plan, _rt, style)
+        hidden = [bool(c.get("hidden")) for c in plan]
     cands = shorts_mod.find_shorts(
         alignment, sections, _beats(), duration=_get_audio_duration(Path(STATE["audio_path"])),
         target=float(target),
         min_sec=float(min_sec if min_sec is not None else shorts_mod.SHORT_MIN),
         max_sec=float(max_sec if max_sec is not None else shorts_mod.SHORT_MAX),
-        limit=int(limit), max_hold=style.get("max_hold_sec", 2.8), mode=mode, spans=spans,
+        limit=int(limit), max_hold=style.get("max_hold_sec", 2.8), mode=mode, spans=spans, hidden=hidden,
     )
     for c in cands:
         c["line"] = alignment[c["start_row"]]["line"]

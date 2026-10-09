@@ -134,11 +134,14 @@ def plan_spans(plan, rt, style=None):
 
 def find_shorts(alignment, sections=None, beats=None, duration=None,
                 target=DEFAULT_TARGET, min_sec=SHORT_MIN, max_sec=SHORT_MAX,
-                limit=5, max_hold=2.8, mode="hook", spans=None):
+                limit=5, max_hold=2.8, mode="hook", spans=None, hidden=None):
     """切り抜き候補をスコア順に返す。
 
     spans: 行ごとの表示区間 [(開始, 終了)]（kinetic のプランの start／end）。渡すと、行の終わりを max_hold の見積もりでなく
            実際の表示の終わりにする（歌い終わりまで残す方式・direction のある曲）。渡さなければ今までと同じ
+
+    hidden: 行ごとの hidden（真偽の配列。alignment と同じ並び）。hidden の行は字幕に出さないので、候補の始まり・終わりに選ばない
+            （間に挟まるのは構わない。T35 U13 中-2）。渡さなければ今までと同じ
 
     mode: hook（サビ優先・既定）/ scene（情景優先）/ mix（両方）
 
@@ -149,7 +152,7 @@ def find_shorts(alignment, sections=None, beats=None, duration=None,
         # 切り口ごとに点の付け方が違うので、点数順に混ぜると片方だけになる
         # （サビ優先の点は構造的に高く出る）。交互に採って、両方が必ず入るようにする。
         lists = [find_shorts(alignment, sections, beats, duration, target, min_sec,
-                             max_sec, limit, max_hold, mode=m, spans=spans) for m in ("hook", "scene")]
+                             max_sec, limit, max_hold, mode=m, spans=spans, hidden=hidden) for m in ("hook", "scene")]
         out = []
         while len(out) < limit and any(lists):
             for lst in lists:
@@ -166,7 +169,13 @@ def find_shorts(alignment, sections=None, beats=None, duration=None,
         return out
     if mode not in MODES:
         raise ValueError(f"mode は {MODES} のいずれか: {mode!r}")
-    alignment = [r for r in alignment if r.get("start") is not None]
+    keep = [k for k, r in enumerate(alignment) if r.get("start") is not None]
+    hid = [bool(hidden and k < len(hidden) and hidden[k]) for k in keep]
+    if spans is not None and len(spans) == len(alignment) and len(keep) != len(alignment):
+        spans = [spans[k] for k in keep]
+    if sections is not None and len(sections) == len(alignment) and len(keep) != len(alignment):
+        sections = [sections[k] for k in keep]
+    alignment = [alignment[k] for k in keep]
     if len(alignment) < 2:
         return []
     sections = list(sections or [r.get("section") or "" for r in alignment])
@@ -199,8 +208,12 @@ def find_shorts(alignment, sections=None, beats=None, duration=None,
 
     cands = []
     for i in range(len(spans)):
+        if hid[i]:
+            continue                 # hidden の行は候補の始まりにしない
         t0 = max(_snap(spans[i][0] - LEAD_IN, beats), 0.0)
         for j in range(i, len(spans)):
+            if hid[j]:
+                continue             # hidden の行は候補の終わりにしない（長さの上限の判定は次の行へ進める）
             t1 = min(spans[j][1] + min(TAIL, gap_after(j) + 0.15), total)
             length = t1 - t0
             if length < min_sec:

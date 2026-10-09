@@ -263,6 +263,7 @@ def main():
                 limit=max(args.short_count, 1), max_hold=style.get("max_hold_sec", 2.8),
                 mode=args.short_mode,
                 spans=shorts.plan_spans(plan, rt, style),
+                hidden=[bool(c.get("hidden")) for c in plan],
             )
             mode_ja = {"hook": "サビ頭から", "scene": "情景・心情の場面", "mix": "サビと情景の両方"}
             print(f"[4/4] ショート候補（{mode_ja[args.short_mode]} / 目安 {args.short_sec:.0f}秒 / {lo}〜{hi}秒）:")
