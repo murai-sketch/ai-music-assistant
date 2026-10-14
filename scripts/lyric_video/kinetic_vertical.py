@@ -210,16 +210,16 @@ def arrange(chars, mid, max_col, height, cap, min_px, forced=None, usable_w=None
                 why = (f"「{chars[a]}」は段の頭に置けない" if chars[a] in NO_START else
                        f"「{chars[a - 1]}」は段の末尾に置けない" if chars[a - 1] in NO_END else
                        "縦中横・数字や!?の連なり・「……」の途中は切れない")
-                raise LookError(f"縦組み: break_after で指定した段の切れ目（{a}字目の前）が禁則に当たります（{why}）。"
-                                f"break_after を 1 字ずらしてください。黙って動かさず止めました")
+                raise LookError(f"縦組み: break_after／col_lengths で指定した段の切れ目（{a}字目の前）が禁則に当たります（{why}）。"
+                                f"break_after／col_lengths を 1 字ずらしてください。黙って動かさず止めました")
         for a, b in cols:
             if col_len(chars, w, a, b) > max_col:
-                raise LookError(f"縦組み: break_after で指定した段（{b - a}字）が 1段の上限 {max_col}字を超えます。"
-                                f"break_after か max_col_chars を見直してください。黙って動かさず止めました")
+                raise LookError(f"縦組み: break_after／col_lengths で指定した段（{b - a}字）が 1段の上限 {max_col}字を超えます。"
+                                f"break_after／col_lengths か max_col_chars を見直してください。黙って動かさず止めました")
         size = size_for(chars, cols, height, cap, usable_w)
         if size < min_px:
             raise LookError(f"縦組み: 指定した段（{len(cols)}段）では字が {size}px になり、下限 {min_px}px を割ります。"
-                            f"break_after・max_px・min_px を見直してください。黙って縮めず止めました")
+                            f"break_after／col_lengths・max_px・min_px を見直してください。黙って縮めず止めました")
         return [chars[a:b] for a, b in cols], size
     first = choose_columns(chars, mid, max_col)
     if first is None:

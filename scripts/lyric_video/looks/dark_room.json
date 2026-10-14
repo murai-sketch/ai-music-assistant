@@ -1,0 +1,47 @@
+{
+ "look": "dark_room",
+ "fonts": {
+  "letter_body": {
+   "family": "Klee",
+   "style": "Demibold",
+   "index": 0,
+   "fallback_path": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/81e879dcb4d596ab140f7cffcd5ccaaf8108519b.asset/AssetData/Klee.ttc",
+   "tracking": 0.0,
+   "leading": 1.12,
+   "min_px": 86,
+   "max_px": 86
+  }
+ },
+ "palettes": {
+  "body": {
+   "bg": "#111111",
+   "text": "#CACACA",
+   "stroke": "#111111",
+   "sub": "#929292",
+   "accent": "#CACACA"
+  },
+  "deep": {
+   "bg": "#111111",
+   "text": "#DCDCDC",
+   "stroke": "#111111",
+   "sub": "#929292",
+   "accent": "#DCDCDC"
+  },
+  "key": {
+   "bg": "#111111",
+   "text": "#EEEEEE",
+   "stroke": "#111111",
+   "sub": "#929292",
+   "accent": "#EEEEEE"
+  }
+ },
+ "default_role": "letter_body",
+ "default_palette": "body",
+ "layout": {
+  "text_width": 816
+ },
+ "texture": {
+  "paper": "plain",
+  "bg_image": false
+ }
+}

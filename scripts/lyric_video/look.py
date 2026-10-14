@@ -274,15 +274,34 @@ def direction_path(cache_dir):
 LINE_ITEM_KEYS = {"voice", "tail", "end", "exit", "entrance", "layout", "hold", "decor",
                   "role", "palette", "accent", "max_px", "tracking",
                   "impact", "land", "karaoke_land", "counter", "solo", "break_after", "min_px", "max_col_chars", "ink", "text_y",
-                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step", "reveal", "bouten", "karaoke_at", "rule_in", "keep_rows"}
+                  "carry", "accent_rows", "row_roles", "row_lengths", "clear_cap", "karaoke_cap", "align_to_prev", "hidden", "step", "reveal", "bouten", "karaoke_at", "rule_in", "keep_rows",
+                  "col_lengths", "soak", "hold_amp", "hold_hz"}   # soak：歌っている行の染み込み（T39 回2）／hold_amp・hold_hz：hold: breathe の振幅と周期。col_lengths：縦組みの列の字数を直接指定（単一の句が12字を超える行は、組み立て前の段が自動の折りで決まるため break_after では指定できない）
 ACCENT_MODES = ("none", "key_word", "fill", "outline", "glow", "rows")   # rows：accent_rows の段だけ差し色（T35 L1）
 ITEM_ALIASES = {"tail_sec": "tail"}
 VOICE_ITEM_KEYS = {"role", "tail", "palette"}
 DIRECTION_TOP_KEYS = {"n_lines", "voices", "lines", "look", "key_word", "bg_transitions",
-                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack", "safe_area", "halftone", "backdrops"}
+                      "impacts", "slam_voice", "karaoke", "counter", "interludes", "vertical", "points", "stack", "page", "safe_area", "halftone", "backdrops"}
 CARRY_DIRS = ("down", "up")          # carry（行全体を一定の速さで動かす保持）の向き
 CARRY_KEYS = {"px_s", "dir"}
 STACK_KEYS = {"lines", "dim", "clear_at_line"}   # stack（前の列を残して薄くする）
+STACK_OPTIONAL_KEYS = {"right", "gap"}           # right：最初の行の右端の x（px。指定すると列を右端そろえで左へ並べる）、gap：行と行の間（px。right のときだけ）
+STACK_END = "end"                                # clear_at_line の値：曲の終わりまで残す（最後の字幕に出す行を含む stack だけ）
+PAGE_TOP_KEYS = {"right", "gap", "groups", "back"}       # page（送り。次の行の開始で、前の行を右へ1行分送る）
+PAGE_GROUP_KEYS = {"lines", "keep", "dims"}      # 必須
+PAGE_GROUP_OPTIONAL_KEYS = {"fade", "shift_sec", "out", "readable", "clear", "enter", "focus", "trace", "soak", "pull"}
+PULL_KEYS = {"at_line", "back", "sec"}            # 引き戻し（T40 S3）：at_line を歌い始めて送られた前の行が、送りきってから gap の back 割だけ左へ戻る
+SOAK_KEYS = {"from", "sec", "r_max", "opacity"}   # 染み込み（歌っている行の項目 soak）。from＝行の開始からの秒。page の group の soak は from が "stop"（薄れが止まった時刻から）
+BACK_KEYS = {"from_group", "at_line", "blur", "opacity"}              # 裏写り（C2。T39 回3）：必須
+BACK_OPTIONAL_KEYS = {"until_line", "sec"}                          # until_line：その行の開始から sec 秒で 0 へ。sec：立ち上がり・消えの秒（既定 2.25）
+BACK_BLUR_MAX = 12.0                                                # 裏写りのぼけの半径の上限（px）
+BACK_OPACITY_MAX = 0.3                                              # 裏写りの不透明度の上限（歌っている行の外は、この値までしか許さない）
+SOAK_R_MAX = 30.0                                  # 暈の最終の半径の上限（px）
+SOAK_OPACITY_MAX = 0.3                             # 暈の最終の不透明度の上限
+HOLD_AMP_MAX = 0.1                                 # breathe の振幅の上限（±の割合）
+HOLD_HZ_RANGE = (0.05, 3.0)                        # breathe の周期の指定（Hz）
+PAGE_CLEAR_FROM = ("start", "sung_end")         # clear を行番号の基準で書くときの起点：その行の開始／歌い終わり
+PAGE_OUT_MODES = ("fade", "slide")               # keep を越えた行の消え方：fade＝右へ1行分送られながら 0 へ／slide＝薄れずに画面の外へ出きるまで
+PAGE_ENTER_MAX_SEC = 0.3                         # 歌っている行の入り（delay＋sec）の上限（設計書 §5-1：入りは 0.3 秒以内）
 VERTICAL_KEYS = {"height", "top", "kana_shift"}   # kana_shift: 小書きの仮名を右上へ寄せる量（字の大きさの割合。既定 0＝寄せない）
 import kinetic_vertical as _kv   # noqa: E402（定数だけ。kinetic_vertical は look を遅延 import するので循環しない）
 
@@ -487,17 +506,21 @@ def _validate_safe_area(sa):
 
 
 def _validate_stack(stack, n_lines, by_line, theme):
-    """stack：前の列を残して薄くする。[{"lines": [最初の行, 最後の行], "dim": 0〜1（残した列の不透明度）, "clear_at_line": 全部消す行}]。
+    """stack：前の列を残して薄くする。[{"lines": [最初の行, 最後の行], "dim": 0〜1（残した列の不透明度）, "clear_at_line": 全部消す行 か "end"（曲の終わりまで）}]。
+    任意：right（最初の行の右端の x。指定すると列を右端そろえで左へ並べる）・gap（行と行の間 px。right のときだけ）。
     積む行はすべて layout: vertical（exit は swap のみ）。区間（最初の行〜消す行の手前）は重ねない。残した列の比は kinetic 側（テーマの配色）で検査する"""
     if not isinstance(stack, list) or not stack:
-        raise LookError('direction: stack は [{"lines": [a, b], "dim": 不透明度, "clear_at_line": N}] の形で書いてください')
+        raise LookError('direction: stack は [{"lines": [a, b], "dim": 不透明度, "clear_at_line": N か "end"}] の形で書いてください')
     if theme is None:
         raise LookError("direction: stack はテーマを使う曲でだけ使えます（残した列の比をテーマの配色から検査する）")
     spans = []
+    hid = hidden_lines(by_line)
+    last_shown = max((k for k in range(1, n_lines + 1) if k not in hid), default=0)
     for i, st in enumerate(stack):
         where = f"stack[{i}]"
-        if not isinstance(st, dict) or set(st) != STACK_KEYS:
-            raise LookError(f"direction: {where} は {', '.join(sorted(STACK_KEYS))} をすべて書いたオブジェクトで書いてください")
+        if not isinstance(st, dict) or not STACK_KEYS <= set(st) <= STACK_KEYS | STACK_OPTIONAL_KEYS:
+            raise LookError(f"direction: {where} は {', '.join(sorted(STACK_KEYS))} をすべて書いたオブジェクトで書いてください"
+                            f"（任意：{', '.join(sorted(STACK_OPTIONAL_KEYS))}）")
         ln = st["lines"]
         if (not isinstance(ln, list) or len(ln) != 2 or any(isinstance(x, bool) or not isinstance(x, int) for x in ln)
                 or not 1 <= ln[0] < ln[1] <= n_lines):
@@ -506,10 +529,21 @@ def _validate_stack(stack, n_lines, by_line, theme):
         if isinstance(dim, bool) or not isinstance(dim, (int, float)) or not 0 < dim < 1:
             raise LookError(f"direction: {where}.dim は 0 より大きく 1 より小さい数値で書いてください")
         n = st["clear_at_line"]
-        if isinstance(n, bool) or not isinstance(n, int) or n != ln[1] + 1 or n > n_lines:
-            raise LookError(f"direction: {where}.clear_at_line は、最後の行の次の行（{ln[1] + 1}。{n_lines} 以下）だけ書けます（間に積まない行を挟むと、重なる・列が早く消える）")
-        hid = hidden_lines(by_line)
-        if n in hid or any(k in hid for k in range(ln[0], ln[1] + 1)):
+        if n == STACK_END:
+            if ln[1] != last_shown:
+                raise LookError(f"direction: {where}.clear_at_line が \"{STACK_END}\"（曲の終わりまで残す）のときは、lines の最後が最後の字幕に出す行（行{last_shown}）でなければなりません"
+                                f"（書いたのは行{ln[1]}。途中の行までなら、次の行の番号を書いてください）")
+            n = n_lines + 1      # 区間の重なりの検査のために、曲の終わり＝最後の行の次
+        elif isinstance(n, bool) or not isinstance(n, int) or n != ln[1] + 1 or n > n_lines:
+            raise LookError(f"direction: {where}.clear_at_line は、最後の行の次の行（{ln[1] + 1}。{n_lines} 以下）か \"{STACK_END}\"（曲の終わりまで）だけ書けます（間に積まない行を挟むと、重なる・列が早く消える）")
+        for key in ("right", "gap"):
+            if key in st and (isinstance(st[key], bool) or not isinstance(st[key], (int, float)) or not math.isfinite(st[key]) or st[key] < 0):
+                raise LookError(f"direction: {where}.{key} は 0 以上の有限の数値（px）で書いてください")
+        if "gap" in st and "right" not in st:
+            raise LookError(f"direction: {where}.gap は right（右端そろえ）と一緒に書いてください（効かない値を残さない）")
+        if "right" in st and not 0 < st["right"] <= 1080:
+            raise LookError(f"direction: {where}.right は画面の中（0〜1080）で書いてください")
+        if (n <= n_lines and n in hid) or any(k in hid for k in range(ln[0], ln[1] + 1)):
             raise LookError(f"direction: {where} の lines／clear_at_line に字幕に出さない行（hidden）があります（行の表示の終わりが無いので、残した列の区間が決まりません）")
         for k in range(ln[0], ln[1] + 1):
             it = by_line.get(k, {})
@@ -522,6 +556,202 @@ def _validate_stack(stack, n_lines, by_line, theme):
     for (a0, n0, w0), (a1, _n1, w1) in zip(spans, spans[1:]):
         if a1 < n0:
             raise LookError(f"direction: {w0} と {w1} の区間（最初の行〜消す行の手前）が重なっています")
+
+
+def _check_soak(soak, where, group=False):
+    """染み込み（soak）の指定の検査。歌っている行：{"from": 行の開始からの秒, "sec", "r_max"（px）, "opacity"}。page の group：from は "stop" だけ"""
+    if not isinstance(soak, dict) or set(soak) != SOAK_KEYS:
+        frm = '"stop"' if group else "秒"
+        raise LookError(f'direction: {where} の soak は {{"from": {frm}, "sec": 秒, "r_max": px, "opacity": 0〜{SOAK_OPACITY_MAX}}} の形で書いてください')
+
+    def _num(v):
+        return not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+
+    if group:
+        if soak["from"] != "stop":
+            raise LookError(f'direction: {where} の soak.from は "stop"（薄れが止まった時刻から。fade が無い group は送りが終わった時刻から）だけ書けます')
+    elif not _num(soak["from"]) or soak["from"] < 0:
+        raise LookError(f"direction: {where} の soak.from は 0 以上の秒数（行の開始から）で書いてください")
+    if not _num(soak["sec"]) or not 0 < soak["sec"] <= 60:
+        raise LookError(f"direction: {where} の soak.sec は 0 より大きく 60 以下の秒数で書いてください")
+    if not _num(soak["r_max"]) or not 0 < soak["r_max"] <= SOAK_R_MAX:
+        raise LookError(f"direction: {where} の soak.r_max は 0 より大きく {SOAK_R_MAX:g} 以下（px）で書いてください")
+    if not _num(soak["opacity"]) or not 0 < soak["opacity"] <= SOAK_OPACITY_MAX:
+        raise LookError(f"direction: {where} の soak.opacity は 0 より大きく {SOAK_OPACITY_MAX} 以下で書いてください")
+
+
+def _validate_page(page, n_lines, by_line, direction, theme):
+    """page（送り。U1）：歌っている行の右端を right にそろえ、次の行の開始で前の行を右へ1行分送り、濃さを落とす。
+    {"right": 歌っている行の右端の x（px）, "gap": 行と行の間（px）, "groups": [{"lines": [a, b], "keep": 1|2, "dims": [送られた直後の不透明度…], ...}]}。
+    group の lines は「前の行を送って見せる行」の範囲（行 a−1 は a の前の行として見える。a は 2 以上）。範囲に入らない行は前の行を持たない（その行だけ）。
+    任意：fade {"to": […], "sec"}（送られた後、sec 秒かけて dims → to）／shift_sec（送りにかける秒。既定 0.35）／out（fade|slide）／
+    readable（送られた行を読める濃さに保つ。比 4.5 以上を描画側で検査）／clear {"after_line": group の最後の行, "from": "start"|"sung_end", "sec"}（行番号の基準。その行の開始／歌い終わりから sec 秒かけて送られた行を位置のまま 0 へ。
+    秒で書く {"at", "sec"} も残るが、at が group の最後の行の開始〜表示の終わりに入らなければ描画側で止める）／
+    enter {"delay", "sec"}（歌っている行の不透明度の立ち上がり。合わせて 0.3 秒以内）／
+    focus {"r_max"}（送られた行を薄れの進みに合わせてぼかす。字の大きさの割合）／trace {"amp"}（インクが 0 になる group で、字の形の紙のくぼみ＝明暗の差 amp/255 が薄れの進みに合わせて現れる）。
+    back [{"from_group", "at_line", "blur", "opacity", "until_line", "sec"}]（裏写り C2：group の紙面を左右反転・ぼけ・ごく薄く、背景のすぐ上に。T39 回3）。
+    stack・点の層・カウンター・網点とは一緒に使わない（点の層・カウンターの空けは送られた行の動いた位置を知らない）。値の意味は動き §2・§9"""
+    if theme is None:
+        raise LookError("direction: page はテーマを使う曲でだけ使えます（送られた行の比をテーマの配色から検査する）")
+    if not isinstance(page, dict) or set(page) - PAGE_TOP_KEYS or not {"right", "groups"} <= set(page):
+        raise LookError('direction: page は {"right": x, "gap": px（任意）, "groups": [...]} の形で書いてください')
+    for key in ("right", "gap"):
+        if key in page and (isinstance(page[key], bool) or not isinstance(page[key], (int, float)) or not math.isfinite(page[key]) or page[key] < 0):
+            raise LookError(f"direction: page.{key} は 0 以上の有限の数値（px）で書いてください")
+    if not 0 < page["right"] <= 1080:
+        raise LookError("direction: page.right は画面の中（0〜1080）で書いてください")
+    groups = page["groups"]
+    if not isinstance(groups, list) or not groups:
+        raise LookError("direction: page.groups は空でない配列で書いてください")
+    for other in ("points", "counter", "halftone"):
+        if direction.get(other) is not None:
+            raise LookError(f"direction: page は {other} と一緒に使えません（{other} の空けが、送られた行の動いた位置を知らない）")
+    if any(it.get("counter") is not None for it in by_line.values()):
+        raise LookError("direction: page は行の counter と一緒に使えません")
+    hid = hidden_lines(by_line)
+    spans = []
+    for gi, g in enumerate(groups):
+        where = f"page.groups[{gi}]"
+        if not isinstance(g, dict) or not PAGE_GROUP_KEYS <= set(g) <= PAGE_GROUP_KEYS | PAGE_GROUP_OPTIONAL_KEYS:
+            raise LookError(f"direction: {where} は {', '.join(sorted(PAGE_GROUP_KEYS))} を書いたオブジェクトで書いてください（任意：{', '.join(sorted(PAGE_GROUP_OPTIONAL_KEYS))}）")
+        ln = g["lines"]
+        if (not isinstance(ln, list) or len(ln) != 2 or any(isinstance(x, bool) or not isinstance(x, int) for x in ln)
+                or not 2 <= ln[0] <= ln[1] <= n_lines):
+            raise LookError(f"direction: {where}.lines は [最初の行, 最後の行]（2〜{n_lines} の整数で、最初 ≦ 最後。最初の行の前の行が送られた行として見える）で書いてください")
+        keep = g["keep"]
+        if isinstance(keep, bool) or keep not in (1, 2):
+            raise LookError(f"direction: {where}.keep は 1 か 2（送られた行を残す数）で書いてください")
+
+        def _alphas(v, name, lo_open=True):
+            if (not isinstance(v, list) or len(v) != keep
+                    or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or not (0 < x <= 1 if lo_open else 0 <= x <= 1) for x in v)):
+                raise LookError(f"direction: {where}.{name} は keep（{keep}）個の不透明度の配列で書いてください（{'0 より大きく' if lo_open else '0 以上'} 1 以下）")
+
+        _alphas(g["dims"], "dims")
+        fade = g.get("fade")
+        if fade is not None:
+            if not isinstance(fade, dict) or set(fade) != {"to", "sec"}:
+                raise LookError(f'direction: {where}.fade は {{"to": […], "sec": 秒}} の形で書いてください')
+            _alphas(fade["to"], "fade.to", lo_open=False)
+            if isinstance(fade["sec"], bool) or not isinstance(fade["sec"], (int, float)) or not 0 < fade["sec"] <= 30:
+                raise LookError(f"direction: {where}.fade.sec は 0 より大きく 30 以下の秒数で書いてください")
+        ss = g.get("shift_sec", 0.35)
+        if isinstance(ss, bool) or not isinstance(ss, (int, float)) or not 0 <= ss <= 5:
+            raise LookError(f"direction: {where}.shift_sec は 0〜5 の秒数で書いてください")
+        if g.get("out", "fade") not in PAGE_OUT_MODES:
+            raise LookError(f"direction: {where}.out は {', '.join(PAGE_OUT_MODES)} のどちらかで書いてください")
+        if "readable" in g and not isinstance(g["readable"], bool):
+            raise LookError(f"direction: {where}.readable は true か false で書いてください")
+        cl = g.get("clear")
+        if cl is not None:
+            if isinstance(cl, dict) and set(cl) == {"after_line", "from", "sec"}:
+                # 行番号の基準（alignment の時刻を直しても付いてくる）。その group の最後の行の、開始（start）か歌い終わり（sung_end）から
+                al = cl["after_line"]
+                if isinstance(al, bool) or not isinstance(al, int) or al != ln[1]:
+                    raise LookError(f"direction: {where}.clear.after_line は、その group の最後の行（{ln[1]}）の行番号で書いてください"
+                                    f"（それより前の行を指すと、group の以後の行で送られた行が黙って消える）")
+                if cl["from"] not in PAGE_CLEAR_FROM:
+                    raise LookError(f"direction: {where}.clear.from は {', '.join(PAGE_CLEAR_FROM)} のどちらかで書いてください")
+                if isinstance(cl["sec"], bool) or not isinstance(cl["sec"], (int, float)) or not math.isfinite(cl["sec"]) or cl["sec"] <= 0:
+                    raise LookError(f"direction: {where}.clear.sec は 0 より大きい有限の秒数で書いてください")
+            elif (not isinstance(cl, dict) or set(cl) != {"at", "sec"} or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in cl.values())
+                    or cl["at"] < 0 or cl["sec"] <= 0):
+                raise LookError(f'direction: {where}.clear は {{"after_line": 行番号, "from": "start"|"sung_end", "sec": 秒}}（行番号の基準。推奨）か '
+                                f'{{"at": 秒（0 以上）, "sec": 秒（0 より大きい）}} の形で書いてください')
+        foc, trc = g.get("focus"), g.get("trace")
+        if foc is not None or trc is not None:
+            # 行の形の画像から描く（T39）。薄れの進み（fade）が要る。跡はインクが 0 になる group だけ。keep 1 だけ（2行前の扱いは未定）
+            if fade is None:
+                raise LookError(f"direction: {where} の focus・trace は fade（薄れの進み）が要ります")
+            if keep != 1:
+                raise LookError(f"direction: {where} の focus・trace は keep が 1 の group だけに書けます")
+        if foc is not None:
+            if (not isinstance(foc, dict) or set(foc) != {"r_max"} or isinstance(foc["r_max"], bool)
+                    or not isinstance(foc["r_max"], (int, float)) or not math.isfinite(foc["r_max"]) or not 0 < foc["r_max"] <= 0.25):
+                raise LookError(f'direction: {where}.focus は {{"r_max": 字の大きさに対する割合（0 より大きく 0.25 以下）}} の形で書いてください')
+        if trc is not None:
+            if (not isinstance(trc, dict) or set(trc) != {"amp"} or isinstance(trc["amp"], bool)
+                    or not isinstance(trc["amp"], (int, float)) or not math.isfinite(trc["amp"]) or not 0 < trc["amp"] <= 20):
+                raise LookError(f'direction: {where}.trace は {{"amp": 紙の明暗の差（/255。0 より大きく 20 以下）}} の形で書いてください')
+            if any(x != 0 for x in fade["to"]):
+                raise LookError(f"direction: {where} の trace は、インクが 0 になる group（fade.to がすべて 0）だけに書けます（インクが残る行に跡を足さない）")
+        if g.get("soak") is not None:
+            # 送られた行の染み込み（T39 回2）。インクが残る group だけ（trace はインクが 0 になる group なので一緒に使えない）。keep 1 だけ
+            _check_soak(g["soak"], f"{where}", group=True)
+            if trc is not None:
+                raise LookError(f"direction: {where} の soak は trace と一緒に書けません（trace はインクが 0 になる group、soak はインクが残る行に掛ける）")
+            if fade is not None and all(x == 0 for x in fade["to"]):
+                raise LookError(f"direction: {where} の soak は、インクが 0 になる group（fade.to がすべて 0）には書けません（染み込ませる字が残らない）")
+        pl = g.get("pull")
+        if pl is not None:
+            # 引き戻し（T40 S3）。at_line＝送りが戻る行（その行を歌い始めると前の行が送られる。group の範囲内）
+            if (not isinstance(pl, dict) or set(pl) != PULL_KEYS or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in pl.values())
+                    or pl["at_line"] != int(pl["at_line"]) or not ln[0] <= pl["at_line"] <= ln[1] or not 0 < pl["back"] <= 0.8 or not 0.1 <= pl["sec"] <= 5):
+                raise LookError(f'direction: {where}.pull は {{"at_line": group の範囲の行, "back": 行と行の空き（gap）に対する戻す割合（0 より大きく 0.8 以下）, "sec": 戻す秒（0.1〜5）}} の形で書いてください')
+        en = g.get("enter")
+        if en is not None:
+            if (not isinstance(en, dict) or set(en) != {"delay", "sec"} or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in en.values())
+                    or en["delay"] < 0 or en["sec"] <= 0 or en["delay"] + en["sec"] > PAGE_ENTER_MAX_SEC + 1e-9):
+                raise LookError(f'direction: {where}.enter は {{"delay": 秒, "sec": 秒}}（合わせて {PAGE_ENTER_MAX_SEC} 秒以内。入りは 0.3 秒以内）で書いてください')
+        for k in range(ln[0] - 1, ln[1] + 1):
+            it = by_line.get(k, {})
+            if k in hid:
+                raise LookError(f"direction: {where} の行{k} は字幕に出さない行（hidden）です（送りの区間が決まりません）")
+            if it.get("layout") != "vertical":
+                raise LookError(f"direction: {where} の行{k} は layout: vertical ではありません（page は縦組みの行だけ）")
+            if it.get("exit", "swap") != "swap":
+                raise LookError(f"direction: {where} の行{k} の exit は swap だけです（送られる行は消え方の動きを持たない）")
+        spans.append((ln[0], ln[1], where))
+    spans.sort()
+    for (a0, b0, w0), (a1, _b1, w1) in zip(spans, spans[1:]):
+        if a1 <= b0:
+            raise LookError(f"direction: {w0} と {w1} の行の範囲が重なっています")
+    if page.get("back") is not None:
+        _check_back(page["back"], groups, n_lines, hid)
+    stack = direction.get("stack") or []
+    for st in stack:
+        s_lo = st["lines"][0]
+        s_hi = n_lines if st.get("clear_at_line") == STACK_END else st["clear_at_line"] - 1
+        for a, b, w in spans:
+            if a - 1 <= s_hi and s_lo <= b:
+                raise LookError(f"direction: page の {w}（行{a - 1}〜{b}）と stack（行{s_lo}〜{s_hi}）の行が重なっています")
+
+
+def _check_back(back, groups, n_lines, hid):
+    """page.back（裏写り。T39 回3）：[{"from_group": group の番号（0 始まり）, "at_line": 切れ目の行（その group の最後の行より後。この行の開始で現れる）,
+    "blur": px, "opacity": 0〜BACK_OPACITY_MAX, "until_line": その行の開始から消え始める（任意。無ければ曲の終わりまで）, "sec": 立ち上がり・消えの秒（任意、既定 2.25）}]。
+    group の行の並び（紙面）を、左右反転・ぼけ・ごく薄く、背景のすぐ上に出す。歌っている行のまわりは描画側で不透明度を弱める。同時に 2 枚は出さない"""
+    if not isinstance(back, list) or not back:
+        raise LookError("direction: page.back は空でない配列で書いてください")
+    prev_until = None
+    for bi, it in enumerate(back):
+        where = f"page.back[{bi}]"
+        if not isinstance(it, dict) or not BACK_KEYS <= set(it) <= BACK_KEYS | BACK_OPTIONAL_KEYS:
+            raise LookError(f"direction: {where} は {', '.join(sorted(BACK_KEYS))} を書いたオブジェクトで書いてください（任意：{', '.join(sorted(BACK_OPTIONAL_KEYS))}）")
+        gi = it["from_group"]
+        if isinstance(gi, bool) or not isinstance(gi, int) or not 0 <= gi < len(groups):
+            raise LookError(f"direction: {where}.from_group は page.groups の番号（0〜{len(groups) - 1}）で書いてください")
+        last = groups[gi]["lines"][1]
+        al = it["at_line"]
+        if isinstance(al, bool) or not isinstance(al, int) or not last < al <= n_lines:
+            raise LookError(f"direction: {where}.at_line は、その group の最後の行（{last}）より後で、{n_lines} 以下の行番号で書いてください")
+        if al in hid:
+            raise LookError(f"direction: {where}.at_line の行{al}は字幕に出さない行（hidden）です")
+        for key, hi in (("blur", BACK_BLUR_MAX), ("opacity", BACK_OPACITY_MAX)):
+            v = it[key]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 < v <= hi:
+                raise LookError(f"direction: {where}.{key} は 0 より大きく {hi:g} 以下の数値で書いてください")
+        sec = it.get("sec", 2.25)
+        if isinstance(sec, bool) or not isinstance(sec, (int, float)) or not math.isfinite(sec) or not 0 < sec <= 10:
+            raise LookError(f"direction: {where}.sec は 0 より大きく 10 以下の秒数で書いてください")
+        ul = it.get("until_line")
+        if ul is not None and (isinstance(ul, bool) or not isinstance(ul, int) or not al < ul <= n_lines or ul in hid):
+            raise LookError(f"direction: {where}.until_line は at_line（{al}）より後で {n_lines} 以下の、字幕に出す行の番号で書いてください")
+        if prev_until is not None and al < prev_until:
+            raise LookError(f"direction: {where}.at_line が、前の裏写りの until_line（{prev_until}）より前です（同時に 2 枚は出さない）")
+        if ul is None and bi < len(back) - 1:
+            raise LookError(f"direction: {where} に until_line がありません（次の裏写りがあるので、いつまで残すか書いてください）")
+        prev_until = ul
 
 
 def hidden_lines(by_line):
@@ -596,12 +826,34 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
 
             if item["decor"] not in kinetic_fx.DECOR_NAMES:
                 raise LookError(f"direction: 行{n} の decor '{item['decor']}' は未対応です（{', '.join(kinetic_fx.DECOR_NAMES)}）")
+        if item.get("col_lengths") is not None:
+            cl_ = item["col_lengths"]
+            if item.get("layout") != "vertical":
+                raise LookError(f"direction: 行{n} の col_lengths は layout: vertical の行だけに書けます")
+            if not isinstance(cl_, list) or not cl_ or any(isinstance(x, bool) or not isinstance(x, int) or x < 1 for x in cl_):
+                raise LookError(f"direction: 行{n} の col_lengths は、1 以上の整数の配列（列ごとの字数）で書いてください")
+            if item.get("break_after") is not None or item.get("keep_rows"):
+                raise LookError(f"direction: 行{n} の col_lengths は break_after・keep_rows と一緒に書けません（列の切り方は1つだけ）")
         if item.get("max_col_chars") is not None and item.get("layout") != "vertical":
             raise LookError(f"direction: 行{n} の max_col_chars は layout: vertical の行だけに書けます")
         if item.get("layout") == "vertical":
             if item.get("entrance", "cut") not in VERTICAL_ENTRANCES:
                 raise LookError(f"direction: 行{n} は縦組みですが、入り '{item.get('entrance')}' は縦組みでは使えません"
                                 f"（使える入り: {', '.join(VERTICAL_ENTRANCES)}）。横向きの動き・slam は止めました")
+        for hk in ("hold_amp", "hold_hz"):
+            if item.get(hk) is not None:
+                v_ = item[hk]
+                lo, hi = (0.0, HOLD_AMP_MAX) if hk == "hold_amp" else HOLD_HZ_RANGE
+                if item.get("hold") != "breathe":
+                    raise LookError(f"direction: 行{n} の {hk} は hold: breathe の行だけに書けます")
+                if isinstance(v_, bool) or not isinstance(v_, (int, float)) or not math.isfinite(v_) or not lo < v_ <= hi:
+                    raise LookError(f"direction: 行{n} の {hk} は {lo:g} より大きく {hi:g} 以下の数値で書いてください")
+        if item.get("soak") is not None:
+            _check_soak(item["soak"], f"行{n}")
+            if theme is None:
+                raise LookError(f"direction: 行{n} の soak はテーマを使う曲でだけ使えます（紙の地かを配色から検査する）")
+            if item.get("hold") is not None:
+                raise LookError(f"direction: 行{n} の soak は hold と一緒に書けません（暈が動かない字の周りで、字だけが動く）")
         if (item.get("hold") == "carry") != (item.get("carry") is not None):
             raise LookError(f"direction: 行{n} の carry は hold: carry の行だけに書けます（hold: carry には carry の指定が要ります）")
         if item.get("hold") == "carry":
@@ -631,6 +883,8 @@ def validate_direction(direction, n_lines, vdefaults, theme=None):
         _validate_safe_area(direction["safe_area"])
     if direction.get("stack") is not None:
         _validate_stack(direction["stack"], n_lines, by_line, theme)
+    if direction.get("page") is not None:
+        _validate_page(direction["page"], n_lines, by_line, direction, theme)
     if direction.get("points") is not None:
         import kinetic_points   # 遅延 import
 

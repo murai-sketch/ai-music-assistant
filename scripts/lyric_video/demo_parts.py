@@ -19,6 +19,9 @@ demo_parts.py
   python3 demo_parts.py D6-N --unsafe-flicker-demo   # 検査器の確認（わざと点滅させた見本。**人に見せない・再生しない**。静止画と数値だけを使う）
   python3 demo_parts.py C1            # carry（行全体を一定の速さで動かす保持）。あり・なし × 横組み3行（流れの線つき）・縦組み2列（T35 C1）
   python3 demo_parts.py C2            # 列を積む（前の列を残して薄くする）。あり・なし（T35 C2）
+  python3 demo_parts.py K1            # 送られた行の終わり方（濃さだけ／focus／圧痕／focus→圧痕。T39 回1）。置き場は _work/_demo_T38/T39/回1/。値と記号の対応は回1/_対応表_見せない.md
+  python3 demo_parts.py K2            # 転換（薄れが止まる）と長い1行の保持（静止／染み込み／breathe）。T39 回2。置き場は _work/_demo_T38/T39/回2/。値と記号の対応は回2/_対応表_見せない.md
+  python3 demo_parts.py K3            # 間奏明けの切れ目（その場で替わる／裏写り）。T39 回3。置き場は _work/_demo_T38/T39/回3/。値と記号の対応は回3/_対応表_見せない.md
   python3 demo_parts.py D1 --stills   # 静止画一覧も作る
 
 出力は _work/_demo_T33/<名前>/（Git に入らない）。--out で変える。
@@ -95,10 +98,16 @@ def _bg_image(path, colors=None):
     im.save(path)
 
 
-def make_case(case, lines, duration, direction, style_name=DEFAULT_STYLE, out_dir=None, stills=False, image=None):
-    """1本のデモを作る。lines は (文, 開始, 終わり, 歌い終わり) の並び。direction は dict（n_lines は自動で入る）"""
+def make_case(case, lines, duration, direction, style_name=DEFAULT_STYLE, out_dir=None, stills=False, image=None, root=None, work_name=None):
+    """1本のデモを作る。lines は (文, 開始, 終わり, 歌い終わり) の並び。direction は dict（n_lines は自動で入る）。
+    root：置き場（既定は _work/_demo_T33＝今までのデモは変わらない）。root を渡すと、作業データ（曲ノート・無音・alignment・direction）は root/_cache/ に置く。work_name：作業データの置き場の名前（既定は case。回をまたいで同じ記号を使うときに分ける）"""
     # D6-N・D6-P（検査器の確認用。人に見せない・再生しない）は、ユーザーに見せるフォルダと分ける
-    d = (DEMO_DIR / "_test_再生しない" if case.startswith(("D6N_", "D6P_")) else DEMO_DIR) / case
+    if root is not None:
+        demo_cache = Path(root) / "_cache"
+        d = demo_cache / "cases" / (work_name or case)
+    else:
+        demo_cache = DEMO_CACHE
+        d = (DEMO_DIR / "_test_再生しない" if case.startswith(("D6N_", "D6P_")) else DEMO_DIR) / case
     d.mkdir(parents=True, exist_ok=True)
     texts = ["".join(l[0].split("|")) for l in lines]
     note = d / "note.md"
@@ -109,7 +118,7 @@ def make_case(case, lines, duration, direction, style_name=DEFAULT_STYLE, out_di
                     "-metadata", f"comment={case}", "-q:a", "9", str(audio)], check=True)
     img = d / "bg.png"
     _bg_image(img, image)
-    cache = DEMO_CACHE / _audio_hash(audio)
+    cache = demo_cache / _audio_hash(audio)
     cache.mkdir(parents=True, exist_ok=True)
     alignment = [{"line": t, "start": s, "end": e, "src": i, "match": 1.0, "section": "Verse"}
                  for i, (t, (_x, s, e, _u)) in enumerate(zip(texts, lines))]
@@ -134,7 +143,7 @@ def make_case(case, lines, duration, direction, style_name=DEFAULT_STYLE, out_di
             "--direction-from", str(dpath), "--replan"]
     # 作業データの置き場を _work/_demo_T33/_cache/ に切り替える（終わったら戻す）
     saved = (align.WORK_DIR, beats_mod.WORK_DIR, make_lyric_video.WORK_DIR)
-    align.WORK_DIR = beats_mod.WORK_DIR = make_lyric_video.WORK_DIR = DEMO_CACHE
+    align.WORK_DIR = beats_mod.WORK_DIR = make_lyric_video.WORK_DIR = demo_cache
     try:
         sys.argv = base + ["--out", str(out / f"{case}.mp4")]
         make_lyric_video.main()
@@ -432,9 +441,172 @@ def c2(out_dir=None, stills=False):
     return made
 
 
+# --- 送られた行の終わり方（T39 回1）。汎用の文だけ。見出しは記号だけ。記号と値の対応は _対応表_見せない.md に書く ---
+
+T39_ROOT = WORK_DIR / "_demo_T38" / "T39"
+K1_LINES = [(S2, 1.0, 7.5, 7.0), (S4, 7.5, 14.0, 13.5), (S3, 14.0, 20.5, 20.0), (S1, 20.5, 27.0, 26.5)]
+K1_BREAK = {"1": {"0": 6}, "2": {"0": 4}, "3": {"0": 4}}      # 行番号 → break_after（縦組みの列の切れ目）
+K1_FOCUS = 0.07       # ぼけの半径の最大（字の大きさの割合）。主の4列
+K1_AMP = 6            # 跡の明暗の差（/255）。主の4列
+
+
+def _k1_direction(focus=None, trace=None):
+    """送られた行の終わり方を変えるだけの direction。focus／trace が無い＝濃さだけ（T38 の page のまま）。trace があるときはインクを 0 まで薄れさせる"""
+    base = {"role": "letter_body", "palette": "body", "layout": "vertical", "entrance": "cut", "tail": 30}
+    lines = {"1-4": dict(base)}
+    for n, ba in K1_BREAK.items():
+        lines[n] = {"break_after": ba}
+    group = {"lines": [2, 4], "keep": 1, "dims": [0.3], "fade": {"to": [0.0 if trace else 0.12], "sec": 2.6},
+             "shift_sec": 0.35, "out": "fade", "enter": {"delay": 0.1, "sec": 0.2}}
+    if focus:
+        group["focus"] = {"r_max": focus}
+    if trace:
+        group["trace"] = {"amp": trace}
+    return {"look": "letter", "lines": lines, "vertical": {"top": 300, "height": 1140},
+            "safe_area": {"left": 132, "right": 132, "top": 300, "bottom": 1440, "corner": {"y_from": 940, "x_max": 850}},
+            "page": {"right": 840, "gap": 86, "groups": [group]}}
+
+
+# 記号 → (説明, focus, trace)。ユーザーには記号だけを見せる
+K1_CASES = {
+    "A": ("濃さだけ", None, None),
+    "B": ("focus（ぼけ）", K1_FOCUS, None),
+    "C": ("圧痕", None, K1_AMP),
+    "D": ("focus→圧痕", K1_FOCUS, K1_AMP),
+    "E1": ("圧痕 振幅違い", None, 3),
+    "E2": ("圧痕 振幅違い", None, 10),
+    "E3": ("圧痕 振幅違い（Cと同じ値）", None, 6),
+    "F1": ("focus 半径違い", 0.04, None),
+    "F2": ("focus 半径違い", 0.10, None),
+    "F3": ("focus 半径違い（Bと同じ値）", 0.07, None),
+}
+
+
+def k1(out_dir=None, stills=False):
+    """T39 回1：前半の、送られた行の終わり方。同じ文・同じ時刻・同じ配置で、部品の指定だけが違う。置き場 _work/_demo_T38/T39/回1/"""
+    out_dir = out_dir or (T39_ROOT / "回1")
+    made = []
+    for sym, (_what, focus, trace) in K1_CASES.items():
+        made.append(make_case(sym, K1_LINES, 28.0, _k1_direction(focus, trace), out_dir=out_dir, stills=stills, root=T39_ROOT))
+    return made
+
+
+# --- 転換と長い1行の保持（T39 回2）。前半の終わり方は focus→圧痕（回1 の D）に決まった前提。汎用の文だけ。記号と値の対応は _対応表_見せない.md ---
+# 行1〜3＝前半（回1 の D と同じ薄れ。行2・3 を歌うとき、前の行が focus→圧痕）／行4 を歌うとき、行3 が薄れかけて止まる（転換。実曲の行19→20 に当たる）／
+# 行5＝読める濃さで送られる（実曲の行20→21 に当たる）／行6＝長い1行の保持（実曲の行23・28 に当たる。送られた行なし）
+K2_LINES = [(S2, 1.0, 7.5, 7.0), (S4, 7.5, 14.0, 13.5), (S3, 14.0, 20.5, 20.0), (S1, 20.5, 28.5, 28.0),
+            (S2, 28.5, 35.0, 34.5), (S5, 35.0, 46.5, 46.0)]
+K2_STOP_AT = 20.5 + 0.35 + 0.86       # 行3 の薄れが止まる時刻（送り＋1拍）
+K2_HOLD_AT = 35.0                      # 保持の行の開始
+K2_STOP_FADE = 0.24                    # 止まったときのインクの濃さ
+K2_STOP_FOCUS = 0.03                   # 止まったときのぼけ（字の大きさの割合）
+K2_SOAK = {"r_max": 8, "opacity": 0.10}      # 染み込みの最終の半径（px）・不透明度
+K2_SOAK_STOP_SEC = 6.0                 # 送られた行の染み込みにかける秒（止まった時刻から）
+K2_SOAK_HOLD_FROM, K2_SOAK_HOLD_SEC = 0.3, 9.0     # 保持の行：入りの後 0.3 秒から 9 秒かけて
+K2_SOAK_WEAK = 0.5                     # 読める濃さで送られた行（行4→5）の染み込みは、不透明度をこの倍率で弱く
+K2_BREATHE = {"hold": "breathe", "hold_amp": 0.010, "hold_hz": 0.58}
+
+
+def _k2_direction(stop_soak=None, hold=None):
+    """前半は回1 の D（focus 0.07・圧痕 6）。stop_soak：転換で止まった行に染み込みを付ける指定 {"r_max","opacity"}。
+    hold：保持の行（行6）の項目（{"soak": …} か breathe の指定）。None＝静止"""
+    base = {"role": "letter_body", "palette": "body", "layout": "vertical", "entrance": "cut", "tail": 30}
+    lines = {"1-6": dict(base),
+             "2": {"break_after": {"0": 6}}, "3": {"break_after": {"0": 4}}, "4": {"break_after": {"0": 4}},
+             "6": {"col_lengths": [8, 5]}}
+    if hold:
+        lines["6"] = dict(lines["6"], **hold)
+    enter = {"delay": 0.1, "sec": 0.2}
+    soak = lambda o, sec: {"from": "stop", "sec": sec, "r_max": stop_soak["r_max"], "opacity": round(stop_soak["opacity"] * o, 4)}
+    g_d = {"lines": [2, 3], "keep": 1, "dims": [0.3], "fade": {"to": [0.0], "sec": 2.6}, "shift_sec": 0.35, "out": "fade", "enter": enter,
+           "focus": {"r_max": K1_FOCUS}, "trace": {"amp": K1_AMP}}
+    g_stop = {"lines": [4, 4], "keep": 1, "dims": [0.3], "fade": {"to": [K2_STOP_FADE], "sec": 0.86}, "shift_sec": 0.35, "out": "fade", "enter": enter,
+              "focus": {"r_max": K2_STOP_FOCUS}}
+    g_read = {"lines": [5, 5], "keep": 1, "dims": [0.8], "shift_sec": 0.35, "out": "slide", "enter": enter, "readable": True}
+    if stop_soak:
+        g_stop["soak"] = soak(1.0, K2_SOAK_STOP_SEC)
+        g_read["soak"] = soak(K2_SOAK_WEAK, K2_SOAK_STOP_SEC)
+    return {"look": "letter", "lines": lines, "vertical": {"top": 300, "height": 1140},
+            "safe_area": {"left": 132, "right": 132, "top": 300, "bottom": 1440, "corner": {"y_from": 940, "x_max": 850}},
+            "page": {"right": 840, "gap": 86, "groups": [g_d, g_stop, g_read]}}
+
+
+def _k2_soak_hold(r_max, opacity):
+    return {"soak": {"from": K2_SOAK_HOLD_FROM, "sec": K2_SOAK_HOLD_SEC, "r_max": r_max, "opacity": opacity}}
+
+
+# 記号 → (転換の染み込み, 保持の行の項目)。ユーザーには記号だけを見せる
+K2_CASES = {
+    "A": ("止まるだけ／保持 静止", None, None),
+    "B": ("止まって染み込み／保持 染み込み", K2_SOAK, _k2_soak_hold(**K2_SOAK)),
+    "C": ("止まるだけ／保持 breathe", None, dict(K2_BREATHE)),
+    "D": ("止まって染み込み／保持 breathe（組み合わせ。計画書に無い置き方）", K2_SOAK, dict(K2_BREATHE)),
+    "E1": ("染み込み 半径違い", {"r_max": 4, "opacity": 0.10}, _k2_soak_hold(4, 0.10)),
+    "E2": ("染み込み 半径違い", {"r_max": 12, "opacity": 0.10}, _k2_soak_hold(12, 0.10)),
+    "E3": ("染み込み 不透明度違い", {"r_max": 8, "opacity": 0.06}, _k2_soak_hold(8, 0.06)),
+    "E4": ("染み込み（Bと同じ値）", K2_SOAK, _k2_soak_hold(**K2_SOAK)),
+    "F1": ("breathe 振幅違い", None, dict(K2_BREATHE, hold_amp=0.015)),
+    "F2": ("breathe（Cと同じ値）", None, dict(K2_BREATHE)),
+}
+
+
+def k2(out_dir=None, stills=False):
+    """T39 回2：転換（薄れが止まる）と長い1行の保持。同じ文・同じ時刻・同じ配置で、部品の指定だけが違う。置き場 _work/_demo_T38/T39/回2/"""
+    out_dir = out_dir or (T39_ROOT / "回2")
+    made = []
+    for sym, (_what, stop_soak, hold) in K2_CASES.items():
+        made.append(make_case(sym, K2_LINES, 48.0, _k2_direction(stop_soak, hold), out_dir=out_dir, stills=stills, root=T39_ROOT, work_name=f"回2_{sym}"))
+    return made
+
+
+# --- 間奏明けの切れ目（T39 回3）。前半の終わり方は focus→圧痕（回1 の D）、転換は止まって染み込み・保持は breathe（回2 の D）に決まった前提。
+# 汎用の文だけ。記号と値の対応は _対応表_見せない.md ---
+# 紙1＝行1〜3（行3 は長く、歌い終わりの後が間奏＝送られた行なしで残る。実曲の行12 に当たる）／切れ目＝行4 の開始（実曲の行13 の開始 111.22 に当たる）／
+# 紙2＝行4〜5／行6 で次の紙（実曲の次の切れ目。裏写りはここへ向けて消える）
+K3_LINES = [(S2, 1.0, 7.5, 7.0), (S4, 7.5, 14.0, 13.5), (S5, 14.0, 28.0, 20.0), (S1, 28.0, 34.5, 34.0),
+            (S3, 34.5, 41.0, 40.5), (S2, 41.0, 48.0, 47.5)]
+K3_CUT_AT = 28.0                        # 切れ目（行4 の開始）
+K3_BACK = {"from_group": 0, "at_line": 4, "until_line": 6, "blur": 3.0, "opacity": 0.08}      # 主
+
+
+def _k3_direction(back=None):
+    """切れ目の出方だけを変える direction。back が無い＝その場で替わる（行3 が消え、行4 が現れるだけ）。
+    前半は回1 の D（focus・圧痕）、紙2 の行5 が行4 を送るときも同じ。保持の行は静止（実曲の行12 は動かさない）"""
+    base = {"role": "letter_body", "palette": "body", "layout": "vertical", "entrance": "cut", "tail": 30}
+    lines = {"1-6": dict(base),
+             "2": {"break_after": {"0": 6}}, "3": {"col_lengths": [8, 5]}, "4": {"break_after": {"0": 4}}, "5": {"break_after": {"0": 4}}}
+    enter = {"delay": 0.1, "sec": 0.2}
+    d_group = lambda a, b: {"lines": [a, b], "keep": 1, "dims": [0.3], "fade": {"to": [0.0], "sec": 2.6}, "shift_sec": 0.35, "out": "fade",
+                            "enter": enter, "focus": {"r_max": K1_FOCUS}, "trace": {"amp": K1_AMP}}
+    page = {"right": 840, "gap": 86, "groups": [d_group(2, 3), d_group(5, 5)]}
+    if back is not None:
+        page["back"] = [dict(K3_BACK, **back)]
+    return {"look": "letter", "lines": lines, "vertical": {"top": 300, "height": 1140},
+            "safe_area": {"left": 132, "right": 132, "top": 300, "bottom": 1440, "corner": {"y_from": 940, "x_max": 850}},
+            "page": page}
+
+
+# 記号 → (説明, back の上書き)。ユーザーには記号だけを見せる。強め S1（めくり）は計画書の V9 に無いので作らない
+K3_CASES = {
+    "A": ("その場で替わる", None),
+    "B": ("裏写り 主", {}),
+    "C": ("裏写り 弱め（ぼけを大きく・薄く）", {"blur": 4.0, "opacity": 0.06}),
+    "D": ("裏写り 強め（ぼけを小さく・濃く）", {"blur": 2.0, "opacity": 0.10}),
+}
+
+
+def k3(out_dir=None, stills=False):
+    """T39 回3：間奏明けの切れ目。同じ文・同じ時刻・同じ配置で、部品の指定だけが違う。置き場 _work/_demo_T38/T39/回3/"""
+    out_dir = out_dir or (T39_ROOT / "回3")
+    made = []
+    for sym, (_what, back) in K3_CASES.items():
+        made.append(make_case(sym, K3_LINES, 49.0, _k3_direction(back), out_dir=out_dir, stills=stills, root=T39_ROOT, work_name=f"回3_{sym}"))
+    return made
+
+
 def main():
     ap = argparse.ArgumentParser(description="部品のデモ動画を作る（本番と同じ描画の経路）")
-    ap.add_argument("demo", choices=["D1", "D2", "D1o", "D2o", "D3", "D3R", "D4", "D5", "D6", "D6-N", "D6-P", "C1", "C2"])
+    ap.add_argument("demo", choices=["D1", "D2", "D1o", "D2o", "D3", "D3R", "D4", "D5", "D6", "D6-N", "D6-P", "C1", "C2", "K1", "K2", "K3"])
     ap.add_argument("--out", help="出力先（既定: _work/_demo_T33/<名前>/。D6-N・D6-P は _work/_demo_T33/_test_再生しない/<名前>/）")
     ap.add_argument("--stills", action="store_true", help="静止画一覧も作る")
     ap.add_argument("--unsafe-flicker-demo", action="store_true",
@@ -448,7 +620,7 @@ def main():
     if args.unsafe_flicker_demo:
         kinetic_points.UNSAFE_SKIP_TRACK_RULES = True
     for p in {"D1": d1, "D2": d2, "D1o": d1o, "D2o": d2o, "D3": d3, "D3R": d3r, "D4": d4, "D5": d5, "D6": d6,
-              "D6-N": d6n, "D6-P": d6p, "C1": c1, "C2": c2}[args.demo](args.out, args.stills):
+              "D6-N": d6n, "D6-P": d6p, "C1": c1, "C2": c2, "K1": k1, "K2": k2, "K3": k3}[args.demo](args.out, args.stills):
         print(f"[DEMO] {p}")
 
 

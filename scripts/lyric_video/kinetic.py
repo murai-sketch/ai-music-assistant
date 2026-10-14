@@ -41,7 +41,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 import kinetic_bg
 import kinetic_fx
@@ -143,6 +143,7 @@ EXIT_RATIO, EXIT_MIN_SEC, EXIT_MAX_SEC = 0.3, 0.14, 0.55
 # 保持（行が止まっている間の小さな動き）。入りの直後に 0.25 秒かけて立ち上がる
 HOLD_MOTIONS = ("breathe", "wave", "jitter")
 HOLD_RAMP_SEC = 0.25
+SOAK_STAGES = 40        # 染み込み（soak）の暈を丸める段の数（T39 回2。補間しない。段の継ぎ目の大きさは K2-2 で測る）
 # carry（行全体を一定の速さで動かす保持。direction で hold: carry と carry を書いた行だけ。T35 C1）。HOLD_MOTIONS には入れない
 # （HOLD_MOTIONS の保持は入りの後 0.25 秒で立ち上がり退場で消える小さな動きで、移動しない。carry は行の頭から一定の速さで動き続ける）
 CARRY = "carry"
@@ -805,7 +806,7 @@ def plan_to_markdown(plan, header=None):
     sung = any("sung_end" in c for c in plan)
     voiced = any("voice" in c for c in plan)
     looked = any("font_role" in c for c in plan)
-    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset", "carry", "stack_group", "row_lengths", "hidden"))
+    staged = any(k in c for c in plan for k in ("impact", "char_times", "karaoke_all_lit", "break_after", "marks", "counter", "solo", "vertical_typeset", "carry", "stack_group", "page_group", "row_lengths", "col_lengths", "hidden"))
     head = "| # | 時間 | 強さ | 構図 | 動き | 背景 | カメラ | 装飾 | 質感 | 保持 | 退場 | フラッシュ | 背景処理 | 下敷き | 切替 |"
     rule = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     if voiced:
@@ -865,12 +866,20 @@ def plan_to_markdown(plan, header=None):
                 bits.append("前の行の先頭字にそろえる")
             if c.get("row_lengths"):
                 bits.append("段の字数 " + ",".join(str(x) for x in c["row_lengths"]))
+            if c.get("col_lengths"):
+                bits.append("列の字数 " + ",".join(str(x) for x in c["col_lengths"]))
             if c.get("carry"):
                 cs = c["carry"]
                 bits.append("carry " + (f"{cs['px_s']:g}px/秒 {cs['dir']}" if "px_s" in cs else
                                         ",".join(f"段{k}:{v['px_s']:g}px/秒 {v['dir']}" for k, v in sorted(cs.items()))))
+            if c.get("page_group") is not None:
+                bits.append(f"送り(群{c['page_group']}・前の行を右へ送る・x {c.get('stack_dx', 0):+.1f}px)")
+            elif c.get("stack_dx") is not None and c.get("stack_group") is None and c.get("vertical_typeset"):
+                bits.append(f"右端そろえ(x {c['stack_dx']:+.1f}px)")
             if c.get("stack_group") is not None:
-                bits.append(f"列積み(dim {c['stack_dim']:g}・行{c['stack_clear_line']}の開始で全部消す・x {c.get('stack_dx', 0):+.1f}px)")
+                bits.append(f"列積み(dim {c['stack_dim']:g}・"
+                        + ("曲の終わりまで残す" if c['stack_clear_line'] == "end" else f"行{c['stack_clear_line']}の開始で全部消す")
+                        + f"・x {c.get('stack_dx', 0):+.1f}px)")
             bits.extend(c.get("marks") or [])
             row += " " + "；".join(bits) + " |"
         if sung:
@@ -1284,6 +1293,9 @@ class _Cut:
             for ri, row in enumerate(rows):
                 while sizes[ri] > 60 and row_width(row, sizes[ri]) * 1.09 > safe_w:
                     sizes[ri] = max(int(sizes[ri] * 0.94), 60)
+        if cut.get("size_scale"):
+            # カット設計で手動指定した文字の縮尺（既定は無し＝変えない）
+            sizes = [max(int(z * float(cut["size_scale"])), 40) for z in sizes]
         size = max(sizes)
         self.size = size
 
@@ -2052,7 +2064,8 @@ class _Cut:
         o = g["order"]
         if hold == "breathe":
             # 呼吸: 行全体が 0.9Hz でわずかに膨らみ縮む（しっとりした行）
-            return 0.0, 0.0, 1 + 0.035 * math.sin(tl * math.tau * 0.9) * amt, 0.0
+            # 振幅と周期は direction の hold_amp・hold_hz（T39 回2）。書かない行は今までの ±3.5%・0.9Hz
+            return 0.0, 0.0, 1 + self.cut.get("hold_amp", 0.035) * math.sin(tl * math.tau * self.cut.get("hold_hz", 0.9)) * amt, 0.0
         if hold == "wave":
             # ウェーブ: 1字ずつ位相をずらして上下し、少し傾く（弾む曲・子ども向け）
             ph = tl * 7 + o * 0.75
@@ -2149,8 +2162,17 @@ class _Cut:
         d.rectangle([int(round(x0)), int(round(y0)), xe, int(round(y0)) + RULE_PX - 1],
                     fill=_hex(self.colors[0]))
 
-    def draw(self, frame, t, sprites, cam=(1.0, 0.0, 0.0, 0.0), dim=1.0):
-        """dim：残した列（stack。T35 C2）として描くときの不透明度の掛け率（0〜1）。1.0 は今までと同じ（掛けない・刻みも変えない）"""
+    def draw(self, frame, t, sprites, cam=(1.0, 0.0, 0.0, 0.0), dim=1.0, dx=0.0, alpha_step=20):
+        """dim：残した列（stack。T35 C2）として描くときの不透明度の掛け率（0〜1）。1.0 は今までと同じ（掛けない・刻みも変えない）
+        dx：行全体を右へずらす量（px。page の送り。U1）。0 は今までと同じ。alpha_step：dim が 1 でないときの不透明度の刻み（既定 20 ＝ 0.05 刻み。
+        page の薄れは 100 ＝ 0.01 刻みで、段が見えないようにする）"""
+        if dx:
+            a0 = self.anchor
+            self.anchor = (a0[0] + dx, a0[1])
+            try:
+                return self.draw(frame, t, sprites, cam, dim, 0.0, alpha_step)
+            finally:
+                self.anchor = a0
         cut = self.cut
         tl = t - cut["start"]
         dur = cut["end"] - cut["start"]
@@ -2244,7 +2266,7 @@ class _Cut:
                 for lkey, limg, la in layers:
                     if la * alpha <= 0.02:
                         continue
-                    im = sprites.transformed(lkey, limg, scale, total_angle, la * alpha, crop_top, crop_right, alpha_step=20)
+                    im = sprites.transformed(lkey, limg, scale, total_angle, la * alpha, crop_top, crop_right, alpha_step=alpha_step)
                     if im is None:
                         continue
                     full_h = im.size[1]
@@ -2310,7 +2332,7 @@ class _Cut:
                         frame.paste(mim, (int(gcx - mim.size[0] / 2 + ox),
                                           int(gcy - mim.size[1] / 2 + oy)), mim)
                 if dim != 1.0:
-                    im = sprites.transformed(g["key"], g["img"], scale, total_angle, a, crop_top, crop_right, alpha_step=20)   # 0.05 刻み（0.55 を 0.6 に丸めない）
+                    im = sprites.transformed(g["key"], g["img"], scale, total_angle, a, crop_top, crop_right, alpha_step=alpha_step)   # 既定 0.05 刻み（0.55 を 0.6 に丸めない）
                 else:
                     im = sprites.transformed(g["key"], g["img"], scale, total_angle, a, crop_top, crop_right)
                 if im is None:
@@ -2766,6 +2788,13 @@ def camera_move(name, u, since_land, index):
 
 # ---------------------------------------------------------------------------
 
+def _on_canvas(im, size, x, y):
+    """画像 im を、size の透明な RGBA 画面の (x, y) に置いた画（画面の外へはみ出す分は切る）"""
+    c = Image.new("RGBA", size, (0, 0, 0, 0))
+    c.paste(im, (x, y))
+    return c
+
+
 class KineticRenderer:
     def _extend_last_cut(self, plan, duration):
         """hidden の行がある曲で、字幕に出す最後のカットの表示の終わりを、描画器に渡された曲の長さまで延ばす（U14）。
@@ -2842,6 +2871,7 @@ class KineticRenderer:
         self.bg.palette = self.palette
         self.sprites = _shared_sprites()
         self.duration = duration
+        self._look_duration = (look or {}).get("duration")
         self.interludes = find_interludes(plan, duration)
         self.interlude_starts = [s for s, _e, _n in self.interludes]
         self.interlude_images = kinetic_bg.interlude_images(backgrounds, len(self.interludes))
@@ -2896,9 +2926,20 @@ class KineticRenderer:
         if getattr(self, "_strict", False):
             self._check_no_blank_frames()
         self._stack_prev = {}       # 行 j（0 始まり）を描くとき、一緒に薄く残す前の列 [(行, 不透明度)]。stack の無い曲は空
+        self._page_of = {}          # page（送り。U1）：行 j（0 始まり）→ その行の group。page の無い曲は空（何も通らない）
+        self._page_list = {}        # 行 j → 一緒に描く送られた行 [(行 p, 何行前か r)]
+        self._page_w = []
+        self._page_fx = False       # focus・trace を書いた group がある（T39）
+        self._backs = []            # 裏写り（page.back。T39 回3）。無い曲は空
+        self._back_cache = {}       # 裏写りの層・歌っている行のまわりの弱め（切れ目ごとに 1 回。行の形の画像の掃除では捨てない）
+        self._fx_cache = {}         # 行の形の画像・ぼけの段・跡の場・染み込みの段（行が描かれなくなったら捨てる。_fx_evict）
+        self._soak_sung = {}        # 歌っている行の染み込み（T39 回2）：行 j（0 始まり）→ 指定
+        self._pulls = {}            # 引き戻し（T40 S3）：送られた行 p（0 始まり）→ {t0, px, sec}
         if self.themed:
             self._check_carry()
             self._setup_stack()
+            self._setup_page()
+            self._setup_soak()
             self._check_safe_area()
             self._check_rule_in()
         self.counter = None
@@ -3114,10 +3155,489 @@ class KineticRenderer:
                 if ratio < look_mod.COUNTER_MIN_CONTRAST:
                     raise LookError(f"stack[{gi}]：行{self.plan[j]['index']} の残した列（不透明度 {dim}）の比が、最悪の背景で {ratio:.2f} になり、"
                                     f"{look_mod.COUNTER_MIN_CONTRAST} を割ります。dim を上げてください")
-            if clear not in self.pos_of_line:
-                raise LookError(f"stack[{gi}]：clear_at_line の行{clear}は字幕に出さない行（hidden）です")
-            for j in range(members[0] + 1, self.pos_of_line[clear]):          # 積む行の2行目から、clear_at_line の行の手前まで（位置は字幕に出す行の並び）
+            if clear == "end":
+                # 曲の終わりまで残す（U2）。最後の字幕に出す行が積む行の最後で、その表示が曲の長さまで続いていること（途中で消えると残した列だけが浮く）
+                song_end = self._song_end()
+                if song_end is None:
+                    raise LookError(f"stack[{gi}]：clear_at_line が \"end\" ですが、曲の長さが分かりません（描画器の duration か look の duration が要ります）")
+                last = self.plan[members[-1]]
+                # 許容は1フレーム：プランの曲の長さ（ffprobe）と書き出しの音声の長さ（moviepy）の差（数十ミリ秒）は、最後の行が最後のコマまで出続ける
+                # ことで吸収される（_active は最後の行を返す。T39 M-1）。延ばさない（行の end を黙って書き換えない）
+                if members[-1] != len(self.plan) - 1 or last["end"] < song_end - 1.0 / FPS:
+                    raise LookError(f"stack[{gi}]：clear_at_line が \"end\" の行{last['index']}の表示が、曲の終わり（{song_end:.2f}秒）まで続きません（終わり {last['end']:.2f}秒）。"
+                                    f"行に tail（行の長さより大きい値）か end を書いてください")
+                stop = len(self.plan)
+            else:
+                if clear not in self.pos_of_line:
+                    raise LookError(f"stack[{gi}]：clear_at_line の行{clear}は字幕に出さない行（hidden）です")
+                stop = self.pos_of_line[clear]
+            for j in range(members[0] + 1, stop):          # 積む行の2行目から、clear_at_line の行の手前（"end" なら最後の行）まで（位置は字幕に出す行の並び）
                 self._stack_prev[j] = [(p, dim) for p in members if p < j]
+
+    # --- page（送り。U1） ---
+
+    def _setup_page(self):
+        """page の検査と、描くときの対応表（self._page_of・self._page_list・self._page_w）。
+        送られた行は「前の行を最後の状態のまま」描く（stack と同じ経路）が、位置は時間で右へずれ、濃さは時間で変わる。
+        検査（止める）：readable の group は、送られた行の濃さ（dims・fade.to）が最悪の背景に対して 4.5 以上（COUNTER_MIN_CONTRAST）"""
+        import look as look_mod
+        from look import LookError
+
+        page = self._dir.get("page")
+        if not page:
+            return
+        self._page_x = float(page["right"])
+        self._page_gap = float(page.get("gap", 0.0))
+        self._page_w = [col_block_width(c) if c.get("vertical_typeset") else 0.0 for c in self.plan]
+        for gi, g in enumerate(page["groups"]):
+            a, b = g["lines"]
+            fade = g.get("fade")
+            gg = {"gi": gi, "keep": int(g["keep"]), "dims": [float(x) for x in g["dims"]],
+                  "to": None if fade is None else [float(x) for x in fade["to"]],
+                  "fade_sec": None if fade is None else float(fade["sec"]),
+                  "shift": float(g.get("shift_sec", 0.35)), "out": g.get("out", "fade"), "readable": bool(g.get("readable", False)),
+                  "clear": g.get("clear"), "enter": g.get("enter"), "base": self.pos_of_line[a - 1], "lines": (a, b),
+                  "focus": g.get("focus"), "trace": g.get("trace"), "soak": g.get("soak")}
+            if gg["focus"] or gg["trace"] or gg["soak"]:
+                for k in range(a - 1, b):
+                    o = self.cuts[self.pos_of_line[k]]
+                    if o.karaoke or o.under is not None or o.overlay is not None or o.glow is not None:
+                        raise LookError(f"page.groups[{gi}]：行{k}は karaoke／下敷き／overlay／glow を持つので、focus・trace・soak（行の形の画像から描く）は使えません"
+                                        f"（描き方が違うので黙って落とさず止めました）")
+                    if gg["soak"] and not look_mod.is_light_palette(self.theme["palettes"][self.plan[self.pos_of_line[k]]["bg"]]):
+                        raise LookError(f"page.groups[{gi}]：行{k}の地が暗い配色なので、soak（染み込み）は使えません（暗い地では暈が光に見える＝紙の地でだけ成り立つ）")
+                self._page_fx = True
+            cl = gg["clear"]
+            if cl is not None:
+                # clear を秒（絶対）に直す。行番号の基準（after_line）はその行の開始／歌い終わりから。どちらの書き方でも、秒が group の最後の行の
+                # 開始〜表示の終わりに入らなければ止める（外れると、group の以後の行で送られた行が黙って消える／消えない。T38 M-2）
+                last_c = self.plan[self.pos_of_line[b]]
+                if "after_line" in cl:
+                    base_t = last_c["start"] if cl["from"] == "start" else last_c.get("sung_end")
+                    if base_t is None:
+                        raise LookError(f"page.groups[{gi}]：clear.from が sung_end ですが、行{b}の歌い終わりが取れていません")
+                    cl = {"at": float(base_t), "sec": float(cl["sec"])}
+                    gg["clear"] = cl
+                if not last_c["start"] - 1e-6 <= cl["at"] <= last_c["end"] + 1e-6:
+                    raise LookError(f"page.groups[{gi}]：clear の開始 {cl['at']:.2f}秒が、group の最後の行{b}の開始〜表示の終わり"
+                                    f"（{last_c['start']:.2f}〜{last_c['end']:.2f}秒）に入りません。alignment の時刻を直したときは、"
+                                    f"clear を {{\"after_line\": {b}, \"from\": \"sung_end\", \"sec\": …}} の形（行番号の基準）で書いてください")
+            pl = g.get("pull")
+            if pl is not None:
+                # 引き戻し（T40 S3）。at_line を歌い始めると前の行が右へ送られる（shift_sec）。送りきった時刻から sec 秒かけて、行と行の空き（gap）の back 割だけ左へ戻る。
+                # 戻りは smoothstep（行き過ぎ無し）。戻った分は、その行が画面から出るまで保つ（次の送りで跳ばない）
+                pos_at = self.pos_of_line[pl["at_line"]]
+                self._pulls[pos_at - 1] = {"t0": self.plan[pos_at]["start"] + gg["shift"], "px": float(pl["back"]) * self._page_gap, "sec": float(pl["sec"])}
+            for k in range(a, b + 1):
+                self._page_of[self.pos_of_line[k]] = gg
+        for bi, it in enumerate(page.get("back") or ()):
+            # 裏写り（C2）。紙面＝group の行（a−1〜b）。最後の行 b を歌い終えた紙面の並び（_page_offset）を、at_line の開始で裏に出す
+            a, b = page["groups"][it["from_group"]]["lines"]
+            pos_b = self.pos_of_line[b]
+            papers = [(self.pos_of_line[k], self._page_offset(pos_b, pos_b - self.pos_of_line[k])) for k in range(a - 1, b + 1)]
+            t_in = self.plan[self.pos_of_line[it["at_line"]]]["start"]
+            if t_in < self.plan[pos_b]["start"]:
+                raise LookError(f"page.back[{bi}]：at_line の行{it['at_line']}の開始が、紙面の最後の行{b}の開始より前です")
+            ul = it.get("until_line")
+            self._backs.append({"papers": papers, "last": pos_b, "t_in": t_in, "sec": float(it.get("sec", 2.25)),
+                                "t_out": None if ul is None else self.plan[self.pos_of_line[ul]]["start"],
+                                "blur": float(it["blur"]), "opacity": float(it["opacity"])})
+        memo = {}
+
+        def build(j):
+            if j in memo:
+                return memo[j]
+            g = self._page_of.get(j)
+            out = []
+            if g is not None:
+                for r in range(1, g["keep"] + 1):
+                    p = j - r
+                    if p < g["base"]:
+                        break
+                    if r >= 2 and p not in dict(build(j - 1)):
+                        break          # その行は前の行の間に見えていなかった（範囲の端）
+                    out.append((p, r))
+            memo[j] = out
+            return out
+
+        for j in range(len(self.plan)):
+            self._page_list[j] = build(j)
+        for j, g in sorted(self._page_of.items()):
+            if not g["readable"]:
+                continue
+            for p, r in self._page_list[j]:
+                pal = self.theme["palettes"][self.plan[p]["bg"]]
+                alphas = [g["dims"][r - 1]] + ([g["to"][r - 1]] if g["to"] else [])
+                ratio = look_mod.worst_contrast(pal["text"], pal["bg"], min(alphas))
+                if ratio < look_mod.COUNTER_MIN_CONTRAST:
+                    raise LookError(f"page.groups[{g['gi']}]：行{self.plan[j]['index']}で送られた行{self.plan[p]['index']}（{r}行前、不透明度 {min(alphas):g}）の比が、"
+                                    f"最悪の背景で {ratio:.2f} になり、{look_mod.COUNTER_MIN_CONTRAST} を割ります（readable）。dims／fade.to を上げてください")
+
+    # --- 裏写り（C2。T39 回3）：切れ目で、前の紙の字が左右反転・ぼけ・ごく薄く、背景のすぐ上（点の層・読み字より下）に透ける ---
+
+    BACK_GUARD_RATIO = 0.25      # 歌っている行の外接矩形＋字の 0.5 倍の範囲では、裏写りの不透明度をこの掛け率に弱める（動き §11。読みの邪魔にしない）
+
+    def _back_layer(self, k):
+        """裏写り k の層：(alpha float32 0〜1（反転・ぼけ済み、不透明度は掛けていない）, x0, y0)。紙面の行を _page_offset の並びで貼り合わせた
+        1 枚を、画面の中心（x＝540）で左右反転し、ぼかす。切れ目ごとに 1 回だけ作る"""
+        key = ("layer", k)
+        hit = self._back_cache.get(key)
+        if hit is None:
+            bk = self._backs[k]
+            W, H = VIDEO_SIZE
+            canvas = Image.new("L", (W, H), 0)
+            for pos, dx in bk["papers"]:
+                base, x0, y0 = self._line_base(pos, 4)
+                tmp = Image.new("L", (W, H), 0)
+                tmp.paste(base.getchannel("A"), (x0 + int(round(dx)), y0))
+                canvas = ImageChops.lighter(canvas, tmp)
+            canvas = ImageOps.mirror(canvas).filter(ImageFilter.GaussianBlur(bk["blur"]))
+            arr = np.asarray(canvas, dtype=np.float32) / 255.0
+            ys, xs = np.where(arr > 0.002)
+            if len(xs) == 0:
+                hit = (np.zeros((1, 1), np.float32), 0, 0)
+            else:
+                x0, x1, y0, y1 = int(xs.min()), int(xs.max()) + 1, int(ys.min()), int(ys.max()) + 1
+                hit = (np.ascontiguousarray(arr[y0:y1, x0:x1]), x0, y0)
+            self._back_cache[key] = hit
+        return hit
+
+    def _back_guard(self, k, active):
+        """裏写り k の層の範囲で、歌っているカット（active）の外接矩形＋字の 0.5 倍を BACK_GUARD_RATIO に弱める掛け率（float32、層と同じ大きさ）。
+        縁は字の 0.25 倍の半径でぼかす（段差を出さない）。歌っているカットの組ごとに 1 回"""
+        key = ("guard", k, tuple(active))
+        hit = self._back_cache.get(key)
+        if hit is None:
+            lay, x0, y0 = self._back_layer(k)
+            W, H = VIDEO_SIZE
+            m = Image.new("L", (W, H), 0)
+            d = ImageDraw.Draw(m)
+            size = 0.0
+            for j in active:
+                X0, Y0, X1, Y1 = self._screen_rect(self.cuts[j])
+                s_ = float(self.plan[j].get("vertical_size") or 0) or 86.0
+                size = max(size, s_)
+                d.rectangle([X0 - 0.5 * s_, Y0 - 0.5 * s_, X1 + 0.5 * s_, Y1 + 0.5 * s_], fill=255)
+            if size:
+                m = m.filter(ImageFilter.GaussianBlur(0.25 * size))
+            g = np.asarray(m, dtype=np.float32)[y0:y0 + lay.shape[0], x0:x0 + lay.shape[1]] / 255.0
+            hit = 1.0 - (1.0 - self.BACK_GUARD_RATIO) * g
+            self._back_cache[key] = hit
+        return hit
+
+    def _back_weight(self, k, t):
+        """裏写り k の立ち上がり・消えの重み（0〜1）。at_line の開始から sec 秒で 0→1、until_line の開始から sec 秒で 1→0（線形）"""
+        bk = self._backs[k]
+        if t < bk["t_in"]:
+            return 0.0
+        w = min((t - bk["t_in"]) / bk["sec"], 1.0)
+        if bk["t_out"] is not None:
+            w = min(w, max(1.0 - (t - bk["t_out"]) / bk["sec"], 0.0))
+        return w
+
+    def _draw_back(self, frame, t, active):
+        """裏写りを背景のすぐ上に描く（本文色を、層の形×不透明度×重み×歌っている行のまわりの弱めで混ぜる）"""
+        for k, bk in enumerate(self._backs):
+            w = self._back_weight(k, t)
+            if w <= 0.0:
+                continue
+            lay, x0, y0 = self._back_layer(k)
+            if lay.shape[0] <= 1:
+                continue
+            a = lay * (bk["opacity"] * w) * self._back_guard(k, active)
+            reg = np.asarray(frame.crop((x0, y0, x0 + lay.shape[1], y0 + lay.shape[0])), dtype=np.float32)
+            ink = np.array(_hex(self.cuts[bk["last"]].colors[0]), dtype=np.float32)
+            out = np.clip(np.rint(reg + (ink - reg) * a[..., None]), 0, 255).astype(np.uint8)
+            frame.paste(Image.fromarray(out), (x0, y0))
+
+    def _page_offset(self, j, r):
+        """行 j を歌っているとき、r 行前の行の右端の、歌っている行の右端からの距離（px）。r＝0 は 0"""
+        if r == 0:
+            return 0.0
+        return r * self._page_gap + sum(self._page_w[j - k] for k in range(1, r + 1))
+
+    @staticmethod
+    def _page_progress(g, tau):
+        """送られた行の薄れの進み q（0〜1）。送り（shift 秒）の間と fade が無い group は 0、送りが終わってから fade.sec 秒で 1 へ。
+        濃さ（_page_alpha）・focus のぼけの半径・trace の跡の量は、すべてこの 1 つの進みから読む（同じ計算を書き直さない。T39）"""
+        if g["to"] is None or (g["shift"] > 0 and tau < g["shift"]):
+            return 0.0
+        return min((tau - g["shift"]) / g["fade_sec"], 1.0)
+
+    def _page_alpha(self, j, r, tau):
+        """行 j を歌い始めて tau 秒後の、r 行前（r≥1）の行の不透明度。送り（shift 秒）の間は、前の状態 → dims、
+        そのあと fade があれば dims → to を fade.sec 秒で。clear があれば、at 秒から sec 秒で 0 へ（位置はそのまま）"""
+        g = self._page_of[j]
+        T = g["shift"]
+        if r == 1:
+            a0 = 1.0
+        else:
+            a0 = self._page_alpha(j - 1, r - 1, self.plan[j]["start"] - self.plan[j - 1]["start"])
+        d = g["dims"][r - 1]
+        if T > 0 and tau < T:
+            a = a0 + (d - a0) * (tau / T)
+        else:
+            a = d
+            if g["to"] is not None:
+                a = d + (g["to"][r - 1] - d) * self._page_progress(g, tau)
+        cl = g["clear"]
+        if cl is not None:
+            t_abs = self.plan[j]["start"] + tau
+            if t_abs >= cl["at"]:
+                a *= max(0.0, 1.0 - (t_abs - cl["at"]) / cl["sec"])
+        return a
+
+    def _page_state(self, j, t):
+        """行 j を歌っている時刻 t に、一緒に描く送られた行 [(行 p, 右へのずれ px, 不透明度)]。page の group に入らない行は空。
+        送りは三次の減速（1−(1−u)^3）。送られる行は全部同じ量（前の行の幅＋gap）だけ動く。keep を越えた行は、out が fade なら送られながら 0 へ、
+        slide なら薄れずに画面の外へ出きるまで。tau＝歌い始めてからの秒"""
+        g = self._page_of.get(j)
+        if g is None or j == 0:
+            return []
+        tau = max(t - self.plan[j]["start"], 0.0)
+        T = g["shift"]
+        u = 1.0 if (T <= 0 or tau >= T) else 1.0 - (1.0 - tau / T) ** 3
+        D = self._page_gap + self._page_w[j - 1]
+        cur = dict(self._page_list[j])
+        out = []
+        for p, r0 in [(j - 1, 0)] + list(self._page_list.get(j - 1, ())):
+            dx0 = self._page_offset(j - 1, r0)
+            if p in cur:
+                out.append((p, dx0 + D * u - self._pull_px(p, t), self._page_alpha(j, cur[p], tau)))
+            elif T > 0 and tau < T:
+                a0 = self._page_alpha(j - 1, r0, self.plan[j]["start"] - self.plan[j - 1]["start"])
+                if g["out"] == "fade":
+                    a, dx = a0 * (1.0 - tau / T), dx0 + D * u - self._pull_px(p, t)
+                else:
+                    dx_end = max(dx0 + D, 1080.0 + self._page_w[p] - self._page_x + 2.0)
+                    a, dx = a0, dx0 + (dx_end - dx0) * u - self._pull_px(p, t) * (1.0 - u)     # 画面の外へ出きるまでに、戻した分を無くす
+                if a > 0.004:
+                    out.append((p, dx, a))
+        return out
+
+    def _pull_px(self, p, t):
+        """引き戻し（page.groups[].pull）。送られた行 p が時刻 t に左へ戻している量（px）。指定が無い行は 0"""
+        pl = self._pulls.get(p)
+        if pl is None:
+            return 0.0
+        u = min(max((t - pl["t0"]) / pl["sec"], 0.0), 1.0)
+        return pl["px"] * u * u * (3.0 - 2.0 * u)
+
+    def _page_enter(self, j, t):
+        """行 j の歌っている行の不透明度の立ち上がり（group の enter。無ければ 1）"""
+        g = self._page_of.get(j)
+        en = g and g["enter"]
+        if not en:
+            return 1.0
+        tau = t - self.plan[j]["start"]
+        return min(max((tau - en["delay"]) / en["sec"], 0.0), 1.0)
+
+    # --- 送られた行の focus（ぼけ）・trace（圧痕）。行の形の画像（V1）から作る（T39） ---
+
+    def _last_state_t(self, p):
+        """行 p の「最後の状態」の時刻（表示の終わりの 1 フレーム前）。残した列・送られた行・行の形の画像が、同じ時刻の字の状態を使う"""
+        cp = self.plan[p]
+        return cp["start"] + max(cp["end"] - cp["start"] - 1.0 / FPS, 0.0)
+
+    def _fx_evict(self, j):
+        """行 j を描くとき、j・j−1・j−2 以外の行の画像を捨てる（行ごとに捨てる。上限で全消しにしない。j は歌っている行の染み込み用）"""
+        if self._fx_cache:
+            for k in [k for k in self._fx_cache if k[1] not in (j, j - 1, j - 2)]:
+                del self._fx_cache[k]
+
+    def _sent_fx(self, j, p, t):
+        """行 j を歌っている時刻 t に、送られた行 p に掛ける focus・trace。無ければ None。
+        戻り値 (ぼけを使う, ぼけの半径 px, 跡の量, pad)。進み q は _page_progress の 1 つ。p が j−1 なら group(j) の指定で進み中、
+        それより前の行（退場中）は group(j−1) の指定の最後の値のまま（跡は out が fade なら送りの 0.35 秒で、インクと同じ掛け率で消える）"""
+        g = self._page_of.get(j)
+        tau = t - self.plan[j]["start"]
+        mult = 1.0
+        kept = p != j - 1 and any(pp == p for pp, _r in self._page_list[j])      # keep 2：残された 2 行前（退場中ではない）。染み込みは送られた時刻から続く
+        if p == j - 1:
+            src, q = g, self._page_progress(g, tau)
+        else:
+            src = self._page_of.get(j - 1)
+            if src is None:
+                return None
+            q = self._page_progress(src, self.plan[j]["start"] - self.plan[j - 1]["start"])
+            if g["out"] == "fade" and g["shift"] > 0 and not kept:
+                mult = max(1.0 - tau / g["shift"], 0.0)
+        foc, trc, soak = src["focus"], src["trace"], src["soak"]
+        if not foc and not trc and not soak:
+            return None
+        size = float(self.plan[p].get("vertical_size") or 0)
+        r_px = round(foc["r_max"] * size * q * 10) / 10 if foc else 0.0
+        amp = round(trc["amp"] * q * mult * 4) / 4 if trc else 0.0
+        pad = int(3 * foc["r_max"] * size) + 6 if foc else 8
+        sk = None
+        if soak:
+            # 染み込み。薄れが止まった時刻（送りの後 fade.sec 秒。fade が無い group は送りが終わった時刻）から soak.sec 秒で 0→1（戻らない）。
+            # 退場中の行は、前の group の最後の値のまま（out が fade なら、インクと同じ掛け率で消える）
+            if p == j - 1:
+                tau_ = tau
+            elif kept:
+                tau_ = t - self.plan[p + 1]["start"]
+            else:
+                tau_ = self.plan[j]["start"] - self.plan[j - 1]["start"]
+            stop = src["shift"] + (src["fade_sec"] or 0.0)
+            u = min(max((tau_ - stop) / soak["sec"], 0.0), 1.0)
+            sk = (round(u * SOAK_STAGES), soak, mult)
+        return (bool(foc), r_px, amp, pad, sk)
+
+    def _line_base(self, p, pad, steady=False):
+        """行 p の最後の状態の字を 1 枚の RGBA にした画像と、その左上の画面の座標 (img, x0, y0)。描いた字そのものから作る
+        （draw と同じ sprites.transformed・glyph_center。縦組みの約物も一致）。縁に pad を付ける。アンカーは dx＝0 のまま"""
+        key = ("base", p, pad, steady)
+        hit = self._fx_cache.get(key)
+        if hit is not None:
+            return hit
+        o = self.cuts[p]
+        cut = o.cut
+        dur = cut["end"] - cut["start"]
+        # steady＝歌っている行（動かない間の姿。最後の行は終わりで退場の動きに入るので、最後の状態ではなく表示の真ん中の姿を使う）
+        tl = dur * 0.5 if steady else self._last_state_t(p) - cut["start"]
+        items = []
+        for g in o.glyphs:
+            dx, dy, scale, angle, alpha, ct, cr = o.glyph_state(g, tl, dur)
+            if alpha <= 0.02:
+                continue
+            im = self.sprites.transformed(g["key"], g["img"], scale, o.base_angle + angle + g["angle"], alpha, ct, cr)
+            if im is None:
+                continue
+            gcx, gcy = o.glyph_center(g, scale, dx, dy)
+            items.append((im, int(gcx - im.size[0] / 2), int(gcy - im.size[1] / 2)))
+        if not items:
+            hit = (Image.new("RGBA", (1, 1), (0, 0, 0, 0)), 0, 0)
+        else:
+            x0 = min(x for _im, x, _y in items) - pad
+            y0 = min(y for _im, _x, y in items) - pad
+            x1 = max(x + im.size[0] for im, x, _y in items) + pad
+            y1 = max(y + im.size[1] for im, _x, y in items) + pad
+            base = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
+            for im, x, y in items:
+                base = Image.alpha_composite(base, _on_canvas(im, base.size, x - x0, y - y0))
+            hit = (base, x0, y0)
+        self._fx_cache[key] = hit
+        return hit
+
+    def _line_blur(self, p, pad, r):
+        """行 p の画像をぼけの半径 r（px。0.1 刻みに丸め済み）でぼかした RGBA（premultiplied でぼかす）。r＝0 は元の画像"""
+        base, x0, y0 = self._line_base(p, pad)
+        if r <= 0:
+            return base, x0, y0
+        key = ("blur", p, pad, r)
+        hit = self._fx_cache.get(key)
+        if hit is None:
+            hit = (base.convert("RGBa").filter(ImageFilter.GaussianBlur(r)).convert("RGBA"), x0, y0)
+            self._fx_cache[key] = hit
+        return hit
+
+    def _line_relief(self, p):
+        """行 p の浮き彫りの場（float32、h×w、値は ±1 以内、光は左上から）。字の形を半径 1.0 でぼかし、左上と右下へ 1px ずつずらした差
+        （mv-motion の look.py の式。先行測定 §2-1 と同じ）。行ごとに 1 回"""
+        key = ("relief", p)
+        hit = self._fx_cache.get(key)
+        if hit is None:
+            base, x0, y0 = self._line_base(p, 8)
+            b = np.asarray(base.getchannel("A").filter(ImageFilter.GaussianBlur(1.0))).astype(np.float32) / 255.0
+            rel = np.roll(np.roll(b, -1, 0), -1, 1) - np.roll(np.roll(b, 1, 0), 1, 1)
+            hit = (rel, x0, y0)
+            self._fx_cache[key] = hit
+        return hit
+
+    def _draw_sent_fx(self, frame, p, dx, pa, fx, bg_cam):
+        """送られた行 p を、行の形の画像から描く。先に跡（trace。紙の明暗の足し引き、色なし）、その上にインク（ぼけを使う group はぼかした画像、
+        使わない group は今までの 1 字ずつの描き方）。dx は右へのずれ（int に丸める）"""
+        use_focus, r_px, amp, pad, sk = fx
+        W, H = VIDEO_SIZE
+        xi = int(round(dx))
+        if sk is not None and sk[0] > 0:
+            # 染み込み（暈）。字の後ろ（インクの下）、跡の上。紙の色を、本文色へごく薄く寄せる
+            self._draw_soak(frame, p, xi, sk[0], sk[1], sk[2])
+        if amp >= 0.25:
+            rel, x0, y0 = self._line_relief(p)
+            bx0, by0 = max(x0 + xi, 0), max(y0, 0)
+            bx1, by1 = min(x0 + xi + rel.shape[1], W), min(y0 + rel.shape[0], H)
+            if bx1 > bx0 and by1 > by0:
+                reg = np.asarray(frame.crop((bx0, by0, bx1, by1))).astype(np.float32)
+                add = rel[by0 - y0:by1 - y0, bx0 - x0 - xi:bx1 - x0 - xi] * amp
+                out = np.clip(np.rint(reg + add[..., None]), 0, 255).astype(np.uint8)
+                frame.paste(Image.fromarray(out), (bx0, by0))
+        if use_focus:
+            a = round(pa * 100) / 100
+            if a > 0.02:
+                img, x0, y0 = self._line_blur(p, pad, r_px)
+                if a < 1.0:
+                    img = img.copy()
+                    img.putalpha(img.getchannel("A").point(lambda v: int(v * a)))
+                frame.paste(img, (x0 + xi, y0), img)
+        else:
+            self.cuts[p].draw(frame, self._last_state_t(p), self.sprites, bg_cam, dim=pa, dx=dx, alpha_step=100)
+
+    # --- 染み込み（soak。T39 回2）：字の周りに、紙に吸われたインクの暈が時間とともに広がり、戻らない。紙の地（明るい地）でだけ ---
+
+    def _setup_soak(self):
+        """歌っている行の soak（行の項目）の検査。止める：暗い地（暈が光に見える）／karaoke・下敷き・overlay・glow の行（描き方が違う）／
+        page・stack で送られる行（送られると暈が消えて跳ぶ。送られる行の染み込みは page.groups[].soak で書く）"""
+        from look import LookError
+
+        import look as look_mod
+        members = set()
+        for g in (self._dir.get("page") or {}).get("groups", ()):
+            a, b = g["lines"]
+            members |= {self.pos_of_line[k] for k in range(a - 1, b + 1)}
+        for i_, c in enumerate(self.plan):
+            if c.get("stack_group") is not None:
+                members.add(i_)
+        for j, c in enumerate(self.plan):
+            sk = c.get("soak")
+            if not sk:
+                continue
+            o = self.cuts[j]
+            if not look_mod.is_light_palette(self.theme["palettes"][c["bg"]]):
+                raise LookError(f"行{c['index']}：地が暗い配色なので、soak（染み込み）は使えません（暗い地では暈が光に見える＝「明るく開かない」に当たる。紙の地でだけ成り立つ）")
+            if o.karaoke or o.under is not None or o.overlay is not None or o.glow is not None:
+                raise LookError(f"行{c['index']}：karaoke／下敷き／overlay／glow を持つ行には soak を書けません（行の形の画像から描くので、描き方が違う）")
+            if j in members:
+                raise LookError(f"行{c['index']}：soak を書いた行が page／stack の送られる行に入っています。送られると暈が消えて跳ぶので止めました"
+                                f"（送られた行の染み込みは page.groups[].soak で書きます）")
+            self._soak_sung[j] = sk
+
+    def _soak_stage(self, p, k, spec, steady=False):
+        """行 p の染み込みの k 段目（1〜SOAK_STAGES）の暈。L 画像と左上の画面の座標 (img, x0, y0)。字の形を 2px 太らせ（MaxFilter 5）、
+        半径 r_max×k/段数 でぼかし、最大が opacity×k/段数 になるよう正規化する（glow と同じ正規化。不透明度も段とともに 0 から立ち上げる＝
+        最初の段で輪郭が急に太らない）。段は最初に必要になった時に 1 回だけ作ってキャッシュする（補間しない）。色は貼るときに付ける"""
+        key = ("soak", p, k, spec["r_max"], spec["opacity"], steady)
+        hit = self._fx_cache.get(key)
+        if hit is None:
+            pad = int(3 * spec["r_max"]) + 8
+            base, x0, y0 = self._line_base(p, pad, steady)
+            q = k / SOAK_STAGES
+            a = base.getchannel("A").filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.GaussianBlur(max(spec["r_max"] * q, 0.3)))
+            arr = np.asarray(a, dtype=np.float32)
+            peak = float(arr.max())
+            out = np.rint(arr / peak * spec["opacity"] * q * 255.0).astype(np.uint8) if peak > 0 else np.zeros_like(arr, dtype=np.uint8)
+            hit = (Image.fromarray(out), x0, y0)
+            self._fx_cache[key] = hit
+        return hit
+
+    def _draw_soak(self, frame, p, xi, k, spec, mult=1.0, steady=False):
+        """行 p の染み込みの暈を、段 k で描く（xi＝右へのずれ px。mult＝退場中の掛け率）。色は行の本文色"""
+        img, x0, y0 = self._soak_stage(p, k, spec, steady)
+        if mult < 1.0:
+            img = img.point(lambda v: int(v * mult))
+        frame.paste(_hex(self.cuts[p].colors[0]), (x0 + xi, y0), img)
+
+    def _draw_soak_sung(self, frame, j, t):
+        """歌っている行 j の染み込み。行の開始から from 秒たってから sec 秒かけて 0→1（戻らない）。字（読み字）の後ろに描く"""
+        sk = self._soak_sung.get(j)
+        if not sk:
+            return
+        self._fx_evict(j)
+        u = min(max((t - self.plan[j]["start"] - sk["from"]) / sk["sec"], 0.0), 1.0)
+        k = round(u * SOAK_STAGES)
+        if k > 0:
+            self._draw_soak(frame, j, 0, k, sk, steady=True)
 
     def _screen_rect(self, o):
         """カットの文字の外接矩形（アンカーを足した画面の座標）。回転（diagonal 等）は両向きの角を取って広いほうを採る"""
@@ -3412,7 +3932,14 @@ class KineticRenderer:
         c = self.plan[j]
         if c.get("stack_group") is None:
             return None
+        if c["stack_clear_line"] == "end":
+            return self._song_end()          # 曲の終わりまで（U2）
         return self.plan_all[c["stack_clear_line"] - 1]["start"]       # 行番号で引く（全行）
+
+    def _song_end(self):
+        """曲の長さ（秒）。描画器の duration → look の duration の順。無ければ None"""
+        d = self.duration or self._look_duration
+        return None if d is None else float(d)
 
     def _counter_rects(self, t):
         """t に出ている文字の外接矩形（余白込み・余白なし）。slam の入りの拡大中は含めない（読ませる時間ではない）"""
@@ -4325,6 +4852,8 @@ class KineticRenderer:
 
     def _foreground(self, frame, t, bg_cam, g_zoom, sx, sy):
         active = self._active(t)
+        if self._backs:
+            self._draw_back(frame, t, active)    # 裏写り（C2）。背景のすぐ上、decor・点の層・読み字より下
         for j in active:
             text_color, _stroke, accent = self.cuts[j].colors
             self.decor.draw(frame, self.plan[j], self._cut_time(j, t), _hex(text_color), _hex(accent), bg_cam)
@@ -4340,9 +4869,24 @@ class KineticRenderer:
         for j in active:
             for p, dim in self._stack_prev.get(j, ()):
                 # 残した列（stack）。前の行の最後の状態（表示の終わりの1フレーム前。退場は swap だけなので掛け率は 1）を dim で描く
-                cp = self.plan[p]
-                self.cuts[p].draw(frame, cp["start"] + max(cp["end"] - cp["start"] - 1.0 / FPS, 0.0), self.sprites, bg_cam, dim=dim)
-            self.cuts[j].draw(frame, self._cut_time(j, t), self.sprites, bg_cam)
+                self.cuts[p].draw(frame, self._last_state_t(p), self.sprites, bg_cam, dim=dim)
+            if self._page_of:
+                self._fx_evict(j)
+                for p, pdx, pa in self._page_state(j, t):
+                    # 送られた行（page。U1）。前の行の最後の状態を、時間で変わるずれと濃さで描く（0.01 刻み）。
+                    # focus・trace（T39）を書いた group の行だけ、行の形の画像（V1）から描く。書いていない行は従来どおり
+                    fx = self._sent_fx(j, p, t) if self._page_fx else None
+                    if fx is None:
+                        self.cuts[p].draw(frame, self._last_state_t(p), self.sprites, bg_cam, dim=pa, dx=pdx, alpha_step=100)
+                    else:
+                        self._draw_sent_fx(frame, p, pdx, pa, fx, bg_cam)
+            if self._soak_sung:
+                self._draw_soak_sung(frame, j, t)
+            en = self._page_enter(j, t) if self._page_of else 1.0
+            if en < 1.0:
+                self.cuts[j].draw(frame, self._cut_time(j, t), self.sprites, bg_cam, dim=en, alpha_step=100)
+            else:
+                self.cuts[j].draw(frame, self._cut_time(j, t), self.sprites, bg_cam)
             c = self.plan[j]
             if c.get("texture") == "grain":
                 tl = t - c["start"]
@@ -4722,8 +5266,13 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
             if it["hold"] not in HOLD_MOTIONS + ("heartbeat", CARRY):
                 raise RuntimeError(f"direction 行{c['index']}: 保持 '{it['hold']}' は未対応です")
             c["hold"] = it["hold"]
+            for hk in ("hold_amp", "hold_hz"):
+                if it.get(hk) is not None:
+                    c[hk] = float(it[hk])      # 書いた行だけプランに入れる（書かない曲のプランは今までと同じ）
             if it["hold"] == CARRY:
                 c["carry"] = json.loads(json.dumps(it["carry"]))      # 書き込み先（プラン）と direction を共有しない
+        if it.get("soak") is not None:
+            c["soak"] = {k: (v if k != "from" else float(v)) for k, v in it["soak"].items()}     # 歌っている行の染み込み（T39 回2）
         if it.get("decor") is not None:
             c["decor"] = it["decor"]
         if it.get("text_y") is not None:
@@ -4881,10 +5430,24 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
         for k in range(a, b + 1):
             c = plan[k - 1]
             nxt = _next_shown(plan, k - 1)      # 隣＝次に字幕に出す行（stack.lines に hidden の行は検証で止まる）
-            if nxt is None or c["end"] < nxt["start"] - 0.0015:
+            if nxt is None and st["clear_at_line"] == "end":
+                pass                            # 曲の終わりまで残す行：表示が曲の長さまで続くかは描画器（曲の長さを知っている）が検査する
+            elif nxt is None or c["end"] < nxt["start"] - 0.0015:
                 raise look.LookError(f"direction: stack[{gi}] の行{k} の表示が、次の行の開始まで続きません（終わり {c['end']:.2f}秒）。"
                                      f"積んだ列を残すには、行に tail（行の長さより大きい値）か end を書いて、次の行の開始まで表示してください")
             c["stack_group"], c["stack_dim"], c["stack_clear_line"] = gi, float(st["dim"]), st["clear_at_line"]
+    for gi, g in enumerate((direction.get("page") or {}).get("groups") or []):
+        a, b = g["lines"]
+        for k in range(a - 1, b + 1):
+            if k >= a:
+                plan[k - 1]["page_group"] = gi          # 前の行を送って見せる行（描画器が direction.page.groups[gi] を読む）
+            if k < b:
+                # 送られる側の行（a−1〜b−1）。次の行の開始まで表示が続くこと（続かないと、送られる前に消える）
+                c = plan[k - 1]
+                nxt = _next_shown(plan, k - 1)
+                if nxt is None or c["end"] < nxt["start"] - 0.0015:
+                    raise look.LookError(f"direction: page.groups[{gi}] の行{k}の表示が、次の行の開始まで続きません（終わり {c['end']:.2f}秒）。"
+                                         f"送る行を残すには、行に tail（行の長さより大きい値）か end を書いて、次の行の開始まで表示してください")
     for i, (c, it) in enumerate(zip(plan, items)):
         if c.get("hidden"):
             c["exit"] = "swap"     # 字幕に出さない行は退場を持たない（描画器に渡らない）
@@ -4905,6 +5468,13 @@ def apply_direction(plan, direction, vdefaults, alignment=None, words=None, use_
         c["exit"] = name
         _fit_exit_to_tail(c)
     return plan
+
+
+def _mark_col(c, notes, text):
+    """col_lengths の印（apply_direction の mark と同じ形：プランの marks と notes の両方）"""
+    c.setdefault("marks", []).append(text)
+    if notes is not None:
+        notes.append(f"行{c['index']}: {text}")
 
 
 def arrange_vertical(plan, direction, theme, vdefaults, words=None, use_lcs=False, notes=None):
@@ -4950,9 +5520,25 @@ def arrange_vertical(plan, direction, theme, vdefaults, words=None, use_lcs=Fals
             split = split_rows_after(c["rows"], it["break_after"], c["index"])
             forced = [len(r) for r in split]
             c["break_after"] = it["break_after"]
+        if it.get("col_lengths"):
+            # 列の字数を直接指定（単一の句が12字を超える行。組み立て前の段が自動の折りなので break_after では指定できない）。禁則・上限は arrange が検査する
+            if sum(it["col_lengths"]) != len(flat):
+                raise look.LookError(f"direction: 行{c['index']} の col_lengths {it['col_lengths']} の合計 {sum(it['col_lengths'])} が、行の字数 {len(flat)} と違います")
+            forced = list(it["col_lengths"])
+            c["col_lengths"] = list(it["col_lengths"])
         word_of = {}
         if words is not None:
             _t, word_of, _n = _match_line(flat, _window_words(words, plan, i), use_lcs)
+        if it.get("col_lengths"):
+            # 列の切れ目が単語の途中なら、break_after・row_lengths と同じ印（T38 M-3）。単語時刻が無い・照合できない行は「判定できません」
+            off_ = 0
+            for k_, n_ in enumerate(it["col_lengths"][:-1]):
+                off_ += n_
+                if off_ in word_of and off_ - 1 in word_of:
+                    if word_of[off_] == word_of[off_ - 1]:
+                        _mark_col(c, notes, f"col_lengths[{k_}]＝{n_}：単語の途中で切っています（先頭から {off_} 字目の後）")
+                else:
+                    _mark_col(c, notes, f"col_lengths[{k_}]＝{n_}：単語の途中かは判定できません（単語の時刻が無いか、隣の字が単語に対応していない）")
         mid = kinetic_vertical.mid_word_flags(flat, word_of)
         rows, size = kinetic_vertical.arrange(flat, mid, int(c.get("max_col_chars", kinetic_vertical.DEFAULT_MAX_COL)),
                                               height, cap, min_px, forced=forced,
@@ -4973,6 +5559,34 @@ def arrange_vertical(plan, direction, theme, vdefaults, words=None, use_lcs=Fals
             c["vertical_kana_shift"] = float(vspec["kana_shift"])
 
 
+def col_block_width(c):
+    """縦組みの行の列のまとまりの幅（px）。列の中心の間隔 × (列数−1) ＋ 字の枠1つ。インクの端ではなく字の枠（マス）の端で測る"""
+    return ((len(c["rows"]) - 1) * kinetic_vertical.COL_PITCH + 1) * c["vertical_size"]
+
+
+def page_dx_for_right(c, right_x):
+    """その行の列のまとまりの右端（字の枠）が right_x に来る、アンカーの x の画面の中央からの差（px）"""
+    size = c["vertical_size"]
+    anchor_x = right_x - ((len(c["rows"]) - 1) / 2 * kinetic_vertical.COL_PITCH + 0.5) * size
+    return anchor_x - VIDEO_SIZE[0] / 2
+
+
+def arrange_page(plan, direction):
+    """page（送り。U1）の、歌っている行の位置。縦組みの全行の列のまとまりの右端を page.right にそろえ（M2：行頭そろえ）、列の上端を vertical.top にそろえる（上辺そろえ。2026-10-09 ユーザー指示）。
+    group に入らない行（前の行を持たない行）も同じ右端。stack の行は、このあと arrange_stack が上書きする"""
+    page = (direction or {}).get("page")
+    if not page:
+        return
+    top = float(((direction or {}).get("vertical") or {}).get("top", kinetic_vertical.DEFAULT_TOP))
+    for c in plan:
+        if c.get("vertical_typeset") and not c.get("hidden"):
+            c["stack_dx"] = round(page_dx_for_right(c, float(page["right"])), 2)
+            # 上辺そろえ：全行の列の上端を同じ y（vertical.top）に置く。描画器は箱 [vertical_top, +vertical_h] の中央に最長の列を置いて
+            # 列の頭をそろえるので、箱の高さを最長の列の長さにして上端を top に固定する（列の長さが違っても上端は動かない）
+            c["vertical_top"] = top
+            c["vertical_h"] = round(max(kinetic_vertical.row_extent(r) for r in c["rows"]) * c["vertical_size"] * kinetic_vertical.PITCH, 2)
+
+
 def arrange_stack(plan, direction):
     """stack（前の列を残して薄くする。T35 C2）の、列の位置。積む行（lines の最初〜最後）の全部の列を右から順に並べ、**積んだ全部の幅の中央を
     画面の中央に置く**（後の行が来ても前の列が動かない）。行ごとの横のずれ stack_dx（px。その行の組版の中央の位置からの差）をプランに書く。
@@ -4981,6 +5595,14 @@ def arrange_stack(plan, direction):
         a, b = st["lines"]
         cuts = [plan[k - 1] for k in range(a, b + 1)]
         widths = [len(c["rows"]) * c["vertical_size"] * kinetic_vertical.COL_PITCH for c in cuts]
+        if st.get("right") is not None:
+            # 右端そろえ（U2）：最初の行の右端の字の枠を right に置き、次の行は gap を空けて左へ。行の右端は字の枠（マス）の端で測る
+            # （インクの端ではない。page と同じ測り方なので、同じ right の page の行と右端がそろう）
+            off = 0.0
+            for c in cuts:
+                c["stack_dx"] = round(page_dx_for_right(c, float(st["right"]) - off), 2)
+                off += col_block_width(c) + float(st.get("gap", 0.0))
+            continue
         right = sum(widths) / 2
         off = 0.0
         for c, w in zip(cuts, widths):
@@ -5228,6 +5850,7 @@ def prepare_plan(cache_dir, alignment, sections, beats, style, *, meta=None, bac
         if direction is not None:
             vnotes = []
             arrange_vertical(plan, direction, theme, vdefaults, words=words, use_lcs=use_lcs, notes=vnotes)
+            arrange_page(plan, direction)
             arrange_stack(plan, direction)
             apply_accent_rows(plan)
             if not quiet:
